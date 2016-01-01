@@ -13,6 +13,8 @@
 #include "mathutils.h"
 #include "quat.h"
 #include "open-simplex-noise.h"
+#include "png_utils.h"
+#include "crater.h"
 
 static struct osn_context *ctx;
 
@@ -32,14 +34,17 @@ static int random_seed = 31415;
 static float shrink_factor = 0.55;
 static int initial_bumps = 60;
 static float initial_bump_size = 0.4;
+static char crater_base_level = 20;
 
 static struct bump {
 	union vec3 p;
 	float r, h;
 	union quat texelq;
 	int tx, ty; /* origin of texel region in sample data */
-	int tr; /* radius of texel region in sample data */
 	float ts; /* scaling factor to get from 3d dist to texel dist */
+	char *sampledata;
+	int samplew, sampleh, sample_bytes_per_row;
+	int is_crater;
 } bumplist[MAXBUMPS], craterlist[MAXCRATERS];
 static int totalbumps = 0;
 
@@ -149,71 +154,28 @@ static inline void distort_vertex(union vec3 *v, float d, struct bump *b)
 	unsigned char *c;
 
 	float nr = 0.5 * (cos(M_PI * d / r) + 1.0f) * h;
+	nr = nr * (!b->is_crater) + (1.0 * b->is_crater);
 
 	vec3_normalize(&distortion, v);
 	quat_rot_vec(&texelv, &distortion, &b->texelq);
 	vec3_mul_self(&texelv, b->ts);
 	x = (int) texelv.v.x + b->tx;
 	y = (int) texelv.v.y + b->ty;
-	if (x < 0 || x > samplew || y < 0 || y > sampleh)
+	if (x < 0 || x > b->samplew || y < 0 || y > b->sampleh) {
 		printf("out of range (%d, %d)\n", x, y);
-	p = y * sample_bytes_per_row + x * 3;
-	c = (unsigned char *) &sampledata[p]; 
-	m = (float) *c / 255.0f;
+		return;
+	}
+	p = y * b->sample_bytes_per_row + x * 3;
+	c = (unsigned char *) &b->sampledata[p];
+	m = ((float) *c - (float) crater_base_level * (float) b->is_crater) / 255.0f;
 	vec3_mul_self(&distortion, nr * m);
 	vec3_add_self(v, &distortion);
 }
 
-static inline void crater_vertex(union vec3 *v, float d, struct bump *b)
-{
-	union vec3 distortion;
-	const float r = b->r;
-	const float r1 = b->r * 0.80;
-	const float r2 = b->r * 0.75;
-
-	vec3_normalize(&distortion, v);
-	if (d <= r2) { /* Central part of crater, just flatten it. */
-		vec3_mul(v, &distortion, crater_min_height);
-		return;
-	}
-	if (d <= r1) { /* Inner crater wall... */
-		const float p = (d - r2) / (r1 - r2);
-		const float a = p * M_PI;
-		const float h = (0.5f - 0.5f * cosf(a)) * b->h;
-		const float oh = vec3_magnitude(v);
-		float m;
-		//const float m = p * (vec3_magnitude(v) - 1.0f) + h;
-		//printf("h = %f\n", 1.0f + h);
-		//if (1.0f + h < oh)
-		if (crater_min_height + h < oh)
-			m = oh;
-		else
-			m = crater_min_height + h;
-		vec3_mul(v, &distortion, m);
-		return;
-	}
-	if (d <= r) {
-		/* Outer crater wall */
-		const float p = (d - r1) / (r - r1);
-		const float a = p * M_PI;
-		const float h = (0.5f + 0.5 * cosf(a)) * b->h;
-		//const float m = p * (vec3_magnitude(v) - 1.0f) + h;
-		const float oh = vec3_magnitude(v);
-		float m;
-		//printf("oh = %f, h = %f\n", oh, h);
-		//m = h;
-		m = h;
-		if (crater_min_height + h < oh)
-			m = oh;
-		else
-			m = crater_min_height + h;
-		vec3_mul(v, &distortion, m);
-		return;
-	}
-}
-
 struct thread_info {
 	pthread_t thread;
+	struct bump *bumplist;
+	int bumpcount;
 	int f;
 };
 
@@ -236,8 +198,8 @@ static void *render_bumps_on_face_fn(void *info)
 		}
 		for (j = 0; j < DIM; j++) {
 			p = fij_to_xyz(f, i, j, DIM);
-			for (k = 0; k < totalbumps; k++) {
-				b = &bumplist[k];
+			for (k = 0; k < t->bumpcount; k++) {
+				b = &t->bumplist[k];
 				p2 = &b->p;
 				float dx = fabs(p.v.x - p2->v.x);
 				if (dx > b->r)
@@ -259,47 +221,7 @@ static void *render_bumps_on_face_fn(void *info)
 	return NULL;
 }
 
-static void *render_craters_on_face_fn(void *info)
-{
-	int f, i, j, k;
-	union vec3 p, *p2;
-	float d2, d;
-	struct bump *b;
-	struct thread_info *t = info;
-
-	f = t->f;
-
-	for (i = 0; i < DIM; i++) {
-		if (i % (DIM / 8) == 0) {
-			printf("%d", f);
-			fflush(stdout);
-		}
-		for (j = 0; j < DIM; j++) {
-			p = fij_to_xyz(f, i, j, DIM);
-			for (k = 0; k < ncraters; k++) {
-				b = &craterlist[k];
-				p2 = &b->p;
-				float dx = fabs(p.v.x - p2->v.x);
-				if (dx > b->r)
-					continue;
-				float dy = fabs(p.v.y - p2->v.y);
-				if (dy > b->r)
-					continue;
-				float dz = fabs(p.v.z - p2->v.z);
-				if (dz > b->r)
-					continue;
-				d2 = dx * dx + dy * dy + dz * dz;
-				if (d2 > b->r * b->r)
-					continue;
-				d = sqrtf(d2);
-				crater_vertex(&vertex[f][i][j], d, b);
-			}
-		}
-	}
-	return NULL;
-}
-
-static void multithread_face_render(render_on_face_fn render)
+static void multithread_face_render(render_on_face_fn render, struct bump *bumplist, int bumpcount)
 {
 	int rc, f;
 	void *status;
@@ -307,6 +229,8 @@ static void multithread_face_render(render_on_face_fn render)
 
 	for (f = 0; f < 6; f++) {
 		t[f].f = f;
+		t[f].bumplist = bumplist;
+		t[f].bumpcount = bumpcount;
 		rc = pthread_create(&t[f].thread, NULL, render, &t[f]);
 		if (rc)
 			fprintf(stderr, "%s: pthread_create failed: %s\n",
@@ -318,20 +242,25 @@ static void multithread_face_render(render_on_face_fn render)
 			fprintf(stderr, "%s: pthread_join failed: %s\n",
 				__func__, strerror(errno));
 	}
+	printf("  6 faces rendered.\n");
 }
 
 static void render_all_bumps(void)
 {
-	if (totalbumps > 0)
-		multithread_face_render(render_bumps_on_face_fn);
+	if (totalbumps > 0) {
+		printf("Rendering bumps on 6 faces with 6 threads\n");
+		multithread_face_render(render_bumps_on_face_fn, bumplist, totalbumps);
+	}
 }
 
 static void render_all_craters(float min, float max)
 {
 	crater_min_height = min;
 	crater_max_height = max;
-	if (ncraters > 0)
-		multithread_face_render(render_craters_on_face_fn);
+	if (ncraters > 0) {
+		printf("Rendering craters on 6 faces with 6 threads\n");
+		multithread_face_render(render_bumps_on_face_fn, craterlist, ncraters);
+	}
 }
 
 static void add_bump(union vec3 p, float r, float h)
@@ -355,6 +284,11 @@ static void add_bump(union vec3 p, float r, float h)
 		b->ts = samplew / RADII;
 	else
 		b->ts = sampleh / RADII;
+	b->sampledata = sampledata;
+	b->samplew = samplew;
+	b->sampleh = sampleh;
+	b->sample_bytes_per_row = sample_bytes_per_row;
+	b->is_crater = 0;
 	quat_from_u2v(&b->texelq, &p, &right_at_ya, &up);
 	totalbumps++;
 }
@@ -364,19 +298,24 @@ static void add_crater(int i, union vec3 p, float r, float h)
 	struct bump *b;
 	const union vec3 right_at_ya = { { 0.0f, 0.0f, 1.0f } };
 	const union vec3 up = { { 0.0f, 1.0f, 0.0f } };
+	float crater_r;
 
 	b = &craterlist[i];
+	b->is_crater = 1;
 	b->p = p;
 	b->r = r;
 	b->h = h;
-	b->tx = (int) ((float) samplew / RADII + 0.5 * snis_random_float() *
-			(RADII - 2.0f) / RADII * (float) samplew);
-	b->ty = (int) ((float) sampleh / RADII + 0.5 * snis_random_float() *
-			(RADII - 2.0f) / RADII * (float) sampleh);
-	if (samplew < sampleh)
-		b->ts = samplew / RADII;
-	else
-		b->ts = sampleh / RADII;
+	b->tx = 512;
+	b->ty = 512;
+	b->ts = 512;
+	b->sampledata = malloc(3 * 1024 * 1024);
+	memset(b->sampledata, crater_base_level, 3 * 1024 * 1024);
+	b->samplew = 1024;
+	b->sampleh = 1024;
+	b->sample_bytes_per_row = 3 * b->samplew;
+	crater_r = (0.5 * (snis_random_float() + 1.0) * 5.5) *
+			(0.5 * (snis_random_float() + 1.0) * 5.5) + 2.5;
+	create_crater_heightmap((unsigned char *) b->sampledata, 1024, 1024, 512, 512, (int) crater_r, 7);
 	quat_from_u2v(&b->texelq, &p, &right_at_ya, &up);
 }
 
@@ -400,33 +339,40 @@ static void recursive_add_bump(union vec3 pos, float r, float h,
 	}
 }
 
-static void add_bumps(const int nbumps)
+static void add_bumps(const int initial_bumps)
 {
 	int i;
+	float h;
 
-	for (i = 0; i < nbumps; i++) {
+	if (nbumps == 1) /* If we're not doing any recursive bumps, then make the bumps taller */
+		h = 0.3;
+	else
+		h = 0.1;
+	printf("adding bumps:");
+	for (i = 0; i < initial_bumps; i++) {
 		union vec3 p;
 		float r = 0.5 * (snis_random_float() + 1.0f) * initial_bump_size;
 
 		random_point_on_sphere(1.0, &p.v.x, &p.v.y, &p.v.z);
-		recursive_add_bump(p, r, 0.10, shrink_factor, rlimit);
+		recursive_add_bump(p, r, h, shrink_factor, rlimit);
 		printf(".");
 		fflush(stdout);
 	}
+	printf("\n");
 }
 
 static void add_craters(const int nc)
 {
 	int i;
 
+	printf("adding craters:");
 	for (i = 0; i < nc; i++) {
-		float r = 0.5 * (snis_random_float() + 1.0f);
-		float r2 = 0.5 * (snis_random_float() + 1.0f);
-		r = r * r2 * 0.1;
 		union vec3 p;
 		random_point_on_sphere(1.0, &p.v.x, &p.v.y, &p.v.z);
-		add_crater(i, p, r, 0.005f);
+		add_crater(i, p, 1.0, 0.005f);
+		printf("o"); fflush(stdout);
 	}
+	printf("\n");
 }
 
 static void find_min_max_height(float *min, float *max)
@@ -435,6 +381,7 @@ static void find_min_max_height(float *min, float *max)
 	float mmin, mmax;
 	float h;
 
+	printf("Finding min and max height\n");
 	mmin = 1000000.0f;
 	mmax = 0.0f;
 
@@ -575,215 +522,12 @@ static void paint_normal_and_height_maps(float min, float max)
 	}
 }
 
-
-static int write_png_image(const char *filename, unsigned char *pixels, int w, int h, int has_alpha)
-{
-	png_structp png_ptr;
-	png_infop info_ptr;
-	png_byte **row;
-	int x, y, rc, colordepth = 8;
-	int bytes_per_pixel = has_alpha ? 4 : 3;
-	FILE *f;
-
-	f = fopen(filename, "w");
-	if (!f) {
-		fprintf(stderr, "fopen: %s:%s\n", filename, strerror(errno));
-		return -1;
-	}
-	png_ptr = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
-	if (!png_ptr)
-		goto cleanup1;
-	info_ptr = png_create_info_struct(png_ptr);
-	if (!info_ptr)
-		goto cleanup2;
-	if (setjmp(png_jmpbuf(png_ptr))) /* oh libpng, you're old as dirt, aren't you. */
-		goto cleanup2;
-
-	png_set_IHDR(png_ptr, info_ptr, (size_t) w, (size_t) h, colordepth,
-			has_alpha ? PNG_COLOR_TYPE_RGBA : PNG_COLOR_TYPE_RGB,
-			PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_DEFAULT,
-			PNG_FILTER_TYPE_DEFAULT);
-
-	row = png_malloc(png_ptr, h * sizeof(*row));
-	for (y = 0; y < h; y++) {
-		row[y] = png_malloc(png_ptr, w * bytes_per_pixel);
-		for (x = 0; x < w; x++) {
-			unsigned char *r = (unsigned char *) row[y];
-			unsigned char *src = (unsigned char *)
-				&pixels[y * w * bytes_per_pixel + x * bytes_per_pixel];
-			unsigned char *dest = &r[x * bytes_per_pixel];
-			memcpy(dest, src, bytes_per_pixel);
-		}
-	}
-
-	png_init_io(png_ptr, f);
-	png_set_rows(png_ptr, info_ptr, row);
-	png_write_png(png_ptr, info_ptr, PNG_TRANSFORM_PACKING, NULL);
-
-	for (y = 0; y < h; y++)
-		png_free(png_ptr, row[y]);
-	png_free(png_ptr, row);
-	rc = 0;
-cleanup2:
-	png_destroy_write_struct(&png_ptr, &info_ptr);
-cleanup1:
-	fclose(f);
-	return rc;
-}
-
-/* Copied and modified from snis_graph.c sng_load_png_texture(), see snis_graph.c */
-char *load_png_image(const char *filename, int flipVertical, int flipHorizontal,
-	int pre_multiply_alpha,
-	int *w, int *h, int *hasAlpha, char *whynot, int whynotlen)
-{
-	int i, j, bit_depth, color_type, row_bytes, image_data_row_bytes;
-	png_byte header[8];
-	png_uint_32 tw, th;
-	png_structp png_ptr = NULL;
-	png_infop info_ptr = NULL;
-	png_infop end_info = NULL;
-	png_byte *image_data = NULL;
-
-	FILE *fp = fopen(filename, "rb");
-	if (!fp) {
-		snprintf(whynot, whynotlen, "Failed to open '%s': %s",
-			filename, strerror(errno));
-		return 0;
-	}
-
-	if (fread(header, 1, 8, fp) != 8) {
-		snprintf(whynot, whynotlen, "Failed to read 8 byte header from '%s'\n",
-				filename);
-		goto cleanup;
-	}
-	if (png_sig_cmp(header, 0, 8)) {
-		snprintf(whynot, whynotlen, "'%s' isn't a png file.",
-			filename);
-		goto cleanup;
-	}
-
-	png_ptr = png_create_read_struct(PNG_LIBPNG_VER_STRING,
-							NULL, NULL, NULL);
-	if (!png_ptr) {
-		snprintf(whynot, whynotlen,
-			"png_create_read_struct() returned NULL");
-		goto cleanup;
-	}
-
-	info_ptr = png_create_info_struct(png_ptr);
-	if (!info_ptr) {
-		snprintf(whynot, whynotlen,
-			"png_create_info_struct() returned NULL");
-		goto cleanup;
-	}
-
-	end_info = png_create_info_struct(png_ptr);
-	if (!end_info) {
-		snprintf(whynot, whynotlen,
-			"2nd png_create_info_struct() returned NULL");
-		goto cleanup;
-	}
-
-	if (setjmp(png_jmpbuf(png_ptr))) {
-		snprintf(whynot, whynotlen, "libpng encounted an error");
-		goto cleanup;
-	}
-
-	png_init_io(png_ptr, fp);
-	png_set_sig_bytes(png_ptr, 8);
-
-	/*
-	 * PNG_TRANSFORM_STRIP_16 |
-	 * PNG_TRANSFORM_PACKING  forces 8 bit
-	 * PNG_TRANSFORM_EXPAND forces to expand a palette into RGB
-	 */
-	png_read_png(png_ptr, info_ptr, PNG_TRANSFORM_STRIP_16 | PNG_TRANSFORM_PACKING | PNG_TRANSFORM_EXPAND, NULL);
-
-	png_get_IHDR(png_ptr, info_ptr, &tw, &th, &bit_depth, &color_type, NULL, NULL, NULL);
-
-	if (bit_depth != 8) {
-		snprintf(whynot, whynotlen, "load_png_texture only supports 8-bit image channel depth");
-		goto cleanup;
-	}
-
-	if (color_type != PNG_COLOR_TYPE_RGB && color_type != PNG_COLOR_TYPE_RGB_ALPHA) {
-		snprintf(whynot, whynotlen, "load_png_texture only supports RGB and RGBA");
-		goto cleanup;
-	}
-
-	if (w)
-		*w = tw;
-	if (h)
-		*h = th;
-	int has_alpha = (color_type == PNG_COLOR_TYPE_RGB_ALPHA);
-	if (hasAlpha)
-		*hasAlpha = has_alpha;
-
-	row_bytes = png_get_rowbytes(png_ptr, info_ptr);
-	image_data_row_bytes = row_bytes;
-
-	/* align to 4 byte boundary */
-	if (image_data_row_bytes & 0x03)
-		image_data_row_bytes += 4 - (image_data_row_bytes & 0x03);
-
-	png_bytepp row_pointers = png_get_rows(png_ptr, info_ptr);
-
-	image_data = malloc(image_data_row_bytes * th * sizeof(png_byte) + 15);
-	if (!image_data) {
-		snprintf(whynot, whynotlen, "malloc failed in load_png_texture");
-		goto cleanup;
-	}
-
-	int bytes_per_pixel = (color_type == PNG_COLOR_TYPE_RGB_ALPHA ? 4 : 3);
-
-	for (i = 0; i < th; i++) {
-		png_byte *src_row;
-		png_byte *dest_row = image_data + i * image_data_row_bytes;
-
-		if (flipVertical)
-			src_row = row_pointers[th - i - 1];
-		else
-			src_row = row_pointers[i];
-
-		if (flipHorizontal) {
-			for (j = 0; j < tw; j++) {
-				png_byte *src = src_row + bytes_per_pixel * j;
-				png_byte *dest = dest_row + bytes_per_pixel * (tw - j - 1);
-				memcpy(dest, src, bytes_per_pixel);
-			}
-		} else {
-			memcpy(dest_row, src_row, row_bytes);
-		}
-
-		if (has_alpha && pre_multiply_alpha) {
-			for (j = 0; j < tw; j++) {
-				png_byte *pixel = dest_row + bytes_per_pixel * j;
-				float alpha = pixel[3] / 255.0;
-				pixel[0] = pixel[0] * alpha;
-				pixel[1] = pixel[1] * alpha;
-				pixel[2] = pixel[2] * alpha;
-			}
-		}
-	}
-
-	png_destroy_read_struct(&png_ptr, &info_ptr, &end_info);
-	fclose(fp);
-	return (char *) image_data;
-
-cleanup:
-	if (image_data)
-		free(image_data);
-	png_destroy_read_struct(&png_ptr, &info_ptr, &end_info);
-	fclose(fp);
-	return 0;
-}
-
 static char *load_image(const char *filename, int *w, int *h, int *a, int *bytes_per_row)
 {
 	char *i;
 	char msg[100];
 
-	i = load_png_image(filename, 0, 0, 0, w, h, a, msg, sizeof(msg));
+	i = png_utils_read_png_image(filename, 0, 0, 0, w, h, a, msg, sizeof(msg));
 	if (!i) {
 		fprintf(stderr, "%s: cannot load image: %s\n", filename, msg);
 		exit(1);
@@ -802,11 +546,9 @@ static void save_images(const char *prefix, unsigned char *image[])
 
 	for (i = 0; i < 6; i++) {
 		sprintf(fname, "%s%d.png", prefix, i);
-		if (write_png_image(fname, image[i], DIM, DIM, 1))
+		if (png_utils_write_png_image(fname, image[i], DIM, DIM, 1, 0))
 			fprintf(stderr, "Failed to write %s\n", fname);
 	}
-	printf("o");
-	fflush(stdout);
 }
 
 static void save_output_images(void)
@@ -910,6 +652,16 @@ static void usage(void)
 	fprintf(stderr, "   -S, seed : set initial random seed.  Default is 31415\n");
 	fprintf(stderr, "   -w, water : png file containing water color data to sample for oceans\n");
 	fprintf(stderr, "   -z, bumpsize: initial bump size.  default = 0.4\n");
+	fprintf(stderr, "\n");
+	fprintf(stderr, "Examples:\n");
+	fprintf(stderr, "\n");
+	fprintf(stderr, "  For earthlike planets:\n");
+	fprintf(stderr, "  ./earthlike -B 25 -h heightdata.png -l land.png -w water.png --bumpsize 0.5 -o myplanet\n");
+	fprintf(stderr, "\n");
+	fprintf(stderr, "  For more rocky, mars-like planets (a.png and b.png should both be land images):\n");
+	fprintf(stderr, "  ./earthlike -B 400 -b 1 -h heightdata.png -l ~/a.png -w ~/b.png -O 0 --bumpsize 0.5 \\\n");
+	fprintf(stderr, "         --craters 250 -o myplanet\n");
+	fprintf(stderr, "\n");
 	fprintf(stderr, "\n");
 	exit(1);
 }
@@ -1016,16 +768,21 @@ int main(int argc, char *argv[])
 
 	snis_srand((unsigned int) random_seed);
 	open_simplex_noise(random_seed, &ctx);
+	printf("Loading %s\n", heightfile);
 	sampledata = load_image(heightfile, &samplew, &sampleh, &samplea,
 					&sample_bytes_per_row);
+	printf("Loading %s\n", landfile);
 	land = load_image(landfile, &landw, &landh, &landa, &landbpr);
+	printf("Loading %s\n", waterfile);
 	water = load_image(waterfile, &waterw, &waterh, &watera, &waterbpr);
+	printf("Allocating output images.\n");
 	allocate_output_images();
+	printf("Initializing vertices.\n");
 	initialize_vertices();
 	find_min_max_height(&min, &max);
 	add_bumps(initial_bumps);
 	add_craters(ncraters);
-	printf("total bumps = %d\n", totalbumps);
+	printf("Rendering %d total bumps\n", totalbumps);
 	render_all_bumps();
 	render_all_craters(min, max);
 	find_min_max_height(&min, &max);
@@ -1035,10 +792,14 @@ int main(int argc, char *argv[])
 	paint_normal_and_height_maps(min, max);
 	printf("painting terrain colors\n");
 	paint_terrain_colors(min, max);
+	printf("Writing color textures\n");
 	save_output_images();
+	printf("Writing normal maps\n");
 	save_normal_maps();
+	printf("Writing height maps\n");
 	save_height_maps();
 	open_simplex_noise_free(ctx);
+	printf("Done.\n");
 	return 0;
 }
 
