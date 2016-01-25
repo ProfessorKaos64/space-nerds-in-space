@@ -2,6 +2,7 @@
 #include <string.h>
 #include <math.h>
 #include <assert.h>
+#include <stdio.h>
 
 #include "vertex.h"
 #include "triangle.h"
@@ -432,6 +433,119 @@ void mesh_set_spherical_vertex_normals(struct mesh *m)
 			m->t[i].vnormal[j].x = normal.v.x;
 			m->t[i].vnormal[j].y = normal.v.y;
 			m->t[i].vnormal[j].z = normal.v.z;
+		}
+	}
+}
+
+/* An attempt at an analytic solution.
+ * (see: http://www.iquilezles.org/www/articles/patchedsphere/patchedsphere.htm )
+ * This does not seem to work (undoubtedly I've done something wrong.)
+ */
+void mesh_set_spherical_cubemap_tangent_and_bitangent(struct mesh *m)
+{
+	int i, j;
+
+	/* This algorithm will have problems for triangles which have vertices which
+	 * are on different faces of the cubemap...
+	 */
+	for (i = 0; i < m->ntriangles; i++) {
+		for (j = 0; j < 3; j++) {
+			union vec3 normal = { { m->t[i].v[j]->x, m->t[i].v[j]->y, m->t[i].v[j]->z } };
+			const float nx = normal.v.x;
+			const float ny = normal.v.y;
+			const float nz = normal.v.z;
+			float x = 0.0f;
+			float y = 0.0f;
+			union vec3 tangent, bitangent;
+
+			/* Figure out which face of cubemap we're on, and which coords
+			 * play roles of x and y in calculation of tangent and bitangent
+			 */
+			if (fabsf(nx) > fabsf(ny) && fabsf(nx) > fabsf(nz)) {
+				if (nx > 0)
+					x = 1.0f - nz;
+				else
+					x = nz;
+				y = ny;
+			} else if (fabsf(ny) > fabsf(nx) && fabsf(ny) > fabsf(nz)) {
+				if (ny > 0)
+					y = 1.0f - nz;
+				else
+					y = nz;
+				x = nx;
+			} else /* it must be true that (fabsf(nz) > fabsf(nx) && fabsf(nz) > fabsf(ny)) */ {
+				if (nz > 0)
+					x = nx;
+				else
+					x = 1.0f - nx;
+				y = ny;
+			}
+			cubemapped_sphere_tangent_and_bitangent(x, y, &tangent, &bitangent);
+			m->t[i].vtangent[j].x = tangent.v.x;
+			m->t[i].vtangent[j].y = tangent.v.y;
+			m->t[i].vtangent[j].z = tangent.v.z;
+			m->t[i].vbitangent[j].x = bitangent.v.x;
+			m->t[i].vbitangent[j].y = bitangent.v.y;
+			m->t[i].vbitangent[j].z = bitangent.v.z;
+		}
+	}
+}
+
+/* An attempt at an empirical solution, sampling rather than computing analytically.
+ * This only works with a spherified cube.
+ */
+void mesh_sample_spherical_cubemap_tangent_and_bitangent(struct mesh *m)
+{
+	int i, j;
+	union vec3 normal, tsample, bsample, tangent, bitangent;
+	float epsilon = 0.001;
+	int triangles_per_face;
+	int face;
+	const float epsilon_factor[6][6] = {
+			{  1.0,  0.0f,  0.0f, 0.0f, -1.0f,  0.0f, }, /* face 0 */
+			{  0.0f, 0.0f, -1.0f, 0.0f, -1.0f,  0.0f, }, /* face 1 */
+			{ -1.0f, 0.0f,  0.0f, 0.0f, -1.0f,  0.0f, }, /* face 2 */
+			{  0.0f, 0.0f,  1.0f, 0.0f, -1.0f,  0.0f, }, /* face 3 */
+			{  1.0f, 0.0f,  0.0f, 0.0f,  0.0f,  1.0f, }, /* face 4 */
+			{  1.0f, 0.0f,  0.0f, 0.0f,  0.0f, -1.0f, }, /* face 5 */
+	};
+
+	/* This algorithm will have problems for triangles which have vertices which
+	 * are on different faces of the cubemap.  Luckily there are no such vertices
+	 * in the case of a spherified cube with duplicated edge vertices.
+	 */
+
+	triangles_per_face = m->ntriangles / 6;
+	assert(triangles_per_face * 6 == m->ntriangles);
+	for (i = 0; i < m->ntriangles; i++) {
+		face = i / triangles_per_face;
+		for (j = 0; j < 3; j++) {
+			normal.v.x = m->t[i].v[j]->x;
+			normal.v.y = m->t[i].v[j]->y;
+			normal.v.z = m->t[i].v[j]->z;
+			vec3_normalize_self(&normal);
+
+			/* Based on which face of cubemap we're on, figure which coords
+			 * play roles of x and y in calculation of tangent and bitangent
+			 */
+			tsample.v.x = normal.v.x + epsilon_factor[face][0] * epsilon;
+			tsample.v.y = normal.v.y + epsilon_factor[face][1] * epsilon;
+			tsample.v.z = normal.v.z + epsilon_factor[face][2] * epsilon;
+			bsample.v.x = normal.v.x + epsilon_factor[face][3] * epsilon;
+			bsample.v.y = normal.v.y + epsilon_factor[face][4] * epsilon;
+			bsample.v.z = normal.v.z + epsilon_factor[face][5] * epsilon;
+			vec3_normalize_self(&tsample);
+			vec3_normalize_self(&bsample);
+			vec3_sub(&tangent, &tsample, &normal);
+			vec3_normalize_self(&tangent);
+			vec3_sub(&bitangent, &bsample, &normal);
+			vec3_normalize_self(&bitangent);
+			m->t[i].vtangent[j].x = tangent.v.x;
+			m->t[i].vtangent[j].y = tangent.v.y;
+			m->t[i].vtangent[j].z = tangent.v.z;
+			m->t[i].vbitangent[j].x = bitangent.v.x;
+			m->t[i].vbitangent[j].y = bitangent.v.y;
+			m->t[i].vbitangent[j].z = bitangent.v.z;
 		}
 	}
 }
@@ -1057,7 +1171,231 @@ struct mesh *mesh_unit_icosphere(int subdivisions)
 	m3 = mesh_duplicate(m2);
 	mesh_free(m2);
 	mesh_set_spherical_vertex_normals(m3);
+	mesh_set_spherical_cubemap_tangent_and_bitangent(m3);
+	mesh_graph_dev_init(m3);
 	return m3;
+}
+
+/* Compute the distance between two vertices of a cube after spherification */
+static float spherified_cube_vertex_distance(struct mesh *m, int v1, int v2)
+{
+	union vec3 vert1, vert2, diff;
+
+	vert1.v.x = m->v[v1].x;
+	vert1.v.y = m->v[v1].y;
+	vert1.v.z = m->v[v1].z;
+	vert2.v.x = m->v[v2].x;
+	vert2.v.y = m->v[v2].y;
+	vert2.v.z = m->v[v2].z;
+	vec3_normalize_self(&vert1);
+	vec3_normalize_self(&vert2);
+	vec3_sub(&diff, &vert1, &vert2);
+	return vec3_magnitude(&diff);
+}
+
+static void make_unit_cube_triangles(struct mesh *m, int face, int subdivisions)
+{
+	int i, j, v1, v2, v3, v4, vindex, tindex;
+	float v1v4dist, v2v3dist;
+
+	vindex = face * (subdivisions + 1) * (subdivisions + 1);
+	tindex = face * (subdivisions * subdivisions) * 2;
+	for (i = 0; i < subdivisions; i++) {
+		for (j = 0; j < subdivisions; j++) {
+
+			/*
+			 *	v1--------v2
+			 *	|          |
+			 *	|          |
+			 *	v3--------v4
+			 */
+
+			v1 = vindex + i + j * (subdivisions + 1);
+			v2 = v1 + 1;
+			v3 = v1 + subdivisions + 1;
+			v4 = v3 + 1;
+
+			/* Cut the rectangle (v1,v2,v4,v3) into two triangles by the shortest diagonal */
+			v1v4dist = spherified_cube_vertex_distance(m, v1, v4);
+			v2v3dist = spherified_cube_vertex_distance(m, v2, v3);
+			if (v2v3dist < v1v4dist) {
+				/* Make triangles (v1,v2,v3) and (v3,v2,v4). */
+				m->t[tindex].v[0] = &m->v[v1];
+				m->t[tindex].v[1] = &m->v[v2];
+				m->t[tindex].v[2] = &m->v[v3];
+				tindex++;
+
+				m->t[tindex].v[0] = &m->v[v3];
+				m->t[tindex].v[1] = &m->v[v2];
+				m->t[tindex].v[2] = &m->v[v4];
+				tindex++;
+			} else {
+				/* Make triangles (v1,v2,v4) and (v1,v4,v3). */
+				m->t[tindex].v[0] = &m->v[v1];
+				m->t[tindex].v[1] = &m->v[v2];
+				m->t[tindex].v[2] = &m->v[v4];
+				tindex++;
+
+				m->t[tindex].v[0] = &m->v[v1];
+				m->t[tindex].v[1] = &m->v[v4];
+				m->t[tindex].v[2] = &m->v[v3];
+				tindex++;
+			}
+		}
+	}
+}
+
+struct mesh *mesh_unit_cube(int subdivisions)
+{
+	struct mesh *m;
+	int i, j, face, vindex;
+	float xangle, yangle, zangle;
+	const double da = (90.0 * M_PI / 180.0) / (double) subdivisions;
+	const double start_angle = 45.0 * M_PI / 180.0;
+
+	m = malloc(sizeof(*m));
+	if (!m)
+		return m;
+	memset(m, 0, sizeof(*m));
+	m->nvertices = 6 * (subdivisions + 1) * (subdivisions + 1);
+	m->ntriangles = 6 * (subdivisions * subdivisions) * 2;
+
+	m->t = malloc(sizeof(*m->t) * m->ntriangles);
+	if (!m->t)
+		goto bail;
+	memset(m->t, 0, sizeof(*m->t) * m->ntriangles);
+	m->v = malloc(sizeof(*m->v) * m->nvertices);
+	if (!m->v)
+		goto bail;
+	memset(m->v, 0, sizeof(*m->v) * m->nvertices);
+	m->tex = 0;
+	/* m->tex = malloc(sizeof(*m->tex) * m->ntriangles * 3);
+	if (!m->tex)
+		goto bail;
+	memset(m->tex, 0, sizeof(*m->tex) * m->ntriangles * 3); */
+	m->l = NULL;
+
+	m->geometry_mode = MESH_GEOMETRY_TRIANGLES;
+
+	face = 0; /* normal is positive z */
+	vindex = face * (subdivisions + 1) * (subdivisions + 1);
+	for (i = 0; i < subdivisions + 1; i++) {
+		for (j = 0; j < subdivisions + 1; j++) {
+			xangle = start_angle - da * i;
+			yangle = -start_angle + da * j;
+			m->v[vindex].x = tan(xangle);
+			m->v[vindex].y = tan(yangle);
+			m->v[vindex].z = 1.0f;
+			vindex++;
+		}
+	}
+
+	face = 1; /* normal is positive x */
+	vindex = face * (subdivisions + 1) * (subdivisions + 1);
+	for (i = 0; i < subdivisions + 1; i++) {
+		for (j = 0; j < subdivisions + 1; j++) {
+			yangle = start_angle - da * j;
+			zangle = start_angle - da * i;
+			m->v[vindex].x = 1.0;
+			m->v[vindex].y = tan(yangle);
+			m->v[vindex].z = tan(zangle);
+			vindex++;
+		}
+	}
+
+	face = 2; /* normal is negative z */
+	vindex = face * (subdivisions + 1) * (subdivisions + 1);
+	for (i = 0; i < subdivisions + 1; i++) {
+		for (j = 0; j < subdivisions + 1; j++) {
+			xangle = -start_angle + da * i;
+			yangle = -start_angle + da * j;
+			m->v[vindex].x = tan(xangle);
+			m->v[vindex].y = tan(yangle);
+			m->v[vindex].z = -1.0;
+			vindex++;
+		}
+	}
+
+	face = 3; /* normal is negative x */
+	vindex = face * (subdivisions + 1) * (subdivisions + 1);
+	for (i = 0; i < subdivisions + 1; i++) {
+		for (j = 0; j < subdivisions + 1; j++) {
+			yangle = -start_angle + da * j;
+			zangle = start_angle - da * i;
+			m->v[vindex].x = -1.0;
+			m->v[vindex].y = tan(yangle);
+			m->v[vindex].z = tan(zangle);
+			vindex++;
+		}
+	}
+
+	face = 4; /* normal is positive y */
+	vindex = face * (subdivisions + 1) * (subdivisions + 1);
+	for (i = 0; i < subdivisions + 1; i++) {
+		for (j = 0; j < subdivisions + 1; j++) {
+			xangle = start_angle - da * i;
+			zangle = start_angle - da * j;
+			m->v[vindex].x = tan(xangle);
+			m->v[vindex].y = 1.0f;
+			m->v[vindex].z = tan(zangle);
+			vindex++;
+		}
+	}
+
+	face = 5; /* normal is negative y */
+	vindex = face * (subdivisions + 1) * (subdivisions + 1);
+	for (i = 0; i < subdivisions + 1; i++) {
+		for (j = 0; j < subdivisions + 1; j++) {
+			xangle = start_angle - da * i;
+			zangle = -start_angle + da * j;
+			m->v[vindex].x = tan(xangle);
+			m->v[vindex].y = -1.0f;
+			m->v[vindex].z = tan(zangle);
+			vindex++;
+		}
+	}
+
+	for (i = 0; i < 6; i++)
+		make_unit_cube_triangles(m, i, subdivisions);
+
+	mesh_set_flat_shading_vertex_normals(m);
+	m->nlines = 0;
+	m->radius = mesh_compute_radius(m);
+	mesh_graph_dev_init(m);
+	return m;
+bail:
+	mesh_free(m);
+	return NULL;
+}
+
+struct mesh *mesh_unit_spherified_cube(int subdivisions)
+{
+	int i;
+	union vec3 v;
+
+	struct mesh *m = mesh_unit_cube(subdivisions);
+	if (!m)
+		return m;
+
+	/* Normalize all the vertices to turn the cube into a sphere */
+	for (i = 0; i < m->nvertices; i++) {
+		v.v.x = m->v[i].x;
+		v.v.y = m->v[i].y;
+		v.v.z = m->v[i].z;
+
+		vec3_normalize_self(&v);
+
+		m->v[i].x = v.v.x;
+		m->v[i].y = v.v.y;
+		m->v[i].z = v.v.z;
+	}
+
+	mesh_set_spherical_vertex_normals(m);
+	mesh_sample_spherical_cubemap_tangent_and_bitangent(m);
+	m->nlines = 0;
+	m->radius = mesh_compute_radius(m);
+	mesh_graph_dev_init(m);
+	return m;
 }
 
 /* this has a known issue mapping vertices of tris that span the "international date line" */
