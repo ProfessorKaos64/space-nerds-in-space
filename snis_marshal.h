@@ -53,6 +53,7 @@ GLOBAL int packed_buffer_append(struct packed_buffer *pb, const char *format, ..
 GLOBAL int packed_buffer_append_va(struct packed_buffer *pb, const char *format,
 					va_list ap);
 GLOBAL int packed_buffer_unpack(void*, const char *format, ...);
+GLOBAL int packed_buffer_unpack_raw(void *buffer, int size, const char *format, ...);
 GLOBAL int packed_buffer_extract(struct packed_buffer *pb, const char *format, ...);
 GLOBAL int packed_buffer_extract_va(struct packed_buffer *pb, const char *format,
 					va_list ap);
@@ -80,6 +81,7 @@ GLOBAL void packed_buffer_queue_prepend(struct packed_buffer_queue *pbqh, struct
 		pthread_mutex_t *mutex);
 GLOBAL void packed_buffer_queue_init(struct packed_buffer_queue *pbq);
 GLOBAL void packed_buffer_queue_print(struct packed_buffer_queue *pbg);
+GLOBAL void packed_buffer_print(char *label, struct packed_buffer *pb);
 GLOBAL struct packed_buffer *packed_buffer_copy(struct packed_buffer *pb);
 GLOBAL void packed_buffer_init(struct packed_buffer * pb, void *buffer, int size);
 

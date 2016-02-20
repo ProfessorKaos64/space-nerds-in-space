@@ -4127,7 +4127,7 @@ static int process_ship_sdata_packet(void)
 	rc = snis_readsocket(gameserver_sock, buffer, sizeof(struct ship_sdata_packet) - sizeof(uint8_t));
 	if (rc != 0)
 		return rc;
-	packed_buffer_unpack(buffer, "wbbbbbbbr",&id, &subclass, &shstrength, &shwavelength,
+	packed_buffer_unpack_raw(buffer, sizeof(buffer), "wbbbbbbbr", &id, &subclass, &shstrength, &shwavelength,
 			&shwidth, &shdepth, &faction, &lifeform_count,
 			name, (unsigned short) sizeof(name));
 	pthread_mutex_lock(&universe_mutex);
@@ -5252,7 +5252,8 @@ static void draw_main_screen_text(GtkWidget *w, GdkGC *gc)
 	}
 }
 
-static void draw_targeting_indicator(GtkWidget *w, GdkGC *gc, int x, int y, int color, int ring)
+static void draw_targeting_indicator(GtkWidget *w, GdkGC *gc, int x, int y, int color,
+					int ring, float scale, float ratio)
 {
 	int i;
 
@@ -5265,15 +5266,15 @@ static void draw_targeting_indicator(GtkWidget *w, GdkGC *gc, int x, int y, int 
 
 		angle = (M_PI * ((i * 90 + offset + timer * 4) % 360)) / 180.0;
 
-		dx = 15.0 * cos(angle);
-		dy = 15.0 * sin(angle);
-		ddx = 5.0 * cos(angle + M_PI / 2.0);
-		ddy = 5.0 * sin(angle + M_PI / 2.0);
+		dx = scale * 15.0 * cos(angle);
+		dy = scale * 15.0 * sin(angle);
+		ddx = scale * 5.0 * cos(angle + M_PI / 2.0);
+		ddy = scale * 5.0 * sin(angle + M_PI / 2.0);
 
 		x1 = x + dx;
 		y1 = y + dy;
-		x2 = x + 2.0 * dx;
-		y2 = y + 2.0 * dy;
+		x2 = x + ratio * dx;
+		y2 = y + ratio * dy;
 		/* snis_draw_line(x1, y1, x2, y2); */
 		snis_draw_line(x2 - ddx, y2 - ddy, x2 + ddx, y2 + ddy);
 		snis_draw_line(x2 - ddx, y2 - ddy, x1, y1);
@@ -5377,6 +5378,7 @@ static void show_weapons_camera_view(GtkWidget *w)
 	union quat camera_orientation;
 	union vec3 recoil = { { -1.0f, 0.0f, 0.0f } };
 	char buf[20];
+	int i;
 
 	static int last_timer = 0;
 	int first_frame = (timer != last_timer+1);
@@ -5470,6 +5472,20 @@ static void show_weapons_camera_view(GtkWidget *w)
 
 	render_entities(ecx);
 
+	/* Show targeting aids */
+	for (i = 0; i <= snis_object_pool_highest_object(pool); i++) {
+		struct snis_entity *o = &go[i];
+
+		if (o->alive && (o->type == OBJTYPE_SHIP2 || o->type == OBJTYPE_SHIP1)) {
+			if (entity_onscreen(o->entity)) {
+				float sx, sy;
+				entity_get_screen_coords(o->entity, &sx, &sy);
+				draw_targeting_indicator(w, gc, sx, sy, TARGETING_COLOR, 0, 0.5, 1.5f);
+			}
+		}
+	}
+
+
 	/* Remove our ship from the scene */
 	remove_entity(ecx, turret_entity);
 	remove_entity(ecx, o->entity);
@@ -5487,7 +5503,7 @@ static void show_weapons_camera_view(GtkWidget *w)
 
 		if (target && target->alive && target->entity && entity_onscreen(target->entity)) {
 			entity_get_screen_coords(target->entity, &sx, &sy);
-			draw_targeting_indicator(w, gc, sx, sy, TARGETING_COLOR, 0);
+			draw_targeting_indicator(w, gc, sx, sy, TARGETING_COLOR, 0, 1.0f, 2.0f);
 		}
 	}
 #endif
@@ -5498,7 +5514,7 @@ static void show_weapons_camera_view(GtkWidget *w)
 		if (curr_science_guy->alive && curr_science_guy->entity &&
 			entity_onscreen(curr_science_guy->entity)) {
 			entity_get_screen_coords(curr_science_guy->entity, &sx, &sy);
-			draw_targeting_indicator(w, gc, sx, sy, SCIENCE_SELECT_COLOR, 0);
+			draw_targeting_indicator(w, gc, sx, sy, SCIENCE_SELECT_COLOR, 0, 1.0f, 2.0f);
 		}
 	}
 
@@ -5683,7 +5699,7 @@ static void show_mainscreen(GtkWidget *w)
 		if (target && target->alive && target->entity &&
 			entity_onscreen(target->entity)) {
 			entity_get_screen_coords(target->entity, &sx, &sy);
-			draw_targeting_indicator(w, gc, sx, sy, TARGETING_COLOR, 0);
+			draw_targeting_indicator(w, gc, sx, sy, TARGETING_COLOR, 0, 1.0f, 2.0f);
 		}
 	}
 #endif
@@ -5694,7 +5710,7 @@ static void show_mainscreen(GtkWidget *w)
 		if (curr_science_guy->alive && curr_science_guy->entity &&
 			entity_onscreen(curr_science_guy->entity)) {
 			entity_get_screen_coords(curr_science_guy->entity, &sx, &sy);
-			draw_targeting_indicator(w, gc, sx, sy, UI_COLOR(main_sci_selection), 0);
+			draw_targeting_indicator(w, gc, sx, sy, UI_COLOR(main_sci_selection), 0, 1.0f, 2.0f);
 		}
 	}
 
@@ -8065,14 +8081,14 @@ static void draw_3d_nav_display(GtkWidget *w, GdkGC *gc)
 		float sx, sy;
 
 		entity_get_screen_coords(targeted_entity, &sx, &sy);
-		draw_targeting_indicator(w, gc, sx, sy, TARGETING_COLOR, 0);
+		draw_targeting_indicator(w, gc, sx, sy, TARGETING_COLOR, 0, 1.0f, 2.0f);
 	}
 #endif
 	if (science_entity && entity_onscreen(science_entity)) {
 		float sx, sy;
 
 		entity_get_screen_coords(science_entity, &sx, &sy);
-		draw_targeting_indicator(w, gc, sx, sy, UI_COLOR(nav_science_select), 0);
+		draw_targeting_indicator(w, gc, sx, sy, UI_COLOR(nav_science_select), 0, 1.0f, 2.0f);
 	}
 
 	pthread_mutex_unlock(&universe_mutex);
@@ -11967,6 +11983,7 @@ static void load_static_textures(void)
 		sprintf(filename, "nebula%d.mat", i);
 
 		material_nebula_read_from_file(asset_dir, filename, &nebula_material[i]);
+		nebula_material[i].nebula.alpha *= 0.25;
 	}
 
 	material_init_texture_cubemap(&asteroid_material[0]);
