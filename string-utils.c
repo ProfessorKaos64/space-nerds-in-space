@@ -59,6 +59,14 @@ void uppercase(char *w)
 		*i = toupper(*i);
 }
 
+void lowercase(char *w)
+{
+	char *i;
+
+	for (i = w; *i; i++)
+		*i = tolower(*i);
+}
+
 char *dir_name(char *path)
 {
 	char *x;
@@ -149,5 +157,30 @@ char *slurp_file(const char *path, int *bytes)
 	if (bytes)
 		*bytes = (int) statbuf.st_size;
 	return buffer;
+}
+
+void remove_single_quotes(char *s)
+{
+	char *src = s;
+	char *dest = s;
+
+	do {
+		if (*src == '\'') {
+			src++;
+			continue;
+		}
+		if (dest == src) {
+			if (!*src)
+				break;
+			dest++;
+			src++;
+			continue;
+		}
+		*dest = *src;
+		if (!*src)
+			break;
+		dest++;
+		src++;
+	} while (1);
 }
 
