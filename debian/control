@@ -6,11 +6,12 @@ Build-Depends: debhelper (>= 9),
  portaudio19-dev, 
  libvorbis-dev,
  libgtk2.0-dev,
- openscad,
  libgtkglext1-dev, 
  liblua5.2-dev,
  libglew-dev (>= 1.10.0-3),
- libsdl1.2-dev
+ libsdl1.2-dev,
+ libssl-dev,
+ openscad
 Standards-Version: 3.9.5
 Homepage: http://smcameron.github.io/space-nerds-in-space
 Vcs-Git: https://github.com/smcameron/space-nerds-in-space.git
