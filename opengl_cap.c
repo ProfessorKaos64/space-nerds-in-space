@@ -21,13 +21,33 @@
 #include <GL/glew.h>
 #include "opengl_cap.h"
 
+#include <stdlib.h>
+
 int msaa_framebuffer_supported()
 {
+	static int suppress = -1;
+	if (suppress == -1) {
+		if (getenv("SNIS_SUPPRESS_MSAA") != NULL)
+			suppress = 1;
+		else
+			suppress = 0;
+	}
+	if (suppress)
+		return 0;
 	return GLEW_ARB_multisample;
 }
 
 int msaa_render_to_fbo_supported()
 {
+	static int suppress = -1;
+	if (suppress == -1) {
+		if (getenv("SNIS_SUPPRESS_FBO") != NULL)
+			suppress = 1;
+		else
+			suppress = 0;
+	}
+	if (suppress)
+		return 0;
 	return GLEW_EXT_framebuffer_multisample && msaa_max_samples() > 0;
 }
 
@@ -40,6 +60,15 @@ int msaa_max_samples()
 
 int fbo_render_to_texture_supported()
 {
+	static int suppress = -1;
+	if (suppress == -1) {
+		if (getenv("SNIS_SUPPRESS_RENDER_TO_TEXTURE") != NULL)
+			suppress = 1;
+		else
+			suppress = 0;
+	}
+	if (suppress)
+		return 0;
 	return GLEW_EXT_framebuffer_object && GLEW_EXT_framebuffer_blit;
 }
 

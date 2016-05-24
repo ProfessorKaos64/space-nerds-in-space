@@ -42,9 +42,61 @@ ssgl/ssgl_server
 
 sleep 0.25
 
-./snis_server localhost SPACENERDS `hostname` localhost --enable-enscript &
+start_multiverse()
+{
+	if [ ! -d ./snisdb ]
+	then
+		echo "./snisdb/ does not exist, creating directory." 1>&2
+		mkdir ./snisdb
+		if [ "$?" != "0" ]
+		then
+			echo "mkdir ./snisdb failed."
+		fi
+		if [ ! -d ./snisdb ]
+		then
+			echo "Directory ./snisdb does not exist, snis_multiverse will not run without it, please create it." 1>&2
+			exit 1
+		fi
+		echo "Created ./snisdb for snis_multiverse" 1>&2
+	fi
+	./snis_multiverse localhost nickname narnia
+	echo "snis_multiverse died, status was $?" 1>&2
+}
 
-sleep 0.50
+start_multiverse &
+
+sleep 0.25
+
+get_solarsystem_name()
+{
+	if [ -d share/snis/solarsystems/"$1" ]
+	then
+		echo "$1"
+	else
+		echo "default2"
+	fi
+}
+
+uppercase()
+{
+	echo "$1" | tr '[a-z]' '[A-Z]'
+}
+
+SS1=$(get_solarsystem_name karado)
+SS2=$(get_solarsystem_name sirius)
+SS3=$(get_solarsystem_name polaris)
+
+export SNISRAND=12345
+./snis_server -l localhost -g SPACENERDS -L $(uppercase "$SS1") x --enable-enscript -m narnia -s "$SS1" &
+if [ "$MULTIVERSE_TEST" != "" ]
+then
+	export SNISRAND=54321
+	./snis_server -l localhost -g XSPACENERDS -L $(uppercase "$SS2") x --enable-enscript -m narnia -s "$SS2" &
+	export SNISRAND=9557
+	./snis_server -l localhost -g YSPACENERDS -L $(uppercase "$SS3") x --enable-enscript -m narnia -s "$SS3" &
+fi
+
+sleep 2.50
 
 # Some common aspect ratios.  Note: the game was designed on a machine
 # with a 16:9 aspect ratio.  Other aspect ratios may have some UI issues.
@@ -56,7 +108,8 @@ ASPECT_RATIO="" # unspecified, figure it out from window manager
 # ASPECT_RATIO="--aspect-ratio 16:9"
 
 # start the game client and server in quickstart mode
-./snis_client $ASPECT_RATIO --fullscreen --solarsystem "$SNIS_SOLARSYSTEM" --quickstart --starship "$shipname" --pw "$password" $@
+# ./snis_client $ASPECT_RATIO --fullscreen --solarsystem "$SNIS_SOLARSYSTEM" --quickstart --starship "$shipname" --pw "$password" $@
+./snis_client $ASPECT_RATIO --fullscreen --starship "$shipname" --pw "$password" $@
 
 exit $?
 

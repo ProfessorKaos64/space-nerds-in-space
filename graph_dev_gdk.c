@@ -932,7 +932,7 @@ void graph_dev_draw_skybox(struct entity_context *cx, const struct mat44 *mat_vp
 	/* no skybox on gdk rendering */
 }
 
-void graph_dev_load_skybox_texture(
+int graph_dev_load_skybox_texture(
 	const char *texture_filename_pos_x,
 	const char *texture_filename_neg_x,
 	const char *texture_filename_pos_y,
@@ -940,7 +940,7 @@ void graph_dev_load_skybox_texture(
 	const char *texture_filename_pos_z,
 	const char *texture_filename_neg_z)
 {
-	/* no skybox on gdk rendering */
+	return 0; /* no skybox on gdk rendering */
 }
 
 unsigned int graph_dev_load_cubemap_texture(
@@ -978,19 +978,40 @@ int graph_dev_graph_dev_debug_menu_click(int x, int y)
 	return 0;
 }
 
-void graph_dev_reload_changed_textures()
+int graph_dev_reload_changed_textures()
 {
-	/* noop */
+	return 0; /* noop */
 }
 
-void graph_dev_reload_changed_cubemap_textures()
+int graph_dev_reload_changed_cubemap_textures()
 {
-	/* noop */
+	return 0; /* noop */
 }
 
 void graph_dev_grab_framebuffer(__attribute__((unused)) unsigned char **buffer,
 				__attribute__((unused)) int *width,
 				__attribute__((unused)) int *height)
+{
+	/* noop */
+}
+
+void graph_dev_expire_all_textures(void)
+{
+	/* noop */
+}
+
+extern void graph_dev_expire_texture(char *filename)
+{
+	/* noop */
+}
+
+extern void graph_dev_expire_cubemap_texture(int is_inside,
+						const char *texture_filename_pos_x,
+						const char *texture_filename_neg_x,
+						const char *texture_filename_pos_y,
+						const char *texture_filename_neg_y,
+						const char *texture_filename_pos_z,
+						const char *texture_filename_neg_z)
 {
 	/* noop */
 }

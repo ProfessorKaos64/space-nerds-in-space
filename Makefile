@@ -348,10 +348,14 @@ GLEWCFLAGS:=$(shell pkg-config --cflags glew)
 COMMONOBJS=mathutils.o snis_alloc.o snis_socket_io.o snis_marshal.o \
 		bline.o shield_strength.o stacktrace.o snis_ship_type.o \
 		snis_faction.o mtwist.o names.o infinite-taunt.o snis_damcon_systems.o \
-		string-utils.o c-is-the-locale.o starbase_metadata.o arbitrary_spin.o
+		string-utils.o c-is-the-locale.o starbase_metadata.o arbitrary_spin.o \
+		snis_hash.o
 SERVEROBJS=${COMMONOBJS} snis_server.o starbase-comms.o \
 		power-model.o quat.o vec4.o matrix.o snis_event_callback.o space-part.o fleet.o \
-		commodities.o docking_port.o elastic_collision.o
+		commodities.o docking_port.o elastic_collision.o snis_nl.o spelled_numbers.o \
+		snis_server_tracker.o snis_bridge_update_packet.o solarsystem_config.o a_star.o
+MULTIVERSEOBJS=snis_multiverse.o snis_marshal.o snis_socket_io.o mathutils.o mtwist.o stacktrace.o \
+		snis_hash.o quat.o string-utils.o key_value_parser.o snis_bridge_update_packet.o
 
 COMMONCLIENTOBJS=${COMMONOBJS} ${OGGOBJ} ${SNDOBJS} snis_ui_element.o snis_font.o snis_text_input.o \
 	snis_typeface.o snis_gauge.o snis_button.o snis_label.o snis_sliders.o snis_text_window.o \
@@ -365,8 +369,10 @@ LIMCLIENTOBJS=${COMMONCLIENTOBJS} graph_dev_gdk.o snis_limited_graph.o snis_limi
 SDLCLIENTOBJS=${COMMONCLIENTOBJS} shader.o graph_dev_opengl.o opengl_cap.o snis_graph.o mesh_viewer.o png_utils.o
 
 SSGL=ssgl/libssglclient.a
-LIBS=-lGL -Lssgl -lssglclient -ldl -lm ${LUALIBS} ${PNGLIBS} ${GLEWLIBS}
-SERVERLIBS=-Lssgl -lssglclient ${LRTLIB} -ldl -lm ${LUALIBS}
+LIBS=-lGL -Lssgl -lssglclient -ldl -lm ${LUALIBS} ${PNGLIBS} ${GLEWLIBS} -lcrypto -lssl
+SERVERLIBS=-Lssgl -lssglclient ${LRTLIB} -ldl -lm ${LUALIBS} -lcrypto -lssl
+MULTIVERSELIBS=-Lssgl -lssglclient ${LRTLIB} -ldl -lm
+MULTIVERSELIBS=-Lssgl -lssglclient ${LRTLIB} -ldl -lm -lcrypto -lssl
 #
 # NOTE: if you get
 #
@@ -386,8 +392,8 @@ SERVERLIBS=-Lssgl -lssglclient ${LRTLIB} -ldl -lm ${LUALIBS}
 #
 
 
-PROGS=snis_server snis_client snis_limited_client mesh_viewer
-BINPROGS=bin/ssgl_server bin/snis_server bin/snis_client bin/snis_limited_client
+PROGS=snis_server snis_client snis_limited_client mesh_viewer snis_multiverse
+BINPROGS=bin/ssgl_server bin/snis_server bin/snis_client bin/snis_limited_client bin/text_to_speech.sh
 UTILPROGS=util/mask_clouds util/cloud-mask-normalmap
 
 # model directory
@@ -435,7 +441,8 @@ MODELS=${MD}/freighter.stl \
 	${MD}/spaceship_turret_base.stl \
 	${MD}/vanquisher.stl \
 	${MD}/docking_port.stl \
-	${MD}/docking_port2.stl
+	${MD}/docking_port2.stl \
+	${MD}/warpgate.stl
 
 MYCFLAGS=-DPREFIX=${PREFIX} ${DEBUGFLAG} ${PROFILEFLAG} ${OPTIMIZEFLAG}\
 	--pedantic -Wall ${STOP_ON_WARN} -pthread -std=gnu99 -rdynamic
@@ -464,6 +471,7 @@ CLIENTLINK=$(CC) ${MYCFLAGS} ${SNDFLAGS} -o $@ ${GTKCFLAGS} ${GLEXTCFLAGS} ${CLI
 LIMCLIENTLINK=$(CC) ${MYCFLAGS} ${SNDFLAGS} -o $@ ${GTKCFLAGS} ${LIMCLIENTOBJS} ${GLEXTLDFLAGS} ${LIBS} ${SNDLIBS} && $(ECHO) '  LINK' $@
 SDLCLIENTLINK=$(CC) ${MYCFLAGS} ${SNDFLAGS} -o $@ ${SDLCFLAGS} ${SDLCLIENTOBJS} ${SDLLIBS} ${LIBS} ${SNDLIBS} && $(ECHO) '  LINK' $@
 SERVERLINK=$(CC) ${MYCFLAGS} -o $@ ${SERVEROBJS} ${SERVERLIBS} && $(ECHO) '  LINK' $@
+MULTIVERSELINK=$(CC) ${MYCFLAGS} -o $@ ${MULTIVERSEOBJS} ${MULTIVERSELIBS} && $(ECHO) '  LINK' $@
 OPENSCAD=openscad -o $@ $< && $(ECHO) '  OPENSCAD' $<
 EXTRACTSCADPARAMS=$(AWK) -f extract_scad_params.awk $< > $@ && $(ECHO) '  EXTRACT THRUST ATTACHMENTS' $@
 EXTRACTDOCKINGPORTS=$(AWK) -f extract_docking_ports.awk $< > $@ && $(ECHO) '  EXTRACT DOCKING PORTS' $@
@@ -483,7 +491,7 @@ GGOBJS=mtwist.o mathutils.o open-simplex-noise.o quat.o png_utils.o
 GGLIBS=-lm ${LRTLIB} -lpng
 GGLINK=$(CC) ${MYCFLAGS} -o $@ ${GTKCFLAGS} gaseous-giganticus.o ${GGOBJS} ${GGLIBS} && $(ECHO) '  LINK' $@
 
-all:	${COMMONOBJS} ${SERVEROBJS} ${CLIENTOBJS} ${LIMCLIENTOBJS} ${PROGS} ${MODELS} ${BINPROGS} ${SCAD_PARAMS_FILES} ${DOCKING_PORT_FILES} ${UTILPROGS}
+all:	${COMMONOBJS} ${SERVEROBJS} ${MULTIVERSEOBJS} ${CLIENTOBJS} ${LIMCLIENTOBJS} ${PROGS} ${MODELS} ${BINPROGS} ${SCAD_PARAMS_FILES} ${DOCKING_PORT_FILES} ${UTILPROGS}
 
 build:	all
 
@@ -565,6 +573,12 @@ shield_strength.o:	shield_strength.c Makefile
 snis_server.o:	snis_server.c Makefile build_info.h
 	$(Q)$(COMPILE)
 
+snis_multiverse.o:	snis_multiverse.c snis_multiverse.h Makefile build_info.h
+	$(Q)$(COMPILE)
+
+snis_server_tracker.o:	snis_server_tracker.c snis_server_tracker.h ssgl/ssgl.h Makefile
+	$(Q)$(COMPILE)
+
 snis_client.o:	snis_client.c Makefile build_info.h ui_colors.h
 	$(Q)$(GLEXTCOMPILE)
 
@@ -601,6 +615,9 @@ snis_socket_io.o:	snis_socket_io.c Makefile
 snis_marshal.o:	snis_marshal.c Makefile
 	$(Q)$(COMPILE)
 
+snis_bridge_update_packet.o:	snis_bridge_update_packet.c snis_bridge_update_packet.h Makefile
+	$(Q)$(COMPILE)
+
 snis_font.o:	snis_font.c Makefile
 	$(Q)$(COMPILE)
 
@@ -621,6 +638,9 @@ snis_server:	${SERVEROBJS} ${SSGL} Makefile
 
 snis_client:	${CLIENTOBJS} ${SSGL} Makefile
 	$(Q)$(CLIENTLINK)
+
+snis_multiverse:	${MULTIVERSEOBJS} ${SSGL} Makefile
+	$(Q)$(MULTIVERSELINK)
 
 snis_limited_client:	${LIMCLIENTOBJS} ${SSGL} Makefile
 	$(Q)$(LIMCLIENTLINK)
@@ -643,6 +663,10 @@ bin/snis_limited_client:	snis_limited_client
 bin/ssgl_server:	ssgl/ssgl_server
 	@mkdir -p bin
 	@cp ssgl/ssgl_server bin
+
+bin/text_to_speech.sh:	text_to_speech.sh
+	@cp text_to_speech.sh bin/text_to_speech.sh
+	@chmod +x bin/text_to_speech.sh
 
 mesh_viewer:	${SDLCLIENTOBJS} ${SSGL} Makefile
 	$(Q)$(SDLCLIENTLINK)
@@ -736,6 +760,15 @@ vec4.o:	vec4.c Makefile
 arbitrary_spin.o:	arbitrary_spin.c arbitrary_spin.h Makefile
 	$(Q)$(COMPILE)
 
+a_star.o:	a_star.c a_star.h Makefile
+	$(Q)$(COMPILE)
+
+a_star_test.o:	a_star_test.c a_star.h Makefile
+	$(Q)$(COMPILE)
+
+a_star_test:	a_star_test.o a_star.o Makefile
+	gcc -g -o a_star_test a_star_test.c a_star.o -lm
+
 mtwist.o:	mtwist.c Makefile
 	$(Q)$(COMPILE)
 
@@ -757,6 +790,13 @@ commodities.o:	commodities.c Makefile
 string-utils.o:	string-utils.c Makefile
 	$(Q)$(COMPILE)
 
+key_value_parser.o:	key_value_parser.c key_value_parser.h Makefile
+	$(Q)$(COMPILE)
+
+test_key_value_parser:	key_value_parser.c key_value_parser.h Makefile
+	$(CC) ${MYCFLAGS} -DTEST_KEY_VALUE_PARSER -o test_key_value_parser key_value_parser.c
+	./test_key_value_parser
+
 test-matrix:	matrix.c Makefile
 	$(CC) ${MYCFLAGS} ${GTKCFLAGS} -DTEST_MATRIX -o test-matrix matrix.c -lm
 
@@ -765,6 +805,21 @@ test-space-partition:	space-part.c Makefile
 
 snis_event_callback.o:	snis_event_callback.c Makefile
 	$(Q)$(COMPILE)
+
+snis_hash.o:	snis_hash.c snis_hash.h Makefile
+	$(Q)$(COMPILE)
+
+snis_nl.o:	snis_nl.c snis_nl.h Makefile
+	$(Q)$(COMPILE)
+
+snis_nl:	snis_nl.o string-utils.o spelled_numbers.o
+	$(CC) -g -DTEST_NL -o snis_nl string-utils.o spelled_numbers.o snis_nl.c
+
+spelled_numbers.o:	spelled_numbers.c spelled_numbers.h Makefile
+	$(Q)$(COMPILE)
+
+spelled_numbers:	spelled_numbers.c
+	$(CC) -g -DSPELLED_NUMBERS_TEST_CASE -o spelled_numbers spelled_numbers.c
 
 ${SSGL}:
 	(cd ssgl ; ${MAKE} )

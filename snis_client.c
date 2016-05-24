@@ -108,6 +108,7 @@
 
 #define SHIP_COLOR CYAN
 #define STARBASE_COLOR RED
+#define WARPGATE_COLOR WHITE
 #define WORMHOLE_COLOR WHITE
 #define PLANET_COLOR GREEN
 #define ASTEROID_COLOR AMBER
@@ -188,6 +189,9 @@ static int physical_io_socket = -1;
 static pthread_t physical_io_thread;
 static pthread_attr_t physical_io_thread_attr;
 
+static pthread_t natural_language_thread;
+static pthread_attr_t natural_language_thread_attr;
+
 GtkWidget *window;
 GdkGC *gc = NULL;               /* our graphics context. */
 GtkWidget *main_da;             /* main drawing area. */
@@ -215,13 +219,17 @@ int damage_limbo_countdown = 0;
 
 struct entity_context *ecx;
 struct entity_context *sciecx;
-struct entity_context *navecx;
+struct entity_context *instrumentecx; /* Used by nav screen, sciplane screen, and demon screen */
 struct entity_context *tridentecx;
 struct entity_context *sciballecx;
 
 static int ecx_fake_stars_initialized = 0;
 static int nfake_stars = 2000;
 static volatile int fake_stars_timer = 0;
+static volatile int credits_screen_active = 0;
+
+static volatile int login_failed_timer = 0;
+static char login_failed_msg[100] = { 0 };
 
 static volatile int displaymode = DISPLAYMODE_LOBBYSCREEN;
 static volatile int helpmode = 0;
@@ -301,6 +309,7 @@ struct mesh *torpedo_nav_mesh;
 struct mesh *laser_mesh;
 struct mesh *asteroid_mesh[NASTEROID_MODELS];
 struct mesh *sphere_mesh;
+struct mesh *low_poly_sphere_mesh;
 struct mesh *planetary_ring_mesh;
 struct mesh **starbase_mesh;
 static int nstarbase_models = -1;
@@ -322,6 +331,7 @@ struct mesh *cargo_container_mesh;
 struct mesh *nebula_mesh;
 struct mesh *sun_mesh;
 struct mesh *thrust_animation_mesh;
+struct mesh *warpgate_mesh;
 #define NDOCKING_PORT_STYLES 3
 struct mesh *docking_port_mesh[NDOCKING_PORT_STYLES];
 static struct mesh *warp_tunnel_mesh;
@@ -341,12 +351,15 @@ static struct material spark_material;
 static struct material warp_effect_material;
 static struct material sun_material;
 #define NPLANETARY_RING_MATERIALS 256
+#define NPLANET_MATERIALS 256
 static int planetary_ring_texture_id = -1;
 static struct material planetary_ring_material[NPLANETARY_RING_MATERIALS];
-static struct material *planet_material = NULL;
+static struct material planet_material[NPLANET_MATERIALS];
 static struct solarsystem_asset_spec *solarsystem_assets = NULL;
-#define DEFAULT_SOLAR_SYSTEM "default"
+static struct solarsystem_asset_spec *old_solarsystem_assets = NULL;
 static char *solarsystem_name = DEFAULT_SOLAR_SYSTEM;
+static char dynamic_solarsystem_name[100] = { 0 };
+static char old_solarsystem_name[100] = { 0 };
 /* static char **planet_material_filename = NULL; */
 /* int nplanet_materials = -1; */
 static struct material shield_material;
@@ -428,21 +441,33 @@ static void format_date(char *buf, int bufsize, double date)
 	snprintf(buf, bufsize, "%-8.1f", FICTIONAL_DATE(date));
 }
 
+int switched_server = -1;
+static char switch_server_location_string[20] = { 0 };
+static int switch_warp_gate_number = -1;
+int switched_server2 = -1;
+int writer_thread_should_die = 0;
+int writer_thread_alive = 0;
+int connected_to_gameserver = 0;
+
 #define MAX_LOBBY_TRIES 3
 static void *connect_to_lobby_thread(__attribute__((unused)) void *arg)
 {
 	int i, sock = -1, rc, game_server_count;
 	struct ssgl_game_server *game_server = NULL;
 	struct ssgl_client_filter filter;
+	lobby_count = 0;
 
 try_again:
 
+	printf("Trying to connect to lobby.\n");
 	/* Loop, trying to connect to the lobby server... */
 	strcpy(lobbyerror, "");
 	while (1 && lobby_count < MAX_LOBBY_TRIES && displaymode == DISPLAYMODE_LOBBYSCREEN) {
+		printf("snis_client: connecting to lobby\n");
 		sock = ssgl_gameclient_connect_to_lobby(lobbyhost);
 		lobby_count++;
 		if (sock >= 0) {
+			printf("snis_client: Connected to lobby\n");
 			lobby_socket = sock;
 			break;
 		}
@@ -451,6 +476,7 @@ try_again:
 		else
 			sprintf(lobbyerror, "%s (%d)", 
 				gai_strerror(sock), sock);
+		printf("snis_client: lobby connection failed: %s\n", lobbyerror);
 		ssgl_sleep(5);
 	}
 
@@ -470,6 +496,7 @@ try_again:
 		rc = ssgl_recv_game_servers(sock, &game_server, &game_server_count, &filter);
 		if (rc) {
 			sprintf(lobbyerror, "ssgl_recv_game_servers failed: %s\n", strerror(errno));
+			printf("snis_client: ssgl_recv_game_server failed: %s\n", lobbyerror);
 			goto handle_error;
 		}
 	
@@ -487,6 +514,7 @@ try_again:
 	} while (!done_with_lobby);
 
 outta_here:
+	printf("lobby socket = %d, done with lobby\n", sock);
 	/* close connection to the lobby */
 	shutdown(sock, SHUT_RDWR);
 	close(sock);
@@ -516,6 +544,7 @@ static void connect_to_lobby()
 		fprintf(stderr, "Failed to create lobby connection thread.\n");
 		fprintf(stderr, "%d %s (%s)\n", rc, strerror(rc), strerror(errno));
 	}
+	pthread_setname_np(lobby_thread, "snisc-lobbycon");
 	return;
 }
 
@@ -624,10 +653,25 @@ static void update_generic_object(int index, uint32_t timestamp, double x, doubl
 static int lookup_object_by_id(uint32_t id)
 {
 	int i;
+	const int cachebits = 13;
+	const int cachesize = 1 << cachebits;
+	const int cachemask = cachesize - 1;
+	static int *cache = NULL;
+
+	if (cache == NULL) {
+		cache = malloc(sizeof(int) * cachesize);
+		memset(cache, -1, sizeof(int) * cachesize);
+	}
+
+	i = cache[id & cachemask];
+	if (i != -1 && go[i].id == id)
+		return i;
 
 	for (i = 0; i <= snis_object_pool_highest_object(pool); i++)
-		if (go[i].id == id)
+		if (go[i].id == id) {
+			cache[id & cachemask] = i;
 			return i;
+		}
 	return -1;
 }
 
@@ -675,6 +719,12 @@ static void update_generic_damcon_object(struct snis_damcon_entity *o,
 	o->heading = heading;
 }
 
+static void clear_damcon_pool()
+{
+	snis_object_pool_free_all_objects(damcon_pool);
+	memset(dco, 0, sizeof(dco));
+}
+
 static int add_generic_damcon_object(uint32_t id, uint32_t ship_id, double x, double y,
 			double velocity, double heading)
 {
@@ -709,7 +759,6 @@ struct damcon_ui {
 static int update_damcon_object(uint32_t id, uint32_t ship_id, uint32_t type,
 			double x, double y, double velocity,
 			double heading, uint8_t autonomous_mode)
-
 {
 	int i;
 	struct snis_damcon_entity *o;
@@ -1509,7 +1558,10 @@ static int update_planet(uint32_t id, uint32_t timestamp, double x, double y, do
 				uint8_t atm_r,
 				uint8_t atm_g,
 				uint8_t atm_b,
-				double atm_scale)
+				double atm_scale,
+				uint8_t has_atmosphere,
+				uint8_t solarsystem_planet_type,
+				uint8_t ring_selector)
 {
 	int i, m;
 	struct entity *e, *atm, *ring;
@@ -1520,10 +1572,14 @@ static int update_planet(uint32_t id, uint32_t timestamp, double x, double y, do
 		/* Orientation should be consistent across clients because planets don't move */
 		orientation = random_orientation[id % NRANDOM_ORIENTATIONS];
 
-		/* each planet texture has another version with a variation of the ring materials */
-		int ring_m = id % NPLANETARY_RING_MATERIALS;
-		const int np = solarsystem_assets->nplanet_textures;
-		m = id % np + (np * (ring_m + 1) * (hasring ? 1 : 0));
+		/* each planet texture has other versions with a variation of the ring materials */
+		m = solarsystem_planet_type;
+		fprintf(stderr, "zzz %s solarsystem_planet_type = %d\n", solarsystem_name, m);
+		if (!hasring) {
+			const int ring_materials = (NPLANET_MATERIALS / 2);
+			m = ring_materials + m * (ring_selector % (ring_materials / 6));
+		}
+		fprintf(stderr, "zzz m = %d, has_atmosphere = %hhu, has ring = %d\n", m, has_atmosphere, hasring);
 
 		e = add_entity(ecx, sphere_mesh, x, y, z, PLANET_COLOR);
 		if (e) {
@@ -1550,18 +1606,22 @@ static int update_planet(uint32_t id, uint32_t timestamp, double x, double y, do
 					&orientation, OBJTYPE_PLANET, 1, e);
 		if (i < 0)
 			return i;
-		atm = add_entity(ecx, sphere_mesh, 0.0f, 0.0f, 0.0f, WHITE);
-		go[i].tsd.planet.atmosphere = atm;
-		if (atm) {
-			update_entity_scale(atm, atm_scale);
-			material_init_atmosphere(&go[i].tsd.planet.atm_material);
-			go[i].tsd.planet.atm_material.atmosphere.r = (float) atm_r / 255.0f;
-			go[i].tsd.planet.atm_material.atmosphere.g = (float) atm_g / 255.0f;
-			go[i].tsd.planet.atm_material.atmosphere.b = (float) atm_b / 255.0f;
-			go[i].tsd.planet.atm_material.atmosphere.scale = (float) atm_scale;
-			update_entity_material(atm, &go[i].tsd.planet.atm_material);
-			update_entity_visibility(atm, 1);
-			update_entity_parent(ecx, atm, e);
+		if (has_atmosphere) {
+			atm = add_entity(ecx, sphere_mesh, 0.0f, 0.0f, 0.0f, WHITE);
+			go[i].tsd.planet.atmosphere = atm;
+			if (atm) {
+				update_entity_scale(atm, atm_scale);
+				material_init_atmosphere(&go[i].tsd.planet.atm_material);
+				go[i].tsd.planet.atm_material.atmosphere.r = (float) atm_r / 255.0f;
+				go[i].tsd.planet.atm_material.atmosphere.g = (float) atm_g / 255.0f;
+				go[i].tsd.planet.atm_material.atmosphere.b = (float) atm_b / 255.0f;
+				go[i].tsd.planet.atm_material.atmosphere.scale = (float) atm_scale;
+				update_entity_material(atm, &go[i].tsd.planet.atm_material);
+				update_entity_visibility(atm, 1);
+				update_entity_parent(ecx, atm, e);
+			}
+		} else {
+			go[i].tsd.planet.atmosphere = NULL;
 		}
 		if (e)
 			update_entity_shadecolor(e, (i % NSHADECOLORS) + 1);
@@ -1579,6 +1639,9 @@ static int update_planet(uint32_t id, uint32_t timestamp, double x, double y, do
 	go[i].tsd.planet.atmosphere_g = atm_g;
 	go[i].tsd.planet.atmosphere_b = atm_b;
 	go[i].tsd.planet.atmosphere_scale = atm_scale;
+	go[i].tsd.planet.has_atmosphere = has_atmosphere;
+	go[i].tsd.planet.solarsystem_planet_type = solarsystem_planet_type;
+	go[i].tsd.planet.ring_selector = ring_selector;
 	return 0;
 }
 
@@ -1617,6 +1680,25 @@ static int update_starbase(uint32_t id, uint32_t timestamp, double x, double y, 
 		e = add_entity(ecx, starbase_mesh[m], x, y, z, STARBASE_COLOR);
 		i = add_generic_object(id, timestamp, x, y, z, 0.0, 0.0, 0.0,
 					orientation, OBJTYPE_STARBASE, 1, e);
+		if (i < 0)
+			return i;
+	} else {
+		update_generic_object(i, timestamp, x, y, z, 0.0, 0.0, 0.0, orientation, 1);
+	}
+	return 0;
+}
+
+static int update_warpgate(uint32_t id, uint32_t timestamp, double x, double y, double z,
+	union quat *orientation)
+{
+	int i;
+	struct entity *e;
+
+	i = lookup_object_by_id(id);
+	if (i < 0) {
+		e = add_entity(ecx, warpgate_mesh, x, y, z, WARPGATE_COLOR);
+		i = add_generic_object(id, timestamp, x, y, z, 0.0, 0.0, 0.0,
+					orientation, OBJTYPE_WARPGATE, 1, e);
 		if (i < 0)
 			return i;
 	} else {
@@ -2037,6 +2119,7 @@ static void move_objects(void)
 			spin_wormhole(timestamp, o);
 			break;
 		case OBJTYPE_STARBASE:
+		case OBJTYPE_WARPGATE:
 		case OBJTYPE_DOCKING_PORT:
 			move_object(timestamp, o, &interpolate_orientated_object);
 			break;
@@ -2228,6 +2311,9 @@ static void do_explosion(double x, double y, double z, uint16_t nsparks, uint16_
 	case OBJTYPE_STARBASE:
 		color = STARBASE_COLOR;
 		break;
+	case OBJTYPE_WARPGATE:
+		color = WARPGATE_COLOR;
+		break;
 	default:
 		color = GREEN;
 		break;
@@ -2359,10 +2445,17 @@ static void request_demon_thrust_packet(uint32_t oid, uint8_t thrust)
 static struct demon_ui {
 	float ux1, uy1, ux2, uy2;
 	double selectedx, selectedz;
+	double press_mousex, press_mousey;
+	double release_mousex, release_mousey;
+	int button2_pressed;
+	int button2_released;
+	int button3_pressed;
+	int button3_released;
 	int nselected;
 #define MAX_DEMON_SELECTABLE 256
 	uint32_t selected_id[MAX_DEMON_SELECTABLE];
 	struct button *demon_exec_button;
+	struct button *demon_home_button;
 	struct button *demon_ship_button;
 	struct button *demon_starbase_button;
 	struct button *demon_planet_button;
@@ -2374,6 +2467,9 @@ static struct demon_ui {
 	struct button *demon_select_none_button;
 	struct button *demon_torpedo_button;
 	struct button *demon_phaser_button;
+	struct button *demon_2d3d_button;
+	struct button *demon_move_button;
+	struct button *demon_scale_button;
 	struct snis_text_input_box *demon_input;
 	char input[100];
 	char error_msg[80];
@@ -2392,8 +2488,29 @@ static struct demon_ui {
 #define DEMON_BUTTON_DELETE 7
 #define DEMON_BUTTON_SELECTNONE 8
 #define DEMON_BUTTON_CAPTAINMODE 9
-
+	int use_3d;
+	union vec3 camera_pos;
+	union quat camera_orientation;
+	union vec3 desired_camera_pos;
+	union quat desired_camera_orientation;
+	float exaggerated_scale;
+	float desired_exaggerated_scale;
 } demon_ui;
+
+static void home_demon_camera(void)
+{
+	union vec3 right = { { 1.0f, 0.0f, 0.0f } };
+	const float homex = XKNOWN_DIM / 2.0;
+	const float homey = YKNOWN_DIM * 7.0;
+	const float homez = ZKNOWN_DIM / 2.0;
+	const union vec3 camera_pos = { { homex, homey, homez, } };
+	union vec3 up = { { 0.0, 1.0, 0.0, } };
+	union vec3 camera_lookat = { { XKNOWN_DIM / 2.0, YKNOWN_DIM / 2.0, ZKNOWN_DIM / 2.0 } };
+	vec3_sub_self(&camera_lookat, &camera_pos);
+
+	demon_ui.desired_camera_pos = camera_pos;
+	quat_from_u2v(&demon_ui.desired_camera_orientation, &right, &camera_lookat, &up);
+}
 
 static void demon_dirkey(int h, int v)
 {
@@ -2468,8 +2585,8 @@ static void draw_plane_radar(GtkWidget *w, struct snis_entity *o, union quat *ai
 	float range2 = range*range;
 	union vec3 ship_pos = {{o->x, o->y, o->z}};
 
-	union quat aim_conj;
-	quat_conj(&aim_conj, aim);
+	union quat aim_inverse;
+	quat_inverse(&aim_inverse, aim);
 
 	for (i = 0; i <= snis_object_pool_highest_object(pool); i++) {
 		if (!go[i].alive)
@@ -2481,6 +2598,7 @@ static void draw_plane_radar(GtkWidget *w, struct snis_entity *o, union quat *ai
 		if (go[i].type != OBJTYPE_SHIP1 &&
 			go[i].type != OBJTYPE_SHIP2 &&
 			go[i].type != OBJTYPE_STARBASE &&
+			go[i].type != OBJTYPE_WARPGATE &&
 			go[i].type != OBJTYPE_ASTEROID &&
 			go[i].type != OBJTYPE_SPACEMONSTER &&
 			go[i].type != OBJTYPE_CARGO_CONTAINER)
@@ -2501,7 +2619,7 @@ static void draw_plane_radar(GtkWidget *w, struct snis_entity *o, union quat *ai
 		/* get direction vector, rotate back to basis axis, then normalize */
 		union vec3 dir;
 		vec3_sub(&dir, &contact_pos, &ship_pos);
-		quat_rot_vec_self(&dir, &aim_conj);
+		quat_rot_vec_self(&dir, &aim_inverse);
 		vec3_normalize(&dir, &dir);
 
 		/* dist to forward vector */
@@ -3172,6 +3290,10 @@ static gint key_press_cb(GtkWidget* widget, GdkEventKey* event, gpointer data)
 		set_renderer(ecx, valid_combos[r]);
 		break;
 		}
+	case key_toggle_credits:
+		if (control_key_pressed)
+			credits_screen_active = !credits_screen_active;
+		break;
 	default:
 		break;
 	}
@@ -3236,7 +3358,15 @@ int lobbylast1clicky = -1;
 int lobby_selected_server = -1;
 static struct lobby_ui {
 	struct button *lobby_cancel_button;
+	struct button *lobby_connect_to_server_button;
 } lobby_ui;
+
+static void lobby_connect_to_server_button_pressed()
+{
+	printf("lobby connect to server button pressed\n");
+	if (lobby_selected_server != -1)
+		displaymode = DISPLAYMODE_CONNECTING;
+}
 
 static void lobby_cancel_button_pressed()
 {
@@ -3251,6 +3381,18 @@ static void lobby_cancel_button_pressed()
 	}
 }
 
+static int lobby_lookup_server_by_location(char *location)
+{
+	/* FIXME, this is racy with connect_to_lobby() */
+	int i;
+
+	for (i = 0; i < ngameservers; i++) {
+		if (strcmp(lobby_game_server[i].location, location) == 0)
+			return i;
+	}
+	return -1;
+}
+
 static void show_lobbyscreen(GtkWidget *w)
 {
 	char msg[100];
@@ -3259,7 +3401,7 @@ static void show_lobbyscreen(GtkWidget *w)
 #define LINEHEIGHT 30
 
 	sng_set_foreground(UI_COLOR(lobby_connecting));
-	if (lobby_socket == -1) {
+	if (lobby_socket == -1 && switched_server2 == -1) {
 		sng_abs_xy_draw_string("Space Nerds", BIG_FONT, txx(80), txy(200));
 		sng_abs_xy_draw_string("In Space", BIG_FONT, txx(180), txy(320));
 		sng_abs_xy_draw_string("Copyright (C) 2010 Stephen M. Cameron", NANO_FONT,
@@ -3273,11 +3415,26 @@ static void show_lobbyscreen(GtkWidget *w)
 		sng_abs_xy_draw_string(msg, SMALL_FONT, txx(100), txy(400));
 		sng_abs_xy_draw_string(lobbyerror, NANO_FONT, txx(100), txy(430));
 	} else {
-		if (lobby_selected_server != -1 &&
-			lobbylast1clickx > txx(200) && lobbylast1clickx < txx(620) &&
-			lobbylast1clicky > txy(520) && lobbylast1clicky < txy(520) + LINEHEIGHT * 2) {
-			displaymode = DISPLAYMODE_CONNECTING;
-			return;
+
+		/* Switch server rigamarole */
+		if (lobby_selected_server == -1) {
+			int time_to_switch_servers;
+			pthread_mutex_lock(&to_server_queue_event_mutex);
+			time_to_switch_servers = (switched_server2 != -1);
+			if (time_to_switch_servers) {
+				fprintf(stderr, "snis_client: time to switch servers\n");
+				lobby_selected_server =
+					lobby_lookup_server_by_location(switch_server_location_string);
+				fprintf(stderr, "snis_client: lobby_seleted_server = %d (%s)\n",
+					lobby_selected_server, switch_server_location_string);
+				if (lobby_selected_server == -1)
+					return;
+				switched_server2 = -1;
+				displaymode = DISPLAYMODE_CONNECTING;
+			}
+			pthread_mutex_unlock(&to_server_queue_event_mutex);
+			if (displaymode == DISPLAYMODE_CONNECTING)
+				return;
 		}
 
 		if (lobby_selected_server != -1 && quickstartmode) {
@@ -3319,12 +3476,9 @@ static void show_lobbyscreen(GtkWidget *w)
 			sng_abs_xy_draw_string(msg, TINY_FONT, txx(700), txy(100) + i * LINEHEIGHT);
 		}
 		if (lobby_selected_server != -1)
-			sng_set_foreground(UI_COLOR(lobby_connect_ok));
+			snis_button_set_color(lobby_ui.lobby_connect_to_server_button, UI_COLOR(lobby_connect_ok));
 		else
-			sng_set_foreground(UI_COLOR(lobby_connect_not_ok));
-		/* This should be a real button, but I'm too lazy to fix it now. */
-		snis_draw_rectangle(0, txx(250), txy(520), txx(300), LINEHEIGHT * 2);
-		sng_abs_xy_draw_string("CONNECT TO SERVER", TINY_FONT, txx(280), txy(520) + LINEHEIGHT);
+			snis_button_set_color(lobby_ui.lobby_connect_to_server_button, UI_COLOR(lobby_connect_not_ok));
 	}
 }
 
@@ -3375,6 +3529,7 @@ static struct navigation_ui {
 	struct gauge *warp_gauge;
 	struct button *engage_warp_button;
 	struct button *docking_magnets_button;
+	struct button *standard_orbit_button;
 	struct button *reverse_button;
 	struct button *trident_button;
 	int gauge_radius;
@@ -3495,7 +3650,7 @@ static int process_update_ship_packet(uint8_t opcode)
 		wwviaudio_add_sound(REVERSE_SOUND);
 	o->tsd.ship.reverse = reverse;
 	o->tsd.ship.trident = trident;
-	snis_button_set_label(nav_ui.trident_button, trident ? "ABSOLUTE" : "RELATIVE");
+	snis_button_set_label(nav_ui.trident_button, trident ? "RELATIVE" : "ABSOLUTE");
 	o->tsd.ship.ai[0].u.attack.victim_id = victim_id;
 	rc = 0;
 out:
@@ -3914,6 +4069,7 @@ static void do_whatever_detonate_does(uint32_t id, double x, double y, double z,
 	case OBJTYPE_SHIP2:
 		radius = 1.25f * ship_mesh_map[o->tsd.ship.shiptype]->radius;
 		break;
+	case OBJTYPE_WARPGATE:
 	case OBJTYPE_STARBASE:
 		radius = 1.25 * entity_get_mesh(o->entity)->radius;
 		break;
@@ -3953,6 +4109,38 @@ static int process_detonate(void)
 	pthread_mutex_lock(&universe_mutex);
 	do_whatever_detonate_does(id, x, y, z, time, fractional_time);
 	pthread_mutex_unlock(&universe_mutex);
+	return 0;
+}
+
+static void reload_per_solarsystem_textures(char *old_solarsystem, char *new_solarsystem,
+						struct solarsystem_asset_spec *old_assets,
+						struct solarsystem_asset_spec *new_assets);
+static int read_solarsystem_config(const char *solarsystem_name,
+	struct solarsystem_asset_spec **assets);
+static int process_set_solarsystem(void)
+{
+	char solarsystem[100];
+	int rc;
+	struct solarsystem_asset_spec *assets = NULL;
+
+	rc = snis_readsocket(gameserver_sock, solarsystem, sizeof(solarsystem));
+	if (rc != 0)
+		return rc;
+	solarsystem[99] = '\0';
+	strncpy(old_solarsystem_name, solarsystem_name, sizeof(old_solarsystem_name) - 1);
+	old_solarsystem_name[99] = '\0';
+	strcpy(old_solarsystem_name, solarsystem_name);
+	memcpy(dynamic_solarsystem_name, solarsystem, 100);
+	printf("SET SOLARSYSTEM TO '%s'\n", dynamic_solarsystem_name);
+	solarsystem_name = dynamic_solarsystem_name;
+	if (read_solarsystem_config(dynamic_solarsystem_name, &assets)) {
+		fprintf(stderr, "Failed re-reading new solarsystem metadata for %s\n",
+			dynamic_solarsystem_name);
+		return -1;
+	}
+	old_solarsystem_assets = solarsystem_assets;
+	solarsystem_assets = assets;
+	per_solarsystem_textures_loaded = 0;
 	return 0;
 }
 
@@ -4082,6 +4270,24 @@ static void delete_object(uint32_t id)
 	snis_object_pool_free_object(pool, i);
 }
 
+static void delete_all_objects(void)
+{
+	int i;
+	pthread_mutex_lock(&universe_mutex);
+	for (i = 0; i <= snis_object_pool_highest_object(pool); i++) {
+		if (go[i].id == -1)
+			continue;
+		go[i].alive = 0;
+		remove_entity(ecx, go[i].entity);
+		go[i].entity = NULL;
+		free_spacemonster_data(&go[i]);
+		free_laserbeam_data(&go[i]);
+		go[i].id = -1;
+		snis_object_pool_free_object(pool, i);
+	}
+	pthread_mutex_unlock(&universe_mutex);
+}
+
 static void demon_deselect(uint32_t id);
 static int process_delete_object_packet(void)
 {
@@ -4181,10 +4387,10 @@ static int process_role_onscreen_packet(void)
 }
 
 static struct science_ui {
+	/* details mode is one of define SCI_DETAILS_MODE_THREED,
+	 * SCI_DETAILS_MODE_DETAILS, SCI_DETAILS_MODE_SCIPLANE
+	 */
 	int details_mode;
-#define SCI_DETAILS_MODE_THREED 1
-#define SCI_DETAILS_MODE_DETAILS 2
-#define SCI_DETAILS_MODE_SCIPLANE 3
 	struct slider *scizoom;
 	struct slider *scipower;
 	struct button *details_button;
@@ -4368,6 +4574,60 @@ static int process_comm_transmission(void)
 	return 0;
 }
 
+static void text_to_speech(char *text)
+{
+	char command[PATH_MAX];
+	char *snisbindir;
+	char bindir[PATH_MAX];
+	struct stat statbuf;
+	int rc;
+
+	/* This is all a little gross... */
+
+	snisbindir = getenv("SNISBINDIR");
+	if (!snisbindir) {
+		snisbindir = STRPREFIX(PREFIX);
+		snprintf(bindir, sizeof(bindir), "%s/bin", snisbindir);
+	} else {
+		strcpy(bindir, snisbindir);
+	}
+
+	/* test that snisbindir is actually a directory. */
+	rc = stat(bindir, &statbuf);
+	if (rc < 0) {
+		fprintf(stderr, "Cannot stat %s: %s\n", bindir, strerror(errno));
+		return;
+	}
+	if (!S_ISDIR(statbuf.st_mode)) {
+		fprintf(stderr, "%s is not a directory.\n", snisbindir);
+		return;
+	}
+	remove_single_quotes(text);
+	sprintf(command, "%s/text_to_speech.sh '%s'", bindir, text);
+	system(command);
+}
+
+static int process_natural_language_request(void)
+{
+	unsigned char buffer[256];
+	char string[256];
+	uint8_t length, subcommand;
+	int rc;
+
+	rc = read_and_unpack_buffer(buffer, "bb", &subcommand, &length);
+	if (rc != 0)
+		return rc;
+	if (subcommand != OPCODE_NL_SUBCOMMAND_TEXT_TO_SPEECH)
+		return -1;
+	memset(string, 0, sizeof(string));
+	rc = snis_readsocket(gameserver_sock, string, length);
+	string[255] = '\0';
+	string[length] = '\0';
+	text_to_speech(string);
+	return 0;
+}
+
+
 static int process_ship_damage_packet(int do_damage_limbo)
 {
 	char buffer[sizeof(struct ship_damage_packet)];
@@ -4395,6 +4655,22 @@ static int process_ship_damage_packet(int do_damage_limbo)
 		damage_limbo_countdown = 2;
 		main_camera_shake = 1.0;
 	}
+	return 0;
+}
+
+static int process_switch_server(void)
+{
+	char buffer[100];
+	struct packed_buffer pb;
+	int rc;
+
+	rc = snis_readsocket(gameserver_sock, buffer, 23);
+	if (rc != 0)
+		return rc;
+	packed_buffer_init(&pb, buffer, sizeof(buffer));
+	switch_warp_gate_number = packed_buffer_extract_u8(&pb);
+	packed_buffer_extract_raw(&pb, switch_server_location_string, 20);
+	switch_server_location_string[19] = '\0';
 	return 0;
 }
 
@@ -4493,29 +4769,32 @@ static int process_update_planet_packet(void)
 	unsigned char buffer[100];
 	uint32_t id, timestamp;
 	double dr, dx, dy, dz, atm_scale;
-	uint8_t government, tech_level, economy, security, atm_r, atm_g, atm_b;
+	uint8_t government, tech_level, economy, security, atm_r, atm_g, atm_b, has_atmosphere, solarsystem_planet_type;
+	uint8_t ring_selector;
 	uint32_t dseed;
 	int hasring;
 	uint16_t contraband;
 	int rc;
 
 	assert(sizeof(buffer) > sizeof(struct update_asteroid_packet) - sizeof(uint8_t));
-	rc = read_and_unpack_buffer(buffer, "wwSSSSwbbbbhbbbS", &id, &timestamp,
+	rc = read_and_unpack_buffer(buffer, "wwSSSSwbbbbhbbbSbbb", &id, &timestamp,
 			&dx, (int32_t) UNIVERSE_DIM,
 			&dy,(int32_t) UNIVERSE_DIM,
 			&dz, (int32_t) UNIVERSE_DIM,
 			&dr, (int32_t) UNIVERSE_DIM,
 			&dseed, &government, &tech_level, &economy, &security,
-			&contraband, &atm_r, &atm_b, &atm_g, &atm_scale, (int32_t) UNIVERSE_DIM);
+			&contraband, &atm_r, &atm_b, &atm_g, &atm_scale, (int32_t) UNIVERSE_DIM,
+			&has_atmosphere, &solarsystem_planet_type, &ring_selector);
 	if (rc != 0)
 		return rc;
+	solarsystem_planet_type = solarsystem_planet_type % PLANET_TYPE_COUNT_SHALL_BE;
 	hasring = (dr < 0);
 	if (hasring)
 		dr = -dr;
 	pthread_mutex_lock(&universe_mutex);
 	rc = update_planet(id, timestamp, dx, dy, dz, dr, government, tech_level,
 				economy, dseed, hasring, security, contraband,
-				atm_r, atm_b, atm_g, atm_scale);
+				atm_r, atm_b, atm_g, atm_scale, has_atmosphere, solarsystem_planet_type, ring_selector);
 	pthread_mutex_unlock(&universe_mutex);
 	return (rc < 0);
 } 
@@ -4560,6 +4839,27 @@ static int process_update_starbase_packet(void)
 	pthread_mutex_unlock(&universe_mutex);
 	return (rc < 0);
 } 
+
+static int process_update_warpgate_packet(void)
+{
+	unsigned char buffer[100];
+	uint32_t id, timestamp;
+	double dx, dy, dz;
+	union quat orientation;
+	int rc;
+
+	rc = read_and_unpack_buffer(buffer, "wwSSSQ", &id, &timestamp,
+			&dx, (int32_t) UNIVERSE_DIM,
+			&dy, (int32_t) UNIVERSE_DIM,
+			&dz, (int32_t) UNIVERSE_DIM,
+			&orientation);
+	if (rc != 0)
+		return rc;
+	pthread_mutex_lock(&universe_mutex);
+	rc = update_warpgate(id, timestamp, dx, dy, dz, &orientation);
+	pthread_mutex_unlock(&universe_mutex);
+	return (rc < 0);
+}
 
 static int process_update_nebula_packet(void)
 {
@@ -4657,16 +4957,77 @@ static int process_client_id_packet(void)
 	return 0;
 }
 
+static int process_add_player_error(uint8_t *error)
+{
+	unsigned char buffer[10];
+	uint8_t err;
+	int rc;
+
+	*error = 255;
+	assert(sizeof(buffer) > sizeof(struct client_ship_id_packet) - sizeof(uint8_t));
+	rc = read_and_unpack_buffer(buffer, "b", &err);
+	if (rc)
+		return rc;
+	switch (err) {
+	case ADD_PLAYER_ERROR_SHIP_DOES_NOT_EXIST:
+		sprintf(login_failed_msg, "NO SHIP BY THAT NAME EXISTS");
+		break;
+	case ADD_PLAYER_ERROR_SHIP_ALREADY_EXISTS:
+		sprintf(login_failed_msg, "A SHIP WITH THAT NAME ALREADY_EXISTS");
+		break;
+	case ADD_PLAYER_ERROR_FAILED_VERIFICATION:
+		sprintf(login_failed_msg, "FAILED BRIDGE VERIFICATION");
+		break;
+	case ADD_PLAYER_ERROR_TOO_MANY_BRIDGES:
+		sprintf(login_failed_msg, "TOO_MANY_BRIDGES");
+		break;
+	default:
+		sprintf(login_failed_msg, "UNKNOWN ERROR");
+		break;
+	}
+	login_failed_timer = FRAME_RATE_HZ * 5;
+	*error = err;
+	return 0;
+}
+
+static void stop_gameserver_writer_thread(void)
+{
+	fprintf(stderr, "top of stop_gameserver_writer_thread\n");
+	pthread_mutex_lock(&to_server_queue_event_mutex);
+	writer_thread_should_die = 1;
+	pthread_mutex_unlock(&to_server_queue_event_mutex);
+	fprintf(stderr, "stop_gameserver_writer_thread 1\n");
+	wakeup_gameserver_writer();
+	fprintf(stderr, "stop_gameserver_writer_thread 2\n");
+	do {
+		int alive;
+		printf("snis_client: Waiting for writer thread to leave\n");
+		pthread_mutex_lock(&to_server_queue_event_mutex);
+		alive = writer_thread_alive;
+		if (!alive)
+			break;
+		pthread_mutex_unlock(&to_server_queue_event_mutex);
+		fprintf(stderr, "stop_gameserver_writer_thread 3, alive = %d\n", alive);
+		sleep(1);
+	} while (1);
+	writer_thread_should_die = 0;
+	pthread_mutex_unlock(&to_server_queue_event_mutex);
+	fprintf(stderr, "stop_gameserver_writer_thread 4\n");
+	/* FIXME: when this returns, to_server_queue_event_mutex is held */
+}
+
 static void *gameserver_reader(__attribute__((unused)) void *arg)
 {
 	static uint32_t successful_opcodes;
 	uint8_t previous_opcode;
 	uint8_t last_opcode = 0x00;
 	uint8_t opcode = 0xff;
+	uint8_t add_player_error;
 	int rc = 0;
 
-	printf("gameserver reader thread\n");
+	printf("snis_client: gameserver reader thread\n");
 	while (1) {
+		add_player_error = 0;
 		previous_opcode = last_opcode;
 		last_opcode = opcode;
 		/* printf("Client reading from game server %d bytes...\n", sizeof(opcode)); */
@@ -4700,6 +5061,10 @@ static void *gameserver_reader(__attribute__((unused)) void *arg)
 		case OPCODE_ID_CLIENT_SHIP:
 			rc = process_client_id_packet();
 			break;
+		case OPCODE_ADD_PLAYER_ERROR:
+			fprintf(stderr, "snis_client: OPCODE_ADD_PLAYER_ERROR\n");
+			rc = process_add_player_error(&add_player_error);
+			break;
 		case OPCODE_UPDATE_ASTEROID:
 			rc = process_update_asteroid_packet();
 			break;
@@ -4717,6 +5082,9 @@ static void *gameserver_reader(__attribute__((unused)) void *arg)
 			break;
 		case OPCODE_UPDATE_STARBASE:
 			rc = process_update_starbase_packet();
+			break;
+		case OPCODE_UPDATE_WARPGATE:
+			rc = process_update_warpgate_packet();
 			break;
 		case OPCODE_UPDATE_WORMHOLE:
 			rc = process_update_wormhole_packet();
@@ -4787,6 +5155,9 @@ static void *gameserver_reader(__attribute__((unused)) void *arg)
 		case OPCODE_COMMS_TRANSMISSION:
 			rc = process_comm_transmission();
 			break;
+		case OPCODE_NATURAL_LANGUAGE_REQUEST:
+			rc = process_natural_language_request();
+			break;
 		case OPCODE_UPDATE_NETSTATS:
 			rc = process_update_netstats();
 			break;
@@ -4840,19 +5211,70 @@ static void *gameserver_reader(__attribute__((unused)) void *arg)
 			if (rc)
 				goto protocol_error;
 			break;
+		case OPCODE_SET_SOLARSYSTEM:
+			rc = process_set_solarsystem();
+			if (rc)
+				goto protocol_error;
+			break;
+		case OPCODE_SWITCH_SERVER:
+			rc = process_switch_server();
+			if (rc)
+				goto protocol_error;
+			printf("snis_client: Switch server opcode received\n");
+			quickstartmode = 0;
+			stop_gameserver_writer_thread();
+			/* FIXME: when this ^^^ returns, to_server_queue_event_mutex is held */
+			delete_all_objects();
+			clear_damcon_pool();
+			printf("snis_client: writer thread left\n");
+			printf("snis_client: **** lobby_selected_server = %d\n", lobby_selected_server);
+			switched_server = 1; /* TODO : something better */
+			printf("snis_client: **** switched_server = %d\n", switched_server);
+			lobby_selected_server = -1;
+			close(gameserver_sock);
+			gameserver_sock = -1;
+			rc = 0;
+			connected_to_gameserver = 0;
+			// pthread_mutex_unlock(&to_server_queue_event_mutex);
+			return NULL;
 		default:
 			goto protocol_error;
 		}
 		if (rc) /* protocol error */
 			break;
+		if (add_player_error) {
+			switch (add_player_error) {
+			case ADD_PLAYER_ERROR_SHIP_DOES_NOT_EXIST:
+				fprintf(stderr,
+					"snis_client: failed to add player: ship does not exist\n");
+				break;
+			case ADD_PLAYER_ERROR_SHIP_ALREADY_EXISTS:
+				printf("snis_client: failed to add player: ship already exists\n");
+				break;
+			default:
+				printf("snis_client: failed to add player: unknown error %d\n",
+					add_player_error);
+				goto protocol_error;
+			}
+			stop_gameserver_writer_thread();
+			/* FIXME: when this ^^^ returns, to_server_queue_event_mutex is held */
+			lobby_selected_server = -1;
+			close(gameserver_sock);
+			gameserver_sock = -1;
+			rc = 0;
+			connected_to_gameserver = 0;
+			displaymode = DISPLAYMODE_NETWORK_SETUP;
+			// pthread_mutex_unlock(&to_server_queue_event_mutex);
+			return NULL;
+		}
 		successful_opcodes++;
 	}
 
 protocol_error:
-	printf("Protocol error in gameserver reader, opcode = %hu\n", opcode);
+	printf("snis_client: Protocol error in gameserver reader, opcode = %hu\n", opcode);
 	snis_print_last_buffer(gameserver_sock);	
-	printf("last opcode was %hhu, before that %hhu\n", last_opcode, previous_opcode);
-	printf("total successful opcodes = %u\n", successful_opcodes);
+	printf("snis_client: last opcode was %hhu, before that %hhu\n", last_opcode, previous_opcode);
+	printf("snis_client: total successful opcodes = %u\n", successful_opcodes);
 	close(gameserver_sock);
 	gameserver_sock = -1;
 	return NULL;
@@ -4922,10 +5344,22 @@ static void wakeup_gameserver_writer(void)
 
 static void *gameserver_writer(__attribute__((unused)) void *arg)
 {
+	int tmpval;
+	writer_thread_alive = 1;
 	while (1) {
 		wait_for_serverbound_packets();
 		write_queued_packets_to_server();
+
+		/* Check if it's time to switch servers .*/
+		pthread_mutex_lock(&to_server_queue_event_mutex);
+		tmpval = writer_thread_should_die;
+		pthread_mutex_unlock(&to_server_queue_event_mutex);
+		if (tmpval) {
+			printf("snis_client: gameserver writer exiting due to server switch\n");
+			break;
+		}
 	}
+	writer_thread_alive = 0;
 	return NULL;
 }
 
@@ -4975,6 +5409,44 @@ static void send_build_info_to_server(void)
 	queue_to_server(pb);
 }
 
+struct network_setup_ui {
+	struct button *start_lobbyserver;
+	struct button *start_gameserver;
+	struct button *connect_to_lobby;
+	struct snis_text_input_box *lobbyservername;
+	struct snis_text_input_box *gameservername;
+	struct snis_text_input_box *shipname_box;
+	struct snis_text_input_box *password_box;
+	struct button *role_main;
+	struct button *role_nav;
+	struct button *role_weap;
+	struct button *role_eng;
+	struct button *role_damcon;
+	struct button *role_sci;
+	struct button *role_comms;
+	struct button *role_sound;
+	struct button *role_demon;
+	struct button *role_text_to_speech;
+	struct button *join_ship_checkbox;
+	struct button *create_ship_checkbox;
+	int role_main_v;
+	int role_nav_v;
+	int role_weap_v;
+	int role_eng_v;
+	int role_damcon_v;
+	int role_sci_v;
+	int role_comms_v;
+	int role_sound_v;
+	int role_demon_v;
+	int role_text_to_speech_v;
+	int create_ship_v;
+	int join_ship_v;
+	char lobbyname[60];
+	char servername[60];
+	char shipname[22];
+	char password[10];
+} net_setup_ui;
+
 static void *connect_to_gameserver_thread(__attribute__((unused)) void *arg)
 {
 	int rc;
@@ -4990,6 +5462,7 @@ static void *connect_to_gameserver_thread(__attribute__((unused)) void *arg)
 	struct add_player_packet app;
 	int flag = 1;
 
+	fprintf(stderr, "snis_client: connect to gameserver thread\n");
 	if (avoid_lobby) {
 		strcpy(hoststr, serverhost);
 		sprintf(portstr, "%d", serverport);
@@ -4998,7 +5471,7 @@ static void *connect_to_gameserver_thread(__attribute__((unused)) void *arg)
 		sprintf(portstr, "%d", ntohs(lobby_game_server[lobby_selected_server].port));
 		sprintf(hoststr, "%d.%d.%d.%d", x[0], x[1], x[2], x[3]);
 	}
-	printf("connecting to %s/%s\n", hoststr, portstr);
+	fprintf(stderr, "snis_client: connecting to %s/%s\n", hoststr, portstr);
 
 	memset(&hints, 0, sizeof hints);
 	hints.ai_family = AF_INET;
@@ -5053,6 +5526,9 @@ static void *connect_to_gameserver_thread(__attribute__((unused)) void *arg)
 	 */
 	memset(&app, 0, sizeof(app));
 	app.opcode = OPCODE_UPDATE_PLAYER;
+	app.new_ship = net_setup_ui.create_ship_v;
+	app.warpgate_number = (uint8_t) switch_warp_gate_number;
+	switch_warp_gate_number = -1;
 	app.role = htonl(role);
 	strncpy((char *) app.shipname, shipname, 19);
 	strncpy((char *) app.password, password, 19);
@@ -5077,6 +5553,7 @@ static void *connect_to_gameserver_thread(__attribute__((unused)) void *arg)
 		fprintf(stderr, "Failed to create gameserver reader thread: %d '%s', '%s'\n",
 			rc, strerror(rc), strerror(errno));
 	}
+	pthread_setname_np(read_from_gameserver_thread, "snisc-reader");
 	printf("started gameserver reader thread\n");
 
 	pthread_mutex_init(&to_server_queue_mutex, NULL);
@@ -5089,6 +5566,7 @@ static void *connect_to_gameserver_thread(__attribute__((unused)) void *arg)
 		fprintf(stderr, "Failed to create gameserver writer thread: %d '%s', '%s'\n",
 			rc, strerror(rc), strerror(errno));
 	}
+	pthread_setname_np(write_to_gameserver_thread, "snisc-writer");
 	printf("started gameserver writer thread\n");
 
 	request_universe_timestamp();
@@ -5112,12 +5590,12 @@ int connect_to_gameserver(int selected_server)
 			"snis_client", rc, strerror(rc), strerror(errno));
 		return -1;
 	}
+	pthread_setname_np(gameserver_connect_thread, "snisc-servcon");
 	return 0;
 }
 
 static void show_connecting_screen(GtkWidget *w)
 {
-	static int connected_to_gameserver = 0;
 	sng_set_foreground(UI_COLOR(lobby_connecting));
 	sng_abs_xy_draw_string("CONNECTING TO SERVER...", SMALL_FONT, txx(100), txy(300) + LINEHEIGHT);
 	if (!connected_to_gameserver) {
@@ -5131,6 +5609,75 @@ static void show_connected_screen(GtkWidget *w)
 	sng_set_foreground(UI_COLOR(lobby_connecting));
 	sng_abs_xy_draw_string("CONNECTED TO SERVER", SMALL_FONT, txx(100), txy(300) + LINEHEIGHT);
 	sng_abs_xy_draw_string("DOWNLOADING GAME DATA", SMALL_FONT, txx(100), txy(300) + LINEHEIGHT * 3);
+}
+
+static char *credits_text[] = {
+	"S P A C E   N E R D S   I N   S P A C E",
+	"",
+	"*   *   *",
+	"",
+	"HTTPS://SMCAMERON.GITHUB.IO/SPACE-NERDS-IN-SPACE/",
+	"",
+	"CREATED BY",
+	"STEPHEN M. CAMERON",
+	"AND",
+	"JEREMY VAN GRINSVEN",
+	"",
+	"INSPIRED BY",
+	"THOM ROBERTSON AND",
+	"ARTEMIS: STARSHIP BRIDGE SIMULATOR",
+	"",
+	"SPECIAL THANKS TO",
+	"",
+	"TX/RX LABS IN HOUSTON, TX",
+	"WITHOUT WHICH THIS GAME",
+	"WOULD NOT EXIST",
+	"",
+	"QUBODUP & FREEGAMEDEV.NET",
+	"",
+	"KWADROKE & BRIDGESIM.NET",
+	"",
+	"*   *   *",
+	"",
+	"OTHER CONTRIBUTORS",
+	"",
+	"ANDY CONRAD",
+	"ANTHONY J. BENTLEY",
+	"CHRISTIAN ROBERTS",
+	"DUSTEDDK",
+	"EMMANOUEL KAPERNAROS",
+	"HER0_01",
+	"IOAN LOOSLEY",
+	"IVAN SANCHEZ ORTEGA",
+	"LUCKI",
+	"MIKEYD",
+	"REMI VERSCHELDE",
+	"SCOTT BENESH",
+	"STEFAN GUSTAVSON",
+	"THOMAS GLAMSCH",
+	"TOBIAS SIMON",
+	"ZACHARY SCHULTZ",
+	"",
+	"*   *   *",
+	"",
+};
+
+static void draw_credits_screen(int lines, char *crawl[])
+{
+	static float z = 1200;
+	int i;
+
+	z = z - 2.0;
+	if (z < -4500.0) {
+		z = 1200;
+		credits_screen_active = 0;
+	}
+
+	sng_set_foreground(UI_COLOR(damcon_part));
+	for (i = 0; i < lines; i++) {
+			sng_center_xz_draw_string(crawl[i],
+					SMALL_FONT, SCREEN_WIDTH / 2, i * txy(40) + z);
+	}
 }
 
 static void show_common_screen(GtkWidget *w, char *title)
@@ -5172,6 +5719,20 @@ static void show_common_screen(GtkWidget *w, char *title)
 		else
 			sng_center_xy_draw_string("SPACE DUST DISABLED",
 					SMALL_FONT, SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2);
+	}
+	if (credits_screen_active)
+		draw_credits_screen(ARRAYSIZE(credits_text), credits_text);
+	if (login_failed_timer) {
+		sng_set_foreground(UI_COLOR(special_options));
+		login_failed_timer--;
+		sng_center_xy_draw_string(login_failed_msg, SMALL_FONT,
+						SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2);
+		if (login_failed_timer <= 0) {
+			/* We failed verfication, so quickstart didn't work, so turn it off. */
+			quickstartmode = 0;
+			displaymode = DISPLAYMODE_LOBBYSCREEN;
+			done_with_lobby = 0;
+		}
 	}
 }
 
@@ -5326,7 +5887,7 @@ static void update_warp_tunnel(struct snis_entity *o, struct entity **warp_tunne
 	union vec3 v;
 	float m;
 	static float max = 0;
-	const float max_alpha = 0.4;
+	const float max_alpha = 0.85;
 
 	if (first_time) {
 		lastp = p;
@@ -5795,6 +6356,9 @@ static void snis_draw_science_guy(GtkWidget *w, GdkGC *gc, struct snis_entity *o
 		case OBJTYPE_SHIP1:
 			sng_set_foreground(UI_COLOR(sci_ball_ship));
 			break;
+		case OBJTYPE_WARPGATE:
+			sng_set_foreground(UI_COLOR(sci_ball_warpgate));
+			break;
 		case OBJTYPE_STARBASE:
 			sng_set_foreground(UI_COLOR(sci_ball_starbase));
 			break;
@@ -5837,13 +6401,17 @@ static void snis_draw_science_guy(GtkWidget *w, GdkGC *gc, struct snis_entity *o
 			sprintf(buffer, "%s %s\n", o->sdata.name,
 					ship_type[o->sdata.subclass].class); 
 			break;
+		case OBJTYPE_WARPGATE:
+			sng_set_foreground(UI_COLOR(sci_ball_warpgate));
+			sprintf(buffer, "%s %s\n", "WG",  o->sdata.name);
+			break;
 		case OBJTYPE_STARBASE:
 			sng_set_foreground(UI_COLOR(sci_ball_starbase));
-			sprintf(buffer, "%s %s\n", "SB",  o->sdata.name); 
+			sprintf(buffer, "%s %s\n", "SB",  o->sdata.name);
 			break;
 		case OBJTYPE_ASTEROID:
 			sng_set_foreground(UI_COLOR(sci_ball_asteroid));
-			sprintf(buffer, "%s %s\n", "A",  o->sdata.name); 
+			sprintf(buffer, "%s %s\n", "A",  o->sdata.name);
 			break;
 		case OBJTYPE_DERELICT:
 			sng_set_foreground(UI_COLOR(sci_ball_derelict));
@@ -5921,6 +6489,9 @@ static void snis_draw_3d_science_guy(GtkWidget *w, GdkGC *gc, struct snis_entity
 		case OBJTYPE_SHIP1:
 			sng_set_foreground(UI_COLOR(sci_ball_ship));
 			break;
+		case OBJTYPE_WARPGATE:
+			sng_set_foreground(UI_COLOR(sci_ball_warpgate));
+			break;
 		case OBJTYPE_STARBASE:
 			sng_set_foreground(UI_COLOR(sci_ball_starbase));
 			break;
@@ -5960,17 +6531,20 @@ static void snis_draw_3d_science_guy(GtkWidget *w, GdkGC *gc, struct snis_entity
 			sprintf(buffer, "%s %s\n", o->sdata.name,
 				ship_type[o->sdata.subclass].class); 
 			break;
+		case OBJTYPE_WARPGATE:
+			sng_set_foreground(UI_COLOR(sci_ball_warpgate));
+			sprintf(buffer, "%s %s\n", "SB",  o->sdata.name);
 		case OBJTYPE_STARBASE:
 			sng_set_foreground(UI_COLOR(sci_ball_starbase));
-			sprintf(buffer, "%s %s\n", "SB",  o->sdata.name); 
+			sprintf(buffer, "%s %s\n", "SB",  o->sdata.name);
 			break;
 		case OBJTYPE_ASTEROID:
 			sng_set_foreground(UI_COLOR(sci_ball_asteroid));
-			sprintf(buffer, "%s %s\n", "A",  o->sdata.name); 
+			sprintf(buffer, "%s %s\n", "A",  o->sdata.name);
 			break;
 		case OBJTYPE_DERELICT:
 			sng_set_foreground(UI_COLOR(sci_ball_asteroid));
-			sprintf(buffer, "%s %s\n", "A",  "???"); 
+			sprintf(buffer, "%s %s\n", "A",  "???");
 			break;
 		case OBJTYPE_PLANET:
 			sng_set_foreground(UI_COLOR(sci_ball_planet));
@@ -6394,25 +6968,25 @@ static void draw_sciplane_display(GtkWidget *w, struct snis_entity *o, double ra
 	union vec3 camera_up = {{0,1,0}};
 	quat_rot_vec_self(&camera_up, &cam_orientation);
 
-	camera_assign_up_direction(navecx, camera_up.v.x, camera_up.v.y, camera_up.v.z);
-	camera_set_pos(navecx, camera_pos.v.x, camera_pos.v.y, camera_pos.v.z);
-	camera_look_at(navecx, camera_lookat.v.x, camera_lookat.v.y, camera_lookat.v.z);
+	camera_assign_up_direction(instrumentecx, camera_up.v.x, camera_up.v.y, camera_up.v.z);
+	camera_set_pos(instrumentecx, camera_pos.v.x, camera_pos.v.y, camera_pos.v.z);
+	camera_look_at(instrumentecx, camera_lookat.v.x, camera_lookat.v.y, camera_lookat.v.z);
 
-        set_renderer(navecx, WIREFRAME_RENDERER);
-	camera_set_parameters(navecx, range*(cam_range_fraction-1.0), range*(dist_to_cam_frac+1.0),
+	set_renderer(instrumentecx, WIREFRAME_RENDERER);
+	camera_set_parameters(instrumentecx, range*(cam_range_fraction-1.0), range*(dist_to_cam_frac+1.0),
 				SCREEN_WIDTH, SCREEN_HEIGHT, fovy);
-	set_window_offset(navecx, 0, 0);
-	calculate_camera_transform(navecx);
+	set_window_offset(instrumentecx, 0, 0);
+	calculate_camera_transform(instrumentecx);
 
-	e = add_entity(navecx, ring_mesh, o->x, o->y, o->z, UI_COLOR(sci_plane_ring));
+	e = add_entity(instrumentecx, ring_mesh, o->x, o->y, o->z, UI_COLOR(sci_plane_ring));
 	if (e)
 		update_entity_scale(e, range);
 
-	add_basis_ring(navecx, o->x, o->y, o->z, 1.0f, 0.0f, 0.0f, 0.0f, range * 0.98,
+	add_basis_ring(instrumentecx, o->x, o->y, o->z, 1.0f, 0.0f, 0.0f, 0.0f, range * 0.98,
 							UI_COLOR(sci_basis_ring_1));
-	add_basis_ring(navecx, o->x, o->y, o->z, 1.0f, 0.0f, 0.0f, 90.0f * M_PI / 180.0, range * 0.98,
+	add_basis_ring(instrumentecx, o->x, o->y, o->z, 1.0f, 0.0f, 0.0f, 90.0f * M_PI / 180.0, range * 0.98,
 							UI_COLOR(sci_basis_ring_2));
-	add_basis_ring(navecx, o->x, o->y, o->z, 0.0f, 0.0f, 1.0f, 90.0f * M_PI / 180.0, range * 0.98,
+	add_basis_ring(instrumentecx, o->x, o->y, o->z, 0.0f, 0.0f, 1.0f, 90.0f * M_PI / 180.0, range * 0.98,
 							UI_COLOR(sci_basis_ring_3));
 
 	int i;
@@ -6431,7 +7005,7 @@ static void draw_sciplane_display(GtkWidget *w, struct snis_entity *o, double ra
 		union vec3 ind_pos = {{range,0,0}};
 		quat_rot_vec_self(&ind_pos, &ind_orientation);
 		vec3_add_self(&ind_pos, &ship_pos);
-		e = add_entity(navecx, heading_indicator_mesh, ind_pos.v.x, ind_pos.v.y, ind_pos.v.z, color);
+		e = add_entity(instrumentecx, heading_indicator_mesh, ind_pos.v.x, ind_pos.v.y, ind_pos.v.z, color);
 		if (e) {
 			update_entity_scale(e, heading_indicator_mesh->radius*range/100.0);
 			update_entity_orientation(e, &ind_orientation);
@@ -6439,7 +7013,7 @@ static void draw_sciplane_display(GtkWidget *w, struct snis_entity *o, double ra
 		}
 
 		/* heading arrow tail */
-		e = add_entity(navecx, heading_ind_line_mesh, o->x, o->y, o->z, color);
+		e = add_entity(instrumentecx, heading_ind_line_mesh, o->x, o->y, o->z, color);
 		if (e) {
 			update_entity_scale(e, range);
 			update_entity_orientation(e, &ind_orientation);
@@ -6469,10 +7043,10 @@ static void draw_sciplane_display(GtkWidget *w, struct snis_entity *o, double ra
 			z2 += o->z;
 
 			float sx1, sy1, sx2, sy2, sx3, sy3;
-			if (!transform_line(navecx, x1, o->y, z1, x2, o->y, z2, &sx1, &sy1, &sx2, &sy2)) {
+			if (!transform_line(instrumentecx, x1, o->y, z1, x2, o->y, z2, &sx1, &sy1, &sx2, &sy2)) {
 				sng_draw_dotted_line(sx1, sy1, sx2, sy2);
 			}
-			if (!transform_point(navecx, x3, o->y, z3, &sx3, &sy3)) {
+			if (!transform_point(instrumentecx, x3, o->y, z3, &sx3, &sy3)) {
 				sprintf(buf, "%d", (int)math_angle_to_game_angle_degrees(i * 360.0/slices));
 				sng_center_xy_draw_string(buf, font, sx3, sy3);
 			}
@@ -6490,7 +7064,7 @@ static void draw_sciplane_display(GtkWidget *w, struct snis_entity *o, double ra
 		tz1 = o->z - sin(heading - beam_width / 2) * range * 0.05;
 		tx2 = o->x + cos(heading - beam_width / 2) * range;
 		tz2 = o->z - sin(heading - beam_width / 2) * range;
-		if (!transform_line(navecx, tx1, o->y, tz1, tx2, o->y, tz2, &sx1, &sy1, &sx2, &sy2)) {
+		if (!transform_line(instrumentecx, tx1, o->y, tz1, tx2, o->y, tz2, &sx1, &sy1, &sx2, &sy2)) {
 			sng_draw_electric_line(sx1, sy1, sx2, sy2);
 		}
 
@@ -6498,20 +7072,20 @@ static void draw_sciplane_display(GtkWidget *w, struct snis_entity *o, double ra
 		tz1 = o->z - sin(heading + beam_width / 2) * range * 0.05;
 		tx2 = o->x + cos(heading + beam_width / 2) * range;
 		tz2 = o->z - sin(heading + beam_width / 2) * range;
-		if (!transform_line(navecx, tx1, o->y, tz1, tx2, o->y, tz2, &sx1, &sy1, &sx2, &sy2)) {
+		if (!transform_line(instrumentecx, tx1, o->y, tz1, tx2, o->y, tz2, &sx1, &sy1, &sx2, &sy2)) {
 			sng_draw_electric_line(sx1, sy1, sx2, sy2);
 		}
 	}
 
 	/* add my ship */
-	e = add_entity(navecx, ship_mesh_map[o->tsd.ship.shiptype], o->x, o->y, o->z, UI_COLOR(sci_plane_self));
+	e = add_entity(instrumentecx, ship_mesh_map[o->tsd.ship.shiptype], o->x, o->y, o->z, UI_COLOR(sci_plane_self));
 	if (e) {
 		set_render_style(e, science_style);
 		update_entity_scale(e, range/300.0);
 		update_entity_orientation(e, &o->orientation);
 	}
 
-	render_entities(navecx);
+	render_entities(instrumentecx);
 
 	/* draw all the rest onto the 3d scene */
 	{
@@ -6591,12 +7165,14 @@ static void draw_sciplane_display(GtkWidget *w, struct snis_entity *o, double ra
 			if ( draw_popout_arc && tween > 0 ) {
 				/* show the flyout arc */
 				sng_set_foreground(UI_COLOR(sci_plane_popout_arc));
-				draw_3d_mark_arc(w, gc, navecx, &ship_pos, dist, heading, mark * tween * 0.9);
+				draw_3d_mark_arc(w, gc, instrumentecx, &ship_pos, dist, heading, mark * tween * 0.9);
 			}
 
 			float sx, sy;
-			if (!transform_point(navecx, display_pos.v.x, display_pos.v.y, display_pos.v.z, &sx, &sy)) {
-				snis_draw_science_guy(w, gc, &go[i], sx, sy, dist, bw, pwr, range, &go[i] == curr_science_guy, nebula_factor);
+			if (!transform_point(instrumentecx, display_pos.v.x, display_pos.v.y, display_pos.v.z,
+						&sx, &sy)) {
+				snis_draw_science_guy(w, gc, &go[i], sx, sy, dist, bw, pwr, range,
+								&go[i] == curr_science_guy, nebula_factor);
 			}
 
 			if (go[i].sdata.science_data_known && selected_guy_popout) {
@@ -6649,7 +7225,7 @@ static void draw_sciplane_display(GtkWidget *w, struct snis_entity *o, double ra
 
 		/* draw in the laserbeams */
 		for (i = 0; i < nlaserbeams; i++) {
-			draw_sciplane_laserbeam(w, gc, navecx, o, laserbeams[i], range);
+			draw_sciplane_laserbeam(w, gc, instrumentecx, o, laserbeams[i], range);
 		}
 
 		pthread_mutex_unlock(&universe_mutex);
@@ -6673,14 +7249,14 @@ static void draw_sciplane_display(GtkWidget *w, struct snis_entity *o, double ra
 				float z2 = o->z - sin(angle) * radius;
 
 				float sx1, sy1, sx2, sy2;
-				if (!transform_line(navecx, x1, y1, z1, x2, y2, z2, &sx1, &sy1, &sx2, &sy2)) {
+				if (!transform_line(instrumentecx, x1, y1, z1, x2, y2, z2, &sx1, &sy1, &sx2, &sy2)) {
 					snis_draw_line(sx1, sy1, sx2, sy2);
 				}
 			}
 		}
 	}
 
-	remove_all_entity(navecx);
+	remove_all_entity(instrumentecx);
 }
 
 static void add_basis_ring(struct entity_context *ecx, float x, float y, float z,
@@ -6842,6 +7418,7 @@ static void draw_all_the_3d_science_guys(GtkWidget *w, struct snis_entity *o, do
 
 		if (dist < range || go[i].type == OBJTYPE_PLANET ||
 					go[i].type == OBJTYPE_NEBULA ||
+					go[i].type == OBJTYPE_WARPGATE ||
 					go[i].type == OBJTYPE_STARBASE)
 			snis_draw_3d_science_guy(w, gc, &go[i], &x, &y, dist, bw, pwr, range,
 				&go[i] == curr_science_guy, 100.0 * current_zoom / 255.0, nebula_factor);
@@ -7265,6 +7842,11 @@ static void docking_magnets_button_pressed(__attribute__((unused)) void *cookie)
 	do_adjust_byte_value(0,  OPCODE_DOCKING_MAGNETS);
 }
 
+static void standard_orbit_button_pressed(__attribute__((unused)) void *cookie)
+{
+	do_adjust_byte_value(0, OPCODE_REQUEST_STANDARD_ORBIT);
+}
+
 static void reverse_button_pressed(__attribute__((unused)) void *s)
 {
 	struct snis_entity *o;
@@ -7364,7 +7946,11 @@ static void init_lobby_ui()
 {
 	lobby_ui.lobby_cancel_button = snis_button_init(txx(650), txy(520), -1, -1,
 			"CANCEL", UI_COLOR(lobby_cancel), NANO_FONT, lobby_cancel_button_pressed, NULL);
+	lobby_ui.lobby_connect_to_server_button = snis_button_init(txx(250), txy(520), -1, -1,
+			"CONNECT TO SERVER", UI_COLOR(lobby_connect_not_ok), NANO_FONT,
+			lobby_connect_to_server_button_pressed, NULL);
 	ui_add_button(lobby_ui.lobby_cancel_button, DISPLAYMODE_LOBBYSCREEN);
+	ui_add_button(lobby_ui.lobby_connect_to_server_button, DISPLAYMODE_LOBBYSCREEN);
 }
 
 static double sample_phaser_wavelength(void);
@@ -7456,26 +8042,31 @@ static void init_nav_ui(void)
 					nav_ui.gauge_radius * 2 + 120,
 					-1, -1, "DOCKING MAGNETS", button_color,
 					NANO_FONT, docking_magnets_button_pressed, NULL);
+	nav_ui.standard_orbit_button = snis_button_init(SCREEN_WIDTH - nav_ui.gauge_radius * 2 - 40,
+					nav_ui.gauge_radius * 2 + 180,
+					-1, -1, "STANDARD ORBIT", button_color,
+					NANO_FONT, standard_orbit_button_pressed, NULL);
 	nav_ui.reverse_button = snis_button_init(SCREEN_WIDTH - 40 + x, 5, 30, 25, "R", button_color,
 			NANO_FONT, reverse_button_pressed, NULL);
-	nav_ui.trident_button = snis_button_init(30, 228, -1, -1, "RELATIVE", button_color,
+	nav_ui.trident_button = snis_button_init(10, 250, -1, -1, "ABSOLUTE", button_color,
 			NANO_FONT, trident_button_pressed, NULL);
 	ui_add_slider(nav_ui.warp_slider, DISPLAYMODE_NAVIGATION);
 	ui_add_slider(nav_ui.navzoom_slider, DISPLAYMODE_NAVIGATION);
 	ui_add_slider(nav_ui.throttle_slider, DISPLAYMODE_NAVIGATION);
 	ui_add_button(nav_ui.engage_warp_button, DISPLAYMODE_NAVIGATION);
 	ui_add_button(nav_ui.docking_magnets_button, DISPLAYMODE_NAVIGATION);
+	ui_add_button(nav_ui.standard_orbit_button, DISPLAYMODE_NAVIGATION);
 	ui_add_button(nav_ui.reverse_button, DISPLAYMODE_NAVIGATION);
 	ui_add_button(nav_ui.trident_button, DISPLAYMODE_NAVIGATION);
 	ui_add_gauge(nav_ui.warp_gauge, DISPLAYMODE_NAVIGATION);
-	navecx = entity_context_new(5000, 1000);
+	instrumentecx = entity_context_new(5000, 1000);
 	tridentecx = entity_context_new(10, 0);
 }
 
 void draw_orientation_trident(GtkWidget *w, GdkGC *gc, struct snis_entity *o, float rx, float ry, float rr)
 {
 	static struct mesh *xz_ring_mesh = 0;
-	int absolute_mode = o->tsd.ship.trident;
+	int relative_mode = o->tsd.ship.trident;
 
 	if (!xz_ring_mesh) {
 		xz_ring_mesh = init_circle_mesh(0, 0, 1, 40, 2.0*M_PI);
@@ -7486,7 +8077,7 @@ void draw_orientation_trident(GtkWidget *w, GdkGC *gc, struct snis_entity *o, fl
 	struct entity *e;
 	union quat cam_orientation;
 
-	if (absolute_mode)
+	if (!relative_mode)
 		quat_init_axis(&cam_orientation, 0, 1, 0, 0);
 	else
 		cam_orientation = o->orientation;
@@ -7504,16 +8095,16 @@ void draw_orientation_trident(GtkWidget *w, GdkGC *gc, struct snis_entity *o, fl
 
 	/* figure out the camera positions */
 	union vec3 camera_up = { {0, 1, 0} };
-	if (!absolute_mode)
+	if (relative_mode)
 		quat_rot_vec_self(&camera_up, &cam_orientation);
 
 	union vec3 camera_pos = { {-dist_to_cam, 0, 0} };
-	if (!absolute_mode)
+	if (relative_mode)
 		quat_rot_vec_self(&camera_pos, &cam_orientation);
 	vec3_add_self(&camera_pos, &center_pos);
 
 	union vec3 camera_lookat = {{0, 0, 0}};
-	if (!absolute_mode)
+	if (relative_mode)
 		quat_rot_vec_self(&camera_lookat, &cam_orientation);
 	vec3_add_self(&camera_lookat, &center_pos);
 
@@ -7592,7 +8183,7 @@ void draw_orientation_trident(GtkWidget *w, GdkGC *gc, struct snis_entity *o, fl
 			center_pos.v.x, center_pos.v.y, center_pos.v.z, UI_COLOR(nav_trident_ship));
 	if (e) {
 		update_entity_orientation(e, &o->orientation);
-		update_entity_scale(e, 0.07 / heading_indicator_mesh->radius);
+		update_entity_scale(e, 0.15 / heading_indicator_mesh->radius);
 	}
 
 	render_entities(tridentecx);
@@ -7755,20 +8346,20 @@ static void draw_3d_nav_display(GtkWidget *w, GdkGC *gc)
 	quat_rot_vec_self(&camera_lookat, &cam_orientation);
 	vec3_add_self(&camera_lookat, &ship_pos);
 
-	camera_assign_up_direction(navecx, camera_up.v.x, camera_up.v.y, camera_up.v.z);
-	camera_set_pos(navecx, camera_pos.v.x, camera_pos.v.y, camera_pos.v.z);
-	camera_look_at(navecx, camera_lookat.v.x, camera_lookat.v.y, camera_lookat.v.z);
+	camera_assign_up_direction(instrumentecx, camera_up.v.x, camera_up.v.y, camera_up.v.z);
+	camera_set_pos(instrumentecx, camera_pos.v.x, camera_pos.v.y, camera_pos.v.z);
+	camera_look_at(instrumentecx, camera_lookat.v.x, camera_lookat.v.y, camera_lookat.v.z);
 
-	set_renderer(navecx, WIREFRAME_RENDERER);
-	camera_set_parameters(navecx, 1.0, camera_pos_len+screen_radius*2,
+	set_renderer(instrumentecx, WIREFRAME_RENDERER);
+	camera_set_parameters(instrumentecx, 1.0, camera_pos_len+screen_radius*2,
 				SCREEN_WIDTH, SCREEN_HEIGHT, ANGLE_OF_VIEW * M_PI / 180.0);
-	calculate_camera_transform(navecx);
+	calculate_camera_transform(instrumentecx);
 
 	int in_nebula = 0;
 	int i;
 
 	for (i=0; i<4; ++i) {
-		e = add_entity(navecx, radar_ring_mesh[i], o->x - ship_normal.v.x, o->y - ship_normal.v.y,
+		e = add_entity(instrumentecx, radar_ring_mesh[i], o->x - ship_normal.v.x, o->y - ship_normal.v.y,
 			o->z - ship_normal.v.z, UI_COLOR(nav_ring));
 		if (e) {
 			update_entity_scale(e, screen_radius);
@@ -7798,7 +8389,7 @@ static void draw_3d_nav_display(GtkWidget *w, GdkGC *gc)
 		union vec3 ind_pos = {{screen_radius,0,0}};
 		quat_rot_vec_self(&ind_pos, &ind_orientation);
 		vec3_add_self(&ind_pos, &ship_pos);
-		e = add_entity(navecx, heading_indicator_mesh, ind_pos.v.x, ind_pos.v.y, ind_pos.v.z, color);
+		e = add_entity(instrumentecx, heading_indicator_mesh, ind_pos.v.x, ind_pos.v.y, ind_pos.v.z, color);
 		if (e) {
 			update_entity_scale(e, heading_indicator_mesh->radius*screen_radius/100.0);
 			update_entity_orientation(e, &ind_orientation);
@@ -7806,7 +8397,7 @@ static void draw_3d_nav_display(GtkWidget *w, GdkGC *gc)
 		}
 
 		/* heading arrow tail */
-		e = add_entity(navecx, heading_ind_line_mesh, o->x, o->y, o->z, color);
+		e = add_entity(instrumentecx, heading_ind_line_mesh, o->x, o->y, o->z, color);
 		if (e) {
 			update_entity_scale(e, screen_radius);
 			update_entity_orientation(e, &ind_orientation);
@@ -7814,7 +8405,7 @@ static void draw_3d_nav_display(GtkWidget *w, GdkGC *gc)
 	}
 
 	/* ship forward vector */
-	e = add_entity(navecx, forward_line_mesh, o->x, o->y, o->z, UI_COLOR(nav_forward_vector));
+	e = add_entity(instrumentecx, forward_line_mesh, o->x, o->y, o->z, UI_COLOR(nav_forward_vector));
 	if (e) {
 		update_entity_scale(e, screen_radius);
 		update_entity_orientation(e, &o->orientation);
@@ -7844,7 +8435,7 @@ static void draw_3d_nav_display(GtkWidget *w, GdkGC *gc)
 			random_point_in_3d_annulus(visible_distance, screen_radius, &ship_pos, &u, &v, &point);
 
 			float sx, sy;
-			if (!transform_point(navecx, point.v.x, point.v.y, point.v.z, &sx, &sy)) {
+			if (!transform_point(instrumentecx, point.v.x, point.v.y, point.v.z, &sx, &sy)) {
 				sng_draw_point(sx, sy);
 			}
 		}
@@ -7854,7 +8445,7 @@ static void draw_3d_nav_display(GtkWidget *w, GdkGC *gc)
 	pthread_mutex_lock(&universe_mutex);
 
 	/* add my ship */
-	e = add_entity(navecx, ship_mesh_map[o->tsd.ship.shiptype], o->x, o->y, o->z, UI_COLOR(nav_self));
+	e = add_entity(instrumentecx, ship_mesh_map[o->tsd.ship.shiptype], o->x, o->y, o->z, UI_COLOR(nav_self));
 	if (e) {
 		set_render_style(e, science_style);
 		update_entity_scale(e, ship_scale);
@@ -7880,7 +8471,7 @@ static void draw_3d_nav_display(GtkWidget *w, GdkGC *gc)
 		}
 
 		if (go[i].type == OBJTYPE_LASERBEAM || go[i].type == OBJTYPE_TRACTORBEAM) {
-			draw_3d_laserbeam(w, gc, navecx, o, &go[i], display_radius);
+			draw_3d_laserbeam(w, gc, instrumentecx, o, &go[i], display_radius);
 			continue;
 		}
 
@@ -7916,6 +8507,7 @@ static void draw_3d_nav_display(GtkWidget *w, GdkGC *gc)
 		case OBJTYPE_ASTEROID:
 		case OBJTYPE_PLANET:
 		case OBJTYPE_STARBASE:
+		case OBJTYPE_WARPGATE:
 		case OBJTYPE_SHIP2:
 		case OBJTYPE_CARGO_CONTAINER:
 		case OBJTYPE_SHIP1:
@@ -7923,21 +8515,21 @@ static void draw_3d_nav_display(GtkWidget *w, GdkGC *gc)
 			struct mesh *m = entity_get_mesh(go[i].entity);
 
 			if (go[i].type == OBJTYPE_TORPEDO) {
-				contact = add_entity(navecx, torpedo_nav_mesh, go[i].x, go[i].y, go[i].z,
+				contact = add_entity(instrumentecx, torpedo_nav_mesh, go[i].x, go[i].y, go[i].z,
 							UI_COLOR(nav_torpedo));
 				if (contact) {
 					set_render_style(contact, science_style | RENDER_BRIGHT_LINE | RENDER_NO_FILL);
 					entity_set_user_data(contact, &go[i]); /* for debug */
 				}
 			} else if (go[i].type == OBJTYPE_LASER) {
-				contact = add_entity(navecx, laserbeam_nav_mesh, go[i].x, go[i].y, go[i].z,
+				contact = add_entity(instrumentecx, laserbeam_nav_mesh, go[i].x, go[i].y, go[i].z,
 					UI_COLOR(nav_laser));
 				if (contact) {
 					set_render_style(contact, science_style | RENDER_BRIGHT_LINE | RENDER_NO_FILL);
 					entity_set_user_data(contact, &go[i]); /* for debug */
 				}
 			} else {
-				contact = add_entity(navecx, m, go[i].x, go[i].y, go[i].z, UI_COLOR(nav_entity));
+				contact = add_entity(instrumentecx, m, go[i].x, go[i].y, go[i].z, UI_COLOR(nav_entity));
 				if (contact) {
 					set_render_style(contact, science_style);
 					entity_set_user_data(contact, &go[i]);
@@ -7969,6 +8561,9 @@ static void draw_3d_nav_display(GtkWidget *w, GdkGC *gc)
 			switch (go[i].type) {
 			case OBJTYPE_PLANET:
 				contact_scale = ((255.0 - current_zoom) / 255.0) * 0.0 + 1.0;
+				break;
+			case OBJTYPE_WARPGATE:
+				contact_scale = ((255.0 - current_zoom) / 255.0) * 4.0 + 1.0;
 				break;
 			case OBJTYPE_STARBASE:
 				contact_scale = ((255.0 - current_zoom) / 255.0) * 4.0 + 1.0;
@@ -8026,17 +8621,17 @@ static void draw_3d_nav_display(GtkWidget *w, GdkGC *gc)
 				}
 
 				if (proj_distance > 0)
-					e = add_entity(navecx, vline_mesh_neg, contact_pos.v.x, contact_pos.v.y,
+					e = add_entity(instrumentecx, vline_mesh_neg, contact_pos.v.x, contact_pos.v.y,
 						contact_pos.v.z, UI_COLOR(nav_ring));
 				else
-					e = add_entity(navecx, vline_mesh_pos, contact_pos.v.x, contact_pos.v.y,
+					e = add_entity(instrumentecx, vline_mesh_pos, contact_pos.v.x, contact_pos.v.y,
 						contact_pos.v.z, UI_COLOR(nav_ring));
 				if (e) {
 					update_entity_scale(e, abs(proj_distance));
 					update_entity_orientation(e, &o->orientation);
 				}
 
-				e = add_entity(navecx, ring_mesh, ship_plane_proj.v.x,
+				e = add_entity(instrumentecx, ring_mesh, ship_plane_proj.v.x,
 						ship_plane_proj.v.y, ship_plane_proj.v.z, UI_COLOR(nav_projected_ring));
 				if (e) {
 					update_entity_scale(e, contact_ring_radius);
@@ -8045,19 +8640,19 @@ static void draw_3d_nav_display(GtkWidget *w, GdkGC *gc)
 			}
 		}
 	}
-	render_entities(navecx);
+	render_entities(instrumentecx);
 
-	draw_orientation_trident(w, gc, o, 75, 175, 100);
+	draw_orientation_trident(w, gc, o, 75, 175, 150);
 
 	/* Draw labels on ships... */
 	sng_set_foreground(UI_COLOR(nav_entity_label));
-	for (i = 0; i <= get_entity_count(navecx); i++) {
+	for (i = 0; i <= get_entity_count(instrumentecx); i++) {
 		float sx, sy;
 		char buffer[100];
 		struct entity *e;
 		struct snis_entity *o;
 
-		e = get_entity(navecx, i);
+		e = get_entity(instrumentecx, i);
 		if (!e)
 			continue;
 		o = entity_get_user_data(e);
@@ -8093,7 +8688,7 @@ static void draw_3d_nav_display(GtkWidget *w, GdkGC *gc)
 
 	pthread_mutex_unlock(&universe_mutex);
 
-	remove_all_entity(navecx);
+	remove_all_entity(instrumentecx);
 }
 
 static void show_navigation(GtkWidget *w)
@@ -8168,12 +8763,12 @@ static void robot_gripper_button_pressed(void *x)
 
 static void robot_auto_button_pressed(void *x)
 {
-	queue_to_server(packed_buffer_new("bb", OPCODE_ROBOT_AUTO_MANUAL, 1));
+	queue_to_server(packed_buffer_new("bb", OPCODE_ROBOT_AUTO_MANUAL, DAMCON_ROBOT_FULLY_AUTONOMOUS));
 }
 
 static void robot_manual_button_pressed(void *x)
 {
-	queue_to_server(packed_buffer_new("bb", OPCODE_ROBOT_AUTO_MANUAL, 0));
+	queue_to_server(packed_buffer_new("bb", OPCODE_ROBOT_AUTO_MANUAL, DAMCON_ROBOT_MANUAL_MODE));
 }
 
 static void init_damcon_ui(void)
@@ -8670,6 +9265,16 @@ static void show_engineering(GtkWidget *w)
 	show_common_screen(w, "ENGINEERING");
 }
 
+static inline double screenx_to_damconx(double x)
+{
+	return x - damconscreenx0 - damconscreenxdim / 2.0 + *damconscreenx;
+}
+
+static inline double screeny_to_damcony(double y)
+{
+	return y - damconscreeny0 - damconscreenydim / 2.0 + *damconscreeny;
+}
+
 static inline int damconx_to_screenx(double x)
 {
 	return x + damconscreenx0 + damconscreenxdim / 2.0 - *damconscreenx;
@@ -8758,6 +9363,22 @@ static void draw_damcon_robot(GtkWidget *w, struct snis_damcon_entity *o)
 	y = o->y + damconscreeny0 + damconscreenydim / 2.0 - *damconscreeny;
 	sng_set_foreground(UI_COLOR(damcon_robot));
 	sng_draw_vect_obj(&damcon_robot_spun[byteangle], x, y);
+#if 0
+	x = damconx_to_screenx(o->tsd.robot.short_term_goal_x);
+	y = damcony_to_screeny(o->tsd.robot.short_term_goal_y);
+	sng_current_draw_line(x - 5, y, x + 5, y);
+	sng_current_draw_line(x, y - 5, x, y + 5);
+	x = damconx_to_screenx(o->tsd.robot.long_term_goal_x);
+	y = damcony_to_screeny(o->tsd.robot.long_term_goal_y);
+	sng_set_foreground(UI_COLOR(damcon_system));
+	sng_current_draw_line(x - 5, y, x + 5, y);
+	sng_current_draw_line(x, y - 5, x, y + 5);
+	x = damconx_to_screenx(o->tsd.robot.angle_debug_x);
+	y = damcony_to_screeny(o->tsd.robot.angle_debug_y);
+	sng_set_foreground(UI_COLOR(common_red_alert));
+	sng_current_draw_line(x - 5, y, x + 5, y);
+	sng_current_draw_line(x, y - 5, x, y + 5);
+#endif
 }
 
 static void draw_damcon_system(GtkWidget *w, struct snis_damcon_entity *o)
@@ -8844,6 +9465,16 @@ static void draw_damcon_part(GtkWidget *w, struct snis_damcon_entity *o)
 			60.0 * (255 - o->tsd.part.damage) / 255.0, 6);
 }
 
+static void draw_damcon_waypoint(GtkWidget *w, struct snis_damcon_entity *o)
+{
+	int x, y;
+
+	sng_set_foreground(UI_COLOR(damcon_part));
+	x = damconx_to_screenx(o->x);
+	y = damcony_to_screeny(o->y);
+	snis_draw_rectangle(0, x - 4, y - 4, 8, 8);
+}
+
 static void draw_damcon_object(GtkWidget *w, struct snis_damcon_entity *o)
 {
 	switch (o->type) {
@@ -8867,6 +9498,9 @@ static void draw_damcon_object(GtkWidget *w, struct snis_damcon_entity *o)
 		break;
 	case DAMCON_TYPE_PART:
 		draw_damcon_part(w, o);
+		break;
+	case DAMCON_TYPE_WAYPOINT:
+		draw_damcon_waypoint(w, o);
 		break;
 	default:
 		break;
@@ -9053,6 +9687,32 @@ static void send_comms_packet_to_server(char *msg, uint8_t opcode, uint32_t id)
 
 	pb = packed_buffer_allocate(sizeof(struct comms_transmission_packet) + len);
 	packed_buffer_append(pb, "bbw", opcode, len, id);
+	packed_buffer_append_raw(pb, msg, (unsigned short) len);
+	packed_buffer_queue_add(&to_server_queue, pb, &to_server_queue_mutex);
+	wakeup_gameserver_writer();
+}
+
+static void send_text_to_speech_packet_to_server(char *msg)
+{
+	struct packed_buffer *pb;
+	uint8_t len = strlen(msg);
+
+	pb = packed_buffer_allocate(sizeof(struct comms_transmission_packet) + len);
+	packed_buffer_append(pb, "bbb", OPCODE_NATURAL_LANGUAGE_REQUEST,
+				OPCODE_NL_SUBCOMMAND_TEXT_TO_SPEECH, len);
+	packed_buffer_append_raw(pb, msg, (unsigned short) len);
+	packed_buffer_queue_add(&to_server_queue, pb, &to_server_queue_mutex);
+	wakeup_gameserver_writer();
+}
+
+static void send_natural_language_request_to_server(char *msg)
+{
+	struct packed_buffer *pb;
+	uint8_t len = strlen(msg);
+
+	pb = packed_buffer_allocate(sizeof(struct comms_transmission_packet) + len);
+	packed_buffer_append(pb, "bbb", OPCODE_NATURAL_LANGUAGE_REQUEST,
+				OPCODE_NL_SUBCOMMAND_TEXT_REQUEST, len);
 	packed_buffer_append_raw(pb, msg, (unsigned short) len);
 	packed_buffer_queue_add(&to_server_queue, pb, &to_server_queue_mutex);
 	wakeup_gameserver_writer();
@@ -9330,6 +9990,7 @@ static void draw_science_data(GtkWidget *w, struct snis_entity *ship, struct sni
 	sng_abs_xy_draw_string(buffer, TINY_FONT, x, y);
 	if (o && (o->type == OBJTYPE_SHIP1 ||
 		o->type == OBJTYPE_SHIP2 ||
+		o->type == OBJTYPE_WARPGATE ||
 		o->type == OBJTYPE_STARBASE)) {
 		y += 25;
 		the_faction = o ? 
@@ -9346,10 +10007,13 @@ static void draw_science_data(GtkWidget *w, struct snis_entity *ship, struct sni
 			sprintf(buffer, "TYPE: %s", ship_type[o->sdata.subclass].class); 
 			break;
 		case OBJTYPE_STARBASE:
-			sprintf(buffer, "TYPE: %s", "STARBASE"); 
+			sprintf(buffer, "TYPE: %s", "STARBASE");
+			break;
+		case OBJTYPE_WARPGATE:
+			sprintf(buffer, "TYPE: %s", "WARPGATE");
 			break;
 		case OBJTYPE_ASTEROID:
-			sprintf(buffer, "TYPE: %s", "ASTEROID"); 
+			sprintf(buffer, "TYPE: %s", "ASTEROID");
 			break;
 		case OBJTYPE_DERELICT:
 			sprintf(buffer, "TYPE: %s", "DERELICT");
@@ -9504,6 +10168,13 @@ static void draw_science_details(GtkWidget *w, GdkGC *gc)
 			for (i = 0; planet_desc[i] != '\0'; i++)
 				planet_desc[i] = toupper(planet_desc[i]);
 		}
+		sprintf(buf, "TYPE: %s (%s, %s)",
+			solarsystem_assets->planet_type[p->solarsystem_planet_type],
+			solarsystem_assets->planet_texture[p->solarsystem_planet_type],
+			solarsystem_assets->planet_normalmap[p->solarsystem_planet_type]);
+		uppercase(buf);
+		sng_abs_xy_draw_string(buf, TINY_FONT, 10, y);
+		y += yinc;
 		sprintf(buf, "GOVERNMENT: %s", government_name[p->government]);
 		sng_abs_xy_draw_string(buf, TINY_FONT, 10, y);
 		y += yinc;
@@ -9566,6 +10237,7 @@ static void show_science(GtkWidget *w)
 {
 	struct snis_entity *o;
 	char buf[80];
+	char ssname[12];
 	double zoom;
 	static int current_zoom = 0;
 
@@ -9576,10 +10248,15 @@ static void show_science(GtkWidget *w)
 
 	current_zoom = newzoom(current_zoom, o->tsd.ship.scizoom);
 
+#if 0
 	if ((timer & 0x3f) == 0)
 		wwviaudio_add_sound(SCIENCE_PROBE_SOUND);
+#endif
 	sng_set_foreground(UI_COLOR(sci_coords));
-	sprintf(buf, "LOC: (%5.2lf, %5.2lf, %5.2lf)", o->x, o->y, o->z);
+	strncpy(ssname, solarsystem_name, 11);
+	ssname[11] = '\0';
+	uppercase(ssname);
+	sprintf(buf, "LOC: %s SYSTEM (%5.2lf, %5.2lf, %5.2lf)", ssname, o->x, o->y, o->z);
 	sng_abs_xy_draw_string(buf, TINY_FONT, 0.25 * SCREEN_WIDTH, LINEHEIGHT * 0.5);
 	zoom = (MAX_SCIENCE_SCREEN_RADIUS - MIN_SCIENCE_SCREEN_RADIUS) *
 			(current_zoom / 255.0) + MIN_SCIENCE_SCREEN_RADIUS;
@@ -9597,7 +10274,7 @@ static void show_3d_science(GtkWidget *w)
 {
 	int /* rx, ry, rw, rh, */ cx, cy, r;
 	struct snis_entity *o;
-	char buf[80];
+	char buf[80], ssname[12];
 	double zoom;
 	static int current_zoom = 0;
 
@@ -9608,10 +10285,15 @@ static void show_3d_science(GtkWidget *w)
 
 	current_zoom = newzoom(current_zoom, o->tsd.ship.scizoom);
 
+#if endif
 	if ((timer & 0x3f) == 0)
 		wwviaudio_add_sound(SCIENCE_PROBE_SOUND);
+#endif
 	sng_set_foreground(UI_COLOR(sci_coords));
-	sprintf(buf, "LOC: (%5.2lf, %5.2lf, %5.2lf)", o->x, o->y, o->z);
+	strncpy(ssname, solarsystem_name, 11);
+	ssname[11] = '\0';
+	uppercase(ssname);
+	sprintf(buf, "LOC: %s SYSTEM (%5.2lf, %5.2lf, %5.2lf)", ssname, o->x, o->y, o->z);
 	sng_abs_xy_draw_string(buf, TINY_FONT, 200, LINEHEIGHT * 0.5);
 	cx = SCIENCE_SCOPE_CX;
 	cy = SCIENCE_SCOPE_CY;
@@ -9812,16 +10494,31 @@ static void demon_select_none(void)
 static void demon_button_press(int button, gdouble x, gdouble y)
 {
 	/* must be right mouse button so as not to conflict with 'EXECUTE' button. */
-	if (button == 3) {
-		demon_ui.ix = demon_mousex_to_ux(x);
-		demon_ui.iz = demon_mousey_to_uz(y);
-		demon_ui.ix2 = demon_mousex_to_ux(x);
-		demon_ui.iz2 = demon_mousey_to_uz(y);
-		demon_ui.selectmode = 1;
-	}
-	if (button == 2) {
-		demon_ui.move_from_x = x;
-		demon_ui.move_from_y = y;
+	if (demon_ui.use_3d) {
+		demon_ui.press_mousex = x;
+		demon_ui.press_mousey = y;
+		switch (button) {
+		case 2:
+			demon_ui.button2_pressed = 1;
+			break;
+		case 3:
+			demon_ui.button3_pressed = 1;
+			break;
+		default:
+			break;
+		}
+	} else {
+		if (button == 3) {
+			demon_ui.ix = demon_mousex_to_ux(x);
+			demon_ui.iz = demon_mousey_to_uz(y);
+			demon_ui.ix2 = demon_mousex_to_ux(x);
+			demon_ui.iz2 = demon_mousey_to_uz(y);
+			demon_ui.selectmode = 1;
+		}
+		if (button == 2) {
+			demon_ui.move_from_x = x;
+			demon_ui.move_from_y = y;
+		}
 	}
 }
 
@@ -9830,13 +10527,20 @@ static inline int between(double a, double b, double v)
 	return ((a <= v && v <= b) || (b <= v && v <= a));
 }
 
-static void demon_button_create_item(gdouble x, gdouble y)
+static void demon_button_create_item(gdouble x, gdouble y, gdouble z)
 {
-	double ux, uz;
+	double ux, uy, uz;
 	uint8_t item_type;
 
-	ux = demon_mousex_to_ux(x);
-	uz = demon_mousey_to_uz(y);
+	if (demon_ui.use_3d) {
+		ux = x;
+		uy = y;
+		uz = z;
+	} else {
+		ux = demon_mousex_to_ux(x);
+		uz = demon_mousey_to_uz(z);
+		uy = y;
+	}
 
 	switch (demon_ui.buttonmode) {
 		case DEMON_BUTTON_SHIPMODE:
@@ -9860,8 +10564,8 @@ static void demon_button_create_item(gdouble x, gdouble y)
 		default:
 			return;
 	}
-	queue_to_server(packed_buffer_new("bbSS", OPCODE_CREATE_ITEM, item_type,
-			ux, (int32_t) UNIVERSE_DIM, uz, (int32_t) UNIVERSE_DIM));
+	queue_to_server(packed_buffer_new("bbSSS", OPCODE_CREATE_ITEM, item_type,
+			ux, (int32_t) UNIVERSE_DIM, uy, (int32_t) UNIVERSE_DIM, uz, (int32_t) UNIVERSE_DIM));
 }
 
 typedef int (*demon_select_test)(uint32_t oid);
@@ -9898,6 +10602,20 @@ static void demon_select_and_act(double sx1, double sy1,
 	pthread_mutex_unlock(&universe_mutex);
 }
 
+static void demon_button2_release_3d(int button, gdouble x, gdouble y)
+{
+	demon_ui.release_mousex = x;
+	demon_ui.release_mousey = y;
+	demon_ui.button2_released = 1;
+}
+
+static void demon_button3_release_3d(int button, gdouble x, gdouble y)
+{
+	demon_ui.release_mousex = x;
+	demon_ui.release_mousey = y;
+	demon_ui.button3_released = 1;
+}
+
 static void demon_button3_release(int button, gdouble x, gdouble y)
 {
 	int nselected;
@@ -9907,7 +10625,7 @@ static void demon_button3_release(int button, gdouble x, gdouble y)
 	/* If the item creation buttons selected, create item... */ 
 	if (demon_ui.buttonmode > DEMON_BUTTON_NOMODE &&
 		demon_ui.buttonmode < DEMON_BUTTON_DELETE) {
-		demon_button_create_item(x, y);
+		demon_button_create_item(x, 0.0, y);
 		return;
 	}
 
@@ -9947,21 +10665,23 @@ static void demon_button3_release(int button, gdouble x, gdouble y)
 static void demon_button2_release(int button, gdouble x, gdouble y)
 {
 	int i;
-	double dx, dz;
+	double dx, dy, dz;
 
 	if (demon_ui.nselected <= 0)
 		return;
 
 	/* Moving objects... */
 	dx = demon_mousex_to_ux(x) - demon_mousex_to_ux(demon_ui.move_from_x);
+	dy = 0.0;
 	dz = demon_mousey_to_uz(y) - demon_mousey_to_uz(demon_ui.move_from_y);
 	
 	pthread_mutex_lock(&universe_mutex);
 	for (i = 0; i < demon_ui.nselected; i++) {
-		queue_to_server(packed_buffer_new("bwSS",
+		queue_to_server(packed_buffer_new("bwSSS",
 				OPCODE_DEMON_MOVE_OBJECT,
 				demon_ui.selected_id[i],
 				dx, (int32_t) UNIVERSE_DIM,
+				dy, (int32_t) UNIVERSE_DIM,
 				dz, (int32_t) UNIVERSE_DIM));
 	}
 	pthread_mutex_unlock(&universe_mutex);
@@ -9969,6 +10689,19 @@ static void demon_button2_release(int button, gdouble x, gdouble y)
 
 static void demon_button_release(int button, gdouble x, gdouble y)
 {
+	if (demon_ui.use_3d) {
+		switch (button) {
+		case 2:
+			demon_button2_release_3d(button, x, y);
+			break;
+		case 3:
+			demon_button3_release_3d(button, x, y);
+			break;
+		default:
+			break;
+		}
+		return;
+	}
 	switch (button) {
 	case 2:
 		demon_button2_release(button, x, y);
@@ -9978,6 +10711,38 @@ static void demon_button_release(int button, gdouble x, gdouble y)
 		return;
 	default:
 		return;
+	}
+}
+
+static void do_damcon_button_release(int button, gdouble x, gdouble y)
+{
+	double dcx, dcy, sx, sy;
+	switch (button) {
+	case 1:
+		sx = sng_pixelx_to_screenx(x);
+		sy = sng_pixely_to_screeny(y);
+		dcx = screenx_to_damconx(sx);
+		dcy = screeny_to_damcony(sy);
+		queue_to_server(packed_buffer_new("bbSS",
+					OPCODE_REQUEST_ROBOT_CMD, OPCODE_ROBOT_SUBCMD_STG,
+					dcx, (int32_t) DAMCONXDIM,
+					dcy, (int32_t) DAMCONYDIM));
+		break;
+	case 2:
+		sx = sng_pixelx_to_screenx(x);
+		sy = sng_pixely_to_screeny(y);
+		dcx = screenx_to_damconx(sx);
+		dcy = screeny_to_damcony(sy);
+		queue_to_server(packed_buffer_new("bbSS",
+					OPCODE_REQUEST_ROBOT_CMD, OPCODE_ROBOT_SUBCMD_LTG,
+					dcx, (int32_t) DAMCONXDIM,
+					dcy, (int32_t) DAMCONYDIM));
+		break;
+	case 3:
+		robot_gripper_button_pressed(NULL);
+		break;
+	default:
+		break;
 	}
 }
 
@@ -10160,6 +10925,7 @@ static struct demon_cmd_def {
 	{ "SAFEMODE", "TOGGLES SAFE MODE (prevents enemies from attacking)" },
 	{ "HELP", "PRINT THIS HELP INFORMATION" },
 	{ "ENSCRIPT", "SAVE (PARTIALLY) UNIVERSE STATE TO LUA SCRIPT" },
+	{ "TTS", "USE TEXT-TO-SPEECH TO SPEAK SOMETHING TO SELECTED SHIP." },
 };
 static int demon_help_mode = 0;
 #define DEMON_CMD_DELIM " ,"
@@ -10277,13 +11043,15 @@ static int construct_demon_command(char *input,
 	char *saveptr;
 	struct packed_buffer *pb;
 	int idcount;
+	char *original = NULL;
 
+	original = strdup(input); /* save lowercase version for text to speech */
 	uppercase(input);
 	saveptr = NULL;
 	s = strtok_r(input, DEMON_CMD_DELIM, &saveptr);
 	if (s == NULL) {
 		strcpy(errmsg, "empty command");
-		return -1;
+		goto error;
 	}
 
 	found = 0;
@@ -10296,7 +11064,7 @@ static int construct_demon_command(char *input,
 	}
 	if (!found) {
 		sprintf(errmsg, "Unknown verb '%s'", s);
-		return -1;
+		goto error;
 	}
 
 	switch (v) {
@@ -10304,12 +11072,12 @@ static int construct_demon_command(char *input,
 			s = strtok_r(NULL, DEMON_CMD_DELIM, &saveptr);
 			if (s == NULL) {
 				sprintf(errmsg, "missing argument to mark command");
-				return -1;
+				goto error;
 			}
 			l = get_demon_location_var(s); 
 			if (l < 0) {
 				sprintf(errmsg, "out of location variables");
-				return -1;
+				goto error;
 			}
 			demon_location[l].x = demon_ui.selectedx;
 			demon_location[l].z = demon_ui.selectedz;
@@ -10318,12 +11086,12 @@ static int construct_demon_command(char *input,
 			s = strtok_r(NULL, DEMON_CMD_DELIM, &saveptr);
 			if (s == NULL) {
 				sprintf(errmsg, "missing argument to name command");
-				return -1;
+				goto error;
 			}
 			g = get_demon_group_var(s); 
 			if (g < 0) {
 				sprintf(errmsg, "out of group variables");
-				return -1;
+				goto error;
 			}
 			set_demon_group(g);
 			break; 
@@ -10331,22 +11099,22 @@ static int construct_demon_command(char *input,
 			s = strtok_r(NULL, DEMON_CMD_DELIM, &saveptr);
 			if (s == NULL) {
 				sprintf(errmsg, "missing 1st argument to attack command");
-				return -1;
+				goto error;
 			}
 			g = lookup_demon_group(s);
 			if (g < 0) {
 				sprintf(errmsg, "No such group '%s'", s);
-				return -1;
+				goto error;
 			}
 			s = strtok_r(NULL, DEMON_CMD_DELIM, &saveptr);
 			if (s == NULL) {
 				sprintf(errmsg, "missing 2nd argument to attack command");
-				return -1;
+				goto error;
 			}
 			g2 = lookup_demon_group(s);
 			if (g2 < 0) {
 				sprintf(errmsg, "no such group '%s'", s);
-				return -1;
+				goto error;
 			}
 			/* TODO - finish this */
 			printf("group %d commanded to attack group %d\n", g, g2);
@@ -10375,35 +11143,35 @@ static int construct_demon_command(char *input,
 			s = strtok_r(NULL, DEMON_CMD_DELIM, &saveptr);
 			if (s == NULL) {
 				sprintf(errmsg, "missing argument to goto command");
-				return -1;
+				goto error;
 			}
 			break; 
 		case 4: /* patrol */
 			s = strtok_r(NULL, DEMON_CMD_DELIM, &saveptr);
 			if (s == NULL) {
 				sprintf(errmsg, "missing argument to patrol command");
-				return -1;
+				goto error;
 			}
 			break; 
 		case 5: /* halt */
 			s = strtok_r(NULL, DEMON_CMD_DELIM, &saveptr);
 			if (s == NULL) {
 				sprintf(errmsg, "missing argument to halt command");
-				return -1;
+				goto error;
 			}
 			break; 
 		case 6: /* identify */
 			s = strtok_r(NULL, DEMON_CMD_DELIM, &saveptr);
 			if (s == NULL) {
 				sprintf(errmsg, "missing argument to identify command");
-				return -1;
+				goto error;
 			}
 			g = lookup_demon_group(s);
 			if (g < 0) {
 				l = lookup_demon_location(s);
 				if (l < 0) { 
 					sprintf(errmsg, "No such group or location '%s'\n", s);
-					return -1;
+					goto error;
 				}
 				demon_ui.selectedx = demon_location[l].x;
 				demon_ui.selectedz = demon_location[l].z;
@@ -10428,11 +11196,21 @@ static int construct_demon_command(char *input,
 		case 13:
 			send_enscript_packet_to_server(saveptr);
 			break;
+		case 14:
+			send_text_to_speech_packet_to_server(original + (saveptr - input));
+			break;
 		default: /* unknown */
 			sprintf(errmsg, "Unknown ver number %d\n", v);
-			return -1;
+			goto error;
 	}
+	if (original)
+		free(original);
 	return 0;
+
+error:
+	if (original)
+		free(original);
+	return -1;
 }
 
 static void clear_empty_demon_variables(void)
@@ -10475,6 +11253,7 @@ static void set_demon_button_colors()
 	const int selected = UI_COLOR(demon_selected_button);
 	const int deselected = UI_COLOR(demon_deselected_button);
 
+	snis_button_set_color(demon_ui.demon_home_button, deselected);
 	snis_button_set_color(demon_ui.demon_ship_button,
 		demon_ui.buttonmode == DEMON_BUTTON_SHIPMODE ? selected : deselected);
 	snis_button_set_color(demon_ui.demon_starbase_button,
@@ -10491,13 +11270,44 @@ static void set_demon_button_colors()
 		demon_ui.buttonmode == DEMON_BUTTON_CAPTAINMODE ? selected : deselected);
 }
 
+static void demon_button_create_item_3d(int button_mode)
+{
+	union vec3 pos = { { 1.0, 0.0, 0.0 } };
+	float distance = demon_ui.exaggerated_scale * XKNOWN_DIM * 0.005 +
+			(1.0 - demon_ui.exaggerated_scale) * XKNOWN_DIM * 0.0005;
+
+	quat_rot_vec_self(&pos, &demon_ui.camera_orientation);
+	vec3_mul_self(&pos, distance);
+	vec3_add_self(&pos, &demon_ui.camera_pos);
+	demon_ui.buttonmode = button_mode;
+	set_demon_button_colors();
+	demon_button_create_item((double) pos.v.x, (double) pos.v.y, (double) pos.v.z);
+}
+
 static void demon_modebutton_pressed(int whichmode)
 {
-	if (demon_ui.buttonmode == whichmode)
-		demon_ui.buttonmode = DEMON_BUTTON_NOMODE;
-	else
-		demon_ui.buttonmode = whichmode;
-	set_demon_button_colors();
+	if (demon_ui.use_3d) {
+		if (whichmode != DEMON_BUTTON_CAPTAINMODE)
+			demon_button_create_item_3d(whichmode);
+	} else {
+		if (demon_ui.buttonmode == whichmode)
+			demon_ui.buttonmode = DEMON_BUTTON_NOMODE;
+		else
+			demon_ui.buttonmode = whichmode;
+		set_demon_button_colors();
+	}
+}
+
+static void demon_home_button_pressed(void *x)
+{
+	if (demon_ui.use_3d) {
+		home_demon_camera();
+	} else {
+		demon_ui.ux1 = 0;
+		demon_ui.uy1 = 0;
+		demon_ui.ux2 = XKNOWN_DIM;
+		demon_ui.uy2 = ZKNOWN_DIM;
+	}
 }
 
 static void demon_ship_button_pressed(void *x)
@@ -10572,6 +11382,72 @@ static void demon_phaser_button_pressed(void *x)
 				go[demon_ui.captain_of].id));
 }
 
+static void demon_2d3d_button_pressed(void *x)
+{
+	demon_ui.use_3d = !demon_ui.use_3d;
+	if (demon_ui.use_3d) {
+		ui_unhide_widget(demon_ui.demon_move_button);
+		ui_unhide_widget(demon_ui.demon_scale_button);
+	} else {
+		ui_hide_widget(demon_ui.demon_move_button);
+		ui_hide_widget(demon_ui.demon_scale_button);
+	}
+}
+
+static void demon_move_button_pressed(void *x)
+{
+	double avgx, avgy, avgz, dx, dy, dz;
+	int i, count;
+
+	if (!demon_ui.use_3d)
+		return;
+
+	avgx = 0.0;
+	avgy = 0.0;
+	avgy = 0.0;
+
+	count = 0;
+
+	pthread_mutex_lock(&universe_mutex);
+	for (i = 0; i <= snis_object_pool_highest_object(pool); i++) {
+		struct snis_entity *o = &go[i];
+		if (!o->alive)
+			continue;
+		if (!demon_id_selected(o->id))
+			continue;
+		avgx += o->x;
+		avgy += o->y;
+		avgz += o->z;
+		count++;
+	}
+	pthread_mutex_unlock(&universe_mutex);
+
+	if (count == 0)
+		return;
+	avgx /= (double) count;
+	avgy /= (double) count;
+	avgz /= (double) count;
+	dx = demon_ui.camera_pos.v.x - avgx;
+	dy = demon_ui.camera_pos.v.y - avgy;
+	dz = demon_ui.camera_pos.v.z - avgz;
+	for (i = 0; i < demon_ui.nselected; i++) {
+		queue_to_server(packed_buffer_new("bwSSS",
+				OPCODE_DEMON_MOVE_OBJECT,
+				demon_ui.selected_id[i],
+				dx, (int32_t) UNIVERSE_DIM,
+				dy, (int32_t) UNIVERSE_DIM,
+				dz, (int32_t) UNIVERSE_DIM));
+	}
+}
+
+static void demon_scale_button_pressed(void *x)
+{
+	if (demon_ui.desired_exaggerated_scale > 0.0)
+		demon_ui.desired_exaggerated_scale = 0.0;
+	else
+		demon_ui.desired_exaggerated_scale = 1.0;
+}
+
 static void init_demon_ui()
 {
 	int x, y, dy, n;
@@ -10585,6 +11461,7 @@ static void init_demon_ui()
 	demon_ui.selectedz = -1.0;
 	demon_ui.selectmode = 0;
 	demon_ui.captain_of = -1;
+	demon_ui.use_3d = 0;
 	strcpy(demon_ui.error_msg, "");
 	memset(demon_ui.selected_id, 0, sizeof(demon_ui.selected_id));
 	demon_ui.demon_input = snis_text_input_box_init(txx(10), txy(520), txy(30), txx(550),
@@ -10599,6 +11476,9 @@ static void init_demon_ui()
 	y = txy(60);
 	dy = txy(25);
 	n = 0;
+	demon_ui.demon_home_button = snis_button_init(x, y + dy * n++, txx(70), txy(20),
+			"HOME", UI_COLOR(demon_deselected_button),
+			NANO_FONT, demon_home_button_pressed, NULL);
 	demon_ui.demon_ship_button = snis_button_init(x, y + dy * n++, txx(70), txy(20),
 			"SHIP", UI_COLOR(demon_deselected_button),
 			NANO_FONT, demon_ship_button_pressed, NULL);
@@ -10632,7 +11512,17 @@ static void init_demon_ui()
 	demon_ui.demon_phaser_button = snis_button_init(x, y + dy * n++, txx(70), txy(20),
 			"PHASER", UI_COLOR(demon_deselected_button),
 			NANO_FONT, demon_phaser_button_pressed, NULL);
+	demon_ui.demon_2d3d_button = snis_button_init(x, y + dy * n++, txx(70), txy(20),
+			"2D/3D", UI_COLOR(demon_deselected_button),
+			NANO_FONT, demon_2d3d_button_pressed, NULL);
+	demon_ui.demon_move_button = snis_button_init(x, y + dy * n++, txx(70), txy(20),
+			"MOVE", UI_COLOR(demon_deselected_button),
+			NANO_FONT, demon_move_button_pressed, NULL);
+	demon_ui.demon_scale_button = snis_button_init(x, y + dy * n++, txx(70), txy(20),
+			"EXAG SCALE", UI_COLOR(demon_deselected_button),
+			NANO_FONT, demon_scale_button_pressed, NULL);
 	ui_add_button(demon_ui.demon_exec_button, DISPLAYMODE_DEMON);
+	ui_add_button(demon_ui.demon_home_button, DISPLAYMODE_DEMON);
 	ui_add_button(demon_ui.demon_ship_button, DISPLAYMODE_DEMON);
 	ui_add_button(demon_ui.demon_starbase_button, DISPLAYMODE_DEMON);
 	ui_add_button(demon_ui.demon_planet_button, DISPLAYMODE_DEMON);
@@ -10644,7 +11534,17 @@ static void init_demon_ui()
 	ui_add_button(demon_ui.demon_captain_button, DISPLAYMODE_DEMON);
 	ui_add_button(demon_ui.demon_torpedo_button, DISPLAYMODE_DEMON);
 	ui_add_button(demon_ui.demon_phaser_button, DISPLAYMODE_DEMON);
+	ui_add_button(demon_ui.demon_2d3d_button, DISPLAYMODE_DEMON);
+	ui_add_button(demon_ui.demon_move_button, DISPLAYMODE_DEMON);
+	ui_add_button(demon_ui.demon_scale_button, DISPLAYMODE_DEMON);
+	ui_hide_widget(demon_ui.demon_move_button);
+	ui_hide_widget(demon_ui.demon_scale_button);
 	ui_add_text_input_box(demon_ui.demon_input, DISPLAYMODE_DEMON);
+	home_demon_camera();
+	demon_ui.camera_orientation = demon_ui.desired_camera_orientation;
+	demon_ui.camera_pos = demon_ui.desired_camera_pos;
+	demon_ui.exaggerated_scale = 1.0;
+	demon_ui.desired_exaggerated_scale = 1.0;
 }
 
 static void calculate_new_2d_zoom(int direction, gdouble x, gdouble y, double zoom_amount,
@@ -10675,6 +11575,19 @@ static void calculate_new_demon_zoom(int direction, gdouble x, gdouble y)
 {
 	calculate_new_2d_zoom(direction, x, y, 0.05,
 			&demon_ui.ux1, &demon_ui.uy1, &demon_ui.ux2, &demon_ui.uy2);
+}
+
+static void demon_3d_scroll(int direction, gdouble x, gdouble y)
+{
+	union vec3 delta = { { 0 } };
+	float scroll_factor;
+
+	scroll_factor = (demon_ui.exaggerated_scale * XKNOWN_DIM * 0.02) +
+			(1.0 - demon_ui.exaggerated_scale) * XKNOWN_DIM * 0.001;
+
+	delta.v.x = direction == GDK_SCROLL_UP ? scroll_factor : -scroll_factor;
+	quat_rot_vec_self(&delta, &demon_ui.camera_orientation);
+	vec3_add(&demon_ui.desired_camera_pos, &demon_ui.camera_pos, &delta);
 }
 
 static void show_demon_groups(GtkWidget *w)
@@ -10759,7 +11672,7 @@ static void draw_2d_small_cross(float x, float y, int color, int blink)
 	}
 }
 
-static void show_demon(GtkWidget *w)
+static void show_demon_2d(GtkWidget *w)
 {
 	int i;
 	char buffer[100];
@@ -10817,6 +11730,290 @@ static void show_demon(GtkWidget *w)
 	show_demon_groups(w);
 	demon_cmd_help(w);
 	show_common_screen(w, "DEMON");
+}
+
+static void show_demon_3d(GtkWidget *w)
+{
+	char buffer[100];
+	static struct mesh *axes = NULL;
+	int i, j, k;
+	float angle_of_view = 60.0 * M_PI / 180.0;
+	union vec3 camera_pos_delta;
+	int color;
+
+	if (!axes) {
+		axes = mesh_fabricate_axes();
+		mesh_scale(axes, 0.002 * XKNOWN_DIM);
+	}
+
+	if (go[my_ship_oid].alive > 0)
+		sng_set_foreground(UI_COLOR(demon_default));
+	else
+		sng_set_foreground(UI_COLOR(demon_default_dead));
+
+	/* Move camera towards desired position */
+	vec3_sub(&camera_pos_delta, &demon_ui.desired_camera_pos, &demon_ui.camera_pos);
+	vec3_mul_self(&camera_pos_delta, 0.05);
+	vec3_add_self(&demon_ui.camera_pos, &camera_pos_delta);
+
+	/* Move camera towards desired orientation */
+	quat_slerp(&demon_ui.camera_orientation,
+			&demon_ui.camera_orientation, &demon_ui.desired_camera_orientation, 0.05);
+
+	/* Move exaggerate scale factor towards desired value */
+	if (demon_ui.desired_exaggerated_scale != demon_ui.exaggerated_scale)
+		demon_ui.exaggerated_scale += (demon_ui.desired_exaggerated_scale - demon_ui.exaggerated_scale) * 0.1;
+
+	/* Setup 3d universe grid */
+	for (i = 0; i < 10; i++) {
+		float x = i * XKNOWN_DIM / 10.0;
+		for (j = 0; j < 10; j++) {
+			float y = (j * XKNOWN_DIM / 10.0) - XKNOWN_DIM / 2.0;
+			for (k = 0; k < 10; k++) {
+				float z = k * XKNOWN_DIM / 10.0;
+				(void) add_entity(instrumentecx, axes, x, y, z, UI_COLOR(demon_default));
+			}
+		}
+	}
+
+	set_renderer(instrumentecx, WIREFRAME_RENDERER);
+	camera_set_pos(instrumentecx, demon_ui.camera_pos.v.x, demon_ui.camera_pos.v.y, demon_ui.camera_pos.v.z);
+	camera_set_orientation(instrumentecx, &demon_ui.camera_orientation);
+	camera_set_parameters(instrumentecx, 10.0, XKNOWN_DIM * 2.0, SCREEN_WIDTH, SCREEN_HEIGHT, angle_of_view);
+	set_window_offset(instrumentecx, 0, 0);
+	calculate_camera_transform(instrumentecx);
+
+	pthread_mutex_lock(&universe_mutex);
+
+	for (i = 0; i <= snis_object_pool_highest_object(pool); i++) {
+		struct entity *e = NULL;
+		struct snis_entity *o = &go[i];
+		struct mesh *m = NULL;
+		float scale = XKNOWN_DIM / 10000.0;
+		int draw_label = 0;
+		char label[100];
+		float sx, sy;
+
+		if (!o->alive)
+			continue;
+		switch (o->type) {
+		case OBJTYPE_PLANET:
+			color = WHITE;
+			strcpy(label, o->sdata.name);
+			draw_label = 1;
+			break;
+		case OBJTYPE_SHIP1:
+			color = MAGENTA;
+			strcpy(label, o->sdata.name);
+			draw_label = 1;
+			break;
+		case OBJTYPE_SHIP2:
+			color = CYAN;
+			strcpy(label, o->sdata.name);
+			draw_label = 1;
+			break;
+		case OBJTYPE_ASTEROID:
+			color = ORANGE;
+			break;
+		case OBJTYPE_STARBASE:
+			scale = XKNOWN_DIM / 50000.0;
+			color = RED;
+			strcpy(label, o->sdata.name);
+			draw_label = 1;
+			break;
+		case OBJTYPE_CARGO_CONTAINER:
+			color = GREEN;
+			break;
+		case OBJTYPE_LASER:
+			color = ORANGERED;
+			break;
+		case OBJTYPE_TORPEDO:
+			color = ORANGERED;
+			break;
+		case OBJTYPE_WARPGATE:
+			color = YELLOW;
+			scale = XKNOWN_DIM / 100000.0;
+			break;
+		default:
+			color = MAGENTA;
+			break;
+		}
+		if (demon_id_selected(o->id)) {
+			if ((timer & 0x0f) < 0x03)
+				color = BLACK;
+			else
+				color = MAGENTA;
+		}
+
+		switch (o->type) {
+		case OBJTYPE_PLANET:
+			e = add_entity(instrumentecx, low_poly_sphere_mesh,  o->x, o->y, o->z, color);
+			if (e) {
+				update_entity_scale(e, o->tsd.planet.radius);
+				entity_set_user_data(e, o);
+			}
+			break;
+		case OBJTYPE_SHIP2:
+		case OBJTYPE_SHIP1:
+		case OBJTYPE_ASTEROID:
+		case OBJTYPE_STARBASE:
+		case OBJTYPE_CARGO_CONTAINER:
+		case OBJTYPE_LASER:
+		case OBJTYPE_WARPGATE:
+		case OBJTYPE_TORPEDO:
+			if (!o->entity)
+				break;
+			if (o->type != OBJTYPE_SHIP1)
+				m = entity_get_mesh(o->entity);
+			if (!m) {
+				if (o->type == OBJTYPE_SHIP1)
+					m = ship_mesh_map[o->tsd.ship.shiptype];
+				else
+					break;
+			}
+			if (m == torpedo_mesh)
+				m = torpedo_nav_mesh;
+			e = add_entity(instrumentecx, m, o->x, o->y, o->z, color);
+			if (!e)
+				break;
+			entity_set_user_data(e, o);
+			update_entity_scale(e, demon_ui.exaggerated_scale * scale +
+					(1.0 - demon_ui.exaggerated_scale) * entity_get_scale(o->entity));
+			update_entity_orientation(e, &o->orientation);
+			if (draw_label) {
+				union vec3 opos = { { o->x, o->y, o->z } };
+				union vec3 dist;
+				vec3_sub(&dist, &opos, &demon_ui.camera_pos);
+				if (o->type == OBJTYPE_PLANET || o->type == OBJTYPE_STARBASE ||
+					vec3_magnitude(&dist) < XKNOWN_DIM / 10.0) {
+					transform_point(instrumentecx, o->x, o->y, o->z, &sx, &sy);
+					sng_abs_xy_draw_string(label, NANO_FONT, sx + 10, sy - 10);
+				}
+			}
+		default:
+			break;
+		}
+	}
+
+	/* Check if user is navigating to something on the screen */
+	if (demon_ui.button3_released) {
+		int found = 0;
+
+		demon_ui.button3_released = 0;
+		for (i = 0; i <= get_entity_count(instrumentecx); i++) {
+			const double threshold = real_screen_width * 0.005;
+			float sx, sy;
+			union vec3 epos, dpos, backoff;
+			struct entity *e;
+			struct mesh *m;
+
+			e = get_entity(instrumentecx, i);
+			if (!entity_onscreen(e))
+				continue;
+			entity_get_screen_coords(e, &sx, &sy);
+			if (fabsf(sx - demon_ui.release_mousex) < threshold &&
+			    fabsf(sy - demon_ui.release_mousey) < threshold) {
+				entity_get_pos(e, &epos.v.x, &epos.v.y, &epos.v.z);
+				m = entity_get_mesh(e);
+				if (m) {
+					union vec3 right = { { 1.0, 0.0, 0.0, }, };
+					union vec3 up = { { 0.0, 0.0, 1.0 } };
+					float factor = (demon_ui.exaggerated_scale * XKNOWN_DIM / 100.0) +
+						(1.0 - demon_ui.exaggerated_scale) * XKNOWN_DIM / 2000.0;
+
+					vec3_sub(&dpos, &epos, &demon_ui.camera_pos);
+					vec3_normalize(&backoff, &dpos);
+					vec3_mul_self(&backoff, factor);
+					vec3_add_self(&dpos, &backoff);
+					vec3_add(&demon_ui.desired_camera_pos, &demon_ui.camera_pos, &dpos);
+					vec3_normalize_self(&dpos);
+					quat_rot_vec_self(&up, &demon_ui.camera_orientation);
+					quat_from_u2v(&demon_ui.desired_camera_orientation, &right, &dpos, &up);
+					found = 1;
+					break;
+				}
+			}
+		}
+		if (!found) {
+			union vec3 turn;
+			union vec3 right = { { 1.0, 0.0, 0.0 } };
+			union quat rotation, local_rotation;
+
+			turn.v.z = demon_ui.release_mousex - real_screen_width / 2.0;
+			turn.v.y = -demon_ui.release_mousey + real_screen_height / 2.0;
+			turn.v.x = real_screen_width / 2.0;
+
+			quat_from_u2v(&rotation, &right, &turn, NULL);
+			quat_conjugate(&local_rotation, &rotation, &demon_ui.camera_orientation);
+			/* Apply to local orientation */
+			quat_mul(&demon_ui.desired_camera_orientation, &local_rotation, &demon_ui.camera_orientation);
+			quat_normalize_self(&demon_ui.desired_camera_orientation);
+		}
+	}
+
+	/* Check if the user is trying to select something */
+	if (demon_ui.button2_released) {
+		struct snis_entity *o;
+
+		demon_ui.button2_released = 0;
+		for (i = 0; i <= get_entity_count(instrumentecx); i++) {
+			const double threshold = real_screen_width * 0.005;
+			float sx, sy;
+			struct entity *e;
+
+			e = get_entity(instrumentecx, i);
+			if (!entity_onscreen(e))
+				continue;
+			entity_get_screen_coords(e, &sx, &sy);
+			if (fabsf(sx - demon_ui.release_mousex) < threshold &&
+			    fabsf(sy - demon_ui.release_mousey) < threshold) {
+				o = entity_get_user_data(e);
+				if (!o) /* e.g. axes have no associated object */
+					continue;
+				if (demon_id_selected(o->id))
+					demon_deselect(o->id);
+				else
+					demon_select(o->id);
+				break;
+			}
+		}
+	}
+	pthread_mutex_unlock(&universe_mutex);
+	render_entities(instrumentecx);
+	pthread_mutex_lock(&universe_mutex);
+	pthread_mutex_unlock(&universe_mutex);
+
+
+	sng_set_foreground(UI_COLOR(demon_default));
+	if (netstats.elapsed_seconds == 0)
+		sprintf(buffer, "Waiting for data");
+	else
+		sprintf(buffer,
+			"TX:%llu RX:%llu T=%lu SECS. BW=%llu B/S SHIPS:%u OBJS:%u %u/%u/%u/%u/%u",
+			(unsigned long long) netstats.bytes_sent,
+			(unsigned long long) netstats.bytes_recd,
+			(unsigned long) netstats.elapsed_seconds,
+			(unsigned long long) (netstats.bytes_recd + netstats.bytes_sent) / netstats.elapsed_seconds,
+			netstats.nships, netstats.nobjects,
+			netstats.faction_population[0],
+			netstats.faction_population[1],
+			netstats.faction_population[2],
+			netstats.faction_population[3],
+			netstats.faction_population[4]);
+	sng_abs_xy_draw_string(buffer, NANO_FONT, 10, SCREEN_HEIGHT - 10);
+
+	show_demon_groups(w);
+	demon_cmd_help(w);
+	show_common_screen(w, "DEMON");
+	remove_all_entity(instrumentecx);
+}
+
+static void show_demon(GtkWidget *w)
+{
+	if (demon_ui.use_3d)
+		show_demon_3d(w);
+	else
+		show_demon_2d(w);
 }
 
 struct warp_star {
@@ -10877,38 +12074,6 @@ static void show_warp_limbo_screen(GtkWidget *w)
 		}
 	}
 }
-
-struct network_setup_ui {
-	struct button *start_lobbyserver;
-	struct button *start_gameserver;
-	struct button *connect_to_lobby;
-	struct snis_text_input_box *lobbyservername;
-	struct snis_text_input_box *gameservername;
-	struct snis_text_input_box *shipname_box;
-	struct snis_text_input_box *password_box;
-	struct button *role_main;
-	struct button *role_nav;
-	struct button *role_weap;
-	struct button *role_eng;
-	struct button *role_damcon;
-	struct button *role_sci;
-	struct button *role_comms;
-	struct button *role_sound;
-	struct button *role_demon;
-	int role_main_v;
-	int role_nav_v;
-	int role_weap_v;
-	int role_eng_v;
-	int role_damcon_v;
-	int role_sci_v;
-	int role_comms_v;
-	int role_sound_v;
-	int role_demon_v;
-	char lobbyname[60];
-	char servername[60];
-	char shipname[22];
-	char password[10];
-} net_setup_ui;
 
 static void lobby_hostname_entered()
 {
@@ -11052,14 +12217,17 @@ static void start_gameserver_button_pressed()
 
 static void connect_to_lobby_button_pressed()
 {
-	printf("connect to lobby pressed\n");
+	printf("snis_client: connect to lobby pressed\n");
 	/* These must be set to connect to the lobby... */
+	printf("lobbyname = '%s'\n", net_setup_ui.lobbyname);
+	printf("shipname = '%s'\n", net_setup_ui.shipname);
+	printf("password = '%s'\n", net_setup_ui.password);
 	if (strcmp(net_setup_ui.lobbyname, "") == 0 ||
 		strcmp(net_setup_ui.shipname, "") == 0 ||
 		strcmp(net_setup_ui.password, "") == 0)
 		return;
 
-	printf("connecting to lobby...\n");
+	printf("snis_client: connecting to lobby...\n");
 	displaymode = DISPLAYMODE_LOBBYSCREEN;
 	lobbyhost = net_setup_ui.lobbyname;
 	shipname = net_setup_ui.shipname;
@@ -11074,19 +12242,27 @@ static void connect_to_lobby_button_pressed()
 	role |= (ROLE_COMMS * !!net_setup_ui.role_comms_v);
 	role |= (ROLE_SOUNDSERVER * !!net_setup_ui.role_sound_v);
 	role |= (ROLE_DEMON * !!net_setup_ui.role_demon_v);
+	role |= (ROLE_TEXT_TO_SPEECH * !!net_setup_ui.role_text_to_speech_v);
 	if (role == 0)
 		role = ROLE_ALL;
+	login_failed_timer = 0; /* turn off any old login failed messages */
 	connect_to_lobby();
+}
+
+static struct button *init_net_checkbox_button(int x, int *y, char *txt, int *value,
+			button_function bf, void *cookie)
+{
+	struct button *b;
+	b = snis_button_init(x, *y, txx(140), txy(18), txt, UI_COLOR(network_setup_role),
+			NANO_FONT, bf, cookie);
+	snis_button_checkbox(b, value);
+	*y = *y + txy(18);
+	return b;
 }
 
 static struct button *init_net_role_button(int x, int *y, char *txt, int *value)
 {
-	struct button *b;
-	b = snis_button_init(x, *y, 225, 23, txt, UI_COLOR(network_setup_role),
-			NANO_FONT, NULL, NULL);
-	snis_button_checkbox(b, value);
-	*y = *y + txy(23);
-	return b;
+	return init_net_checkbox_button(x, y, txt, value, NULL, NULL);
 }
 
 static void ui_add_button(struct button *b, int active_displaymode);
@@ -11107,6 +12283,7 @@ static void init_net_role_buttons(struct network_setup_ui *nsu)
 	nsu->role_sound_v = 1;
 	nsu->role_damcon_v = 1;
 	nsu->role_demon_v = 1;
+	nsu->role_text_to_speech_v = 1;
 	nsu->role_main = init_net_role_button(x, &y, "MAIN SCREEN ROLE", &nsu->role_main_v);
 	nsu->role_nav = init_net_role_button(x, &y, "NAVIGATION ROLE", &nsu->role_nav_v);
 	nsu->role_weap = init_net_role_button(x, &y, "WEAPONS ROLE", &nsu->role_weap_v);
@@ -11117,6 +12294,8 @@ static void init_net_role_buttons(struct network_setup_ui *nsu)
 	nsu->role_sound = init_net_role_button(x, &y, "SOUND SERVER ROLE", &nsu->role_sound_v);
 	nsu->role_demon = init_net_role_button(x, &y, "DEMON MODE",
 							&nsu->role_demon_v);
+	nsu->role_text_to_speech = init_net_role_button(x, &y, "TEXT TO SPEECH",
+							&nsu->role_text_to_speech_v);
 	ui_add_button(nsu->role_main, DISPLAYMODE_NETWORK_SETUP);
 	ui_add_button(nsu->role_nav, DISPLAYMODE_NETWORK_SETUP);
 	ui_add_button(nsu->role_weap, DISPLAYMODE_NETWORK_SETUP);
@@ -11126,6 +12305,36 @@ static void init_net_role_buttons(struct network_setup_ui *nsu)
 	ui_add_button(nsu->role_comms, DISPLAYMODE_NETWORK_SETUP);
 	ui_add_button(nsu->role_sound, DISPLAYMODE_NETWORK_SETUP);
 	ui_add_button(nsu->role_demon, DISPLAYMODE_NETWORK_SETUP);
+	ui_add_button(nsu->role_text_to_speech, DISPLAYMODE_NETWORK_SETUP);
+}
+
+static void create_ship_checkbox_cb(__attribute__((unused)) void *cookie)
+{
+	/* If create-ship selected, make sure join-ship is turned off. */
+	struct network_setup_ui *nsu = cookie;
+	nsu->join_ship_v = 0;
+}
+
+static void join_ship_checkbox_cb(__attribute__((unused)) void *cookie)
+{
+	/* If join-ship selected, make sure create-ship is turned off. */
+	struct network_setup_ui *nsu = cookie;
+	nsu->create_ship_v = 0;
+}
+
+static void init_join_create_buttons(struct network_setup_ui *nsu)
+{
+	nsu->create_ship_v = 1;
+	nsu->join_ship_v = 0;
+	int x = txx(350);
+	int y = txy(400);
+	nsu->create_ship_checkbox = init_net_checkbox_button(x, &y,
+						"CREATE SHIP", &nsu->create_ship_v,
+						create_ship_checkbox_cb, nsu);
+	nsu->join_ship_checkbox = init_net_checkbox_button(x, &y, "JOIN SHIP", &nsu->join_ship_v,
+						join_ship_checkbox_cb, nsu);
+	ui_add_button(nsu->create_ship_checkbox, DISPLAYMODE_NETWORK_SETUP);
+	ui_add_button(nsu->join_ship_checkbox, DISPLAYMODE_NETWORK_SETUP);
 }
 
 static void ui_add_text_input_box(struct snis_text_input_box *t, int active_displaymode);
@@ -11162,12 +12371,12 @@ static void init_net_setup_ui(void)
 			TINY_FONT, start_gameserver_button_pressed, NULL);
 	y += yinc * 2;
 	net_setup_ui.shipname_box =
-		snis_text_input_box_init(150, y, txy(30), txx(250), input_color, TINY_FONT,
+		snis_text_input_box_init(txx(150), y, txy(30), txx(250), input_color, TINY_FONT,
 					net_setup_ui.shipname, 50, &timer,
 					shipname_entered, NULL);
 	y += yinc;
 	net_setup_ui.password_box =
-		snis_text_input_box_init(150, y, txy(30), txx(250), input_color, TINY_FONT,
+		snis_text_input_box_init(txx(150), y, txy(30), txx(250), input_color, TINY_FONT,
 					net_setup_ui.password, 50, &timer,
 					password_entered, NULL);
 	y += yinc;
@@ -11175,6 +12384,7 @@ static void init_net_setup_ui(void)
 		snis_button_init(left, y, -1, -1, "CONNECT TO LOBBY", inactive_button_color,
 			TINY_FONT, connect_to_lobby_button_pressed, NULL);
 	init_net_role_buttons(&net_setup_ui);
+	init_join_create_buttons(&net_setup_ui);
 	ui_add_button(net_setup_ui.start_lobbyserver, DISPLAYMODE_NETWORK_SETUP);
 	ui_add_button(net_setup_ui.start_gameserver, DISPLAYMODE_NETWORK_SETUP);
 	ui_add_button(net_setup_ui.connect_to_lobby, DISPLAYMODE_NETWORK_SETUP);
@@ -11192,7 +12402,7 @@ static void show_network_setup(GtkWidget *w)
 	sng_set_foreground(UI_COLOR(network_setup_logo));
 	sng_draw_vect_obj(&snis_logo, txx(100), txy(500));
 	sng_set_foreground(UI_COLOR(network_setup_text));
-	sng_abs_xy_draw_string("NETWORK SETUP", SMALL_FONT, txx(25), txy(10) + LINEHEIGHT * 2);
+	sng_abs_xy_draw_string("NETWORK SETUP", SMALL_FONT, txx(25), txy(10 + LINEHEIGHT * 2));
 	sng_abs_xy_draw_string("LOBBY SERVER NAME OR IP ADDRESS", TINY_FONT, txx(25), txy(130));
 	sng_abs_xy_draw_string("GAME SERVER NICKNAME", TINY_FONT, txx(25), txy(280));
 	sng_abs_xy_draw_string("SHIP NAME", TINY_FONT, txx(20), txy(470));
@@ -11252,7 +12462,10 @@ static int main_da_scroll(GtkWidget *w, GdkEvent *event, gpointer p)
 		do_adjust_byte_value((uint8_t) newval, OPCODE_REQUEST_SCIZOOM);
 		return 0;
 	case DISPLAYMODE_DEMON:
-		calculate_new_demon_zoom(e->direction, e->x, e->y);
+		if (demon_ui.use_3d)
+			demon_3d_scroll(e->direction, e->x, e->y);
+		else
+			calculate_new_demon_zoom(e->direction, e->x, e->y);
 		return 0;
 	case DISPLAYMODE_NAVIGATION:
 		if (e->direction == GDK_SCROLL_UP)
@@ -11290,6 +12503,8 @@ static char *help_text[] = {
 	"  * 1 KEY TOGGLES CAMERA VIEW MODES\n"
 	"  * CTRL-I INVERTS VERTICAL KEYBOARD CONTROLS\n"
 	"  * 'f' TOGGLES SPACE DUST EFFECT\n"
+	"  * CTRL-C TOGGLES CREDITS SCREEN\n"
+
 	"\nPRESS ESC TO EXIT HELP\n",
 
 	/* Navigation help text */
@@ -11362,6 +12577,7 @@ static char *help_text[] = {
 	"  * COMMANDS ARE PRECEDED BY FORWARD SLASH ->  /\n"
 	"  * /help\n"
 	"  * /channel channel-number - change current channel\n"
+	"  * /computer <english request for computer>\n"
 	"  * /hail ship-name - hail ship on current channel\n"
 	"\nPRESS ESC TO EXIT HELP\n",
 
@@ -11502,10 +12718,10 @@ static int main_da_expose(GtkWidget *w, GdkEvent *event, gpointer p)
 
 	make_science_forget_stuff();
 
+	load_textures();
+
 	if (displaymode == DISPLAYMODE_GLMAIN)	
 		return 0;
-
-	load_textures();
 
 #ifndef WITHOUTOPENGL
 	GdkGLContext *gl_context = gtk_widget_get_gl_context(main_da);
@@ -11681,10 +12897,14 @@ void really_quit(void);
 
 gint advance_game(gpointer data)
 {
+	int time_to_switch_servers;
+
 	timer++;
 
-	if (red_alert_mode && (role & ROLE_SOUNDSERVER) && (timer % 45) == 0)
-		wwviaudio_add_sound(RED_ALERT_SOUND);
+	if (red_alert_mode && (role & ROLE_SOUNDSERVER)) {
+		if ((timer % 45) == 0 && (timer % (45 * 6)) < (45 * 3))
+			wwviaudio_add_sound(RED_ALERT_SOUND);
+	}
 
 	deal_with_joystick();
 	deal_with_keyboard();
@@ -11712,6 +12932,20 @@ gint advance_game(gpointer data)
 	gdk_window_invalidate_rect(gtk_widget_get_root_window(main_da), &alloc, FALSE);
 
 	gdk_threads_leave();
+
+	/* Check if it's time to switch servers */
+	pthread_mutex_lock(&to_server_queue_event_mutex);
+	time_to_switch_servers = (switched_server != -1);
+	if (time_to_switch_servers) {
+		fprintf(stderr, "snis_client: switch server hack\n");
+		/* this is a hack */
+		switched_server2 = switched_server;
+		switched_server = -1;
+		connect_to_lobby();
+		displaymode = DISPLAYMODE_LOBBYSCREEN;
+	}
+	pthread_mutex_unlock(&to_server_queue_event_mutex);
+
 	return TRUE;
 }
 
@@ -11762,6 +12996,18 @@ static unsigned int load_cubemap_textures(int is_inside, char *filenameprefix)
 					filename[5], filename[0], filename[2]);
 }
 
+static void expire_cubemap_texture(int is_inside, char *filenameprefix)
+{
+	int i;
+	char filename[6][PATH_MAX + 1];
+
+	for (i = 0; i < 6; i++)
+		sprintf(filename[i], "%s/%s%d.png", asset_dir, filenameprefix, i);
+
+	graph_dev_expire_cubemap_texture(is_inside, filename[1], filename[3], filename[4],
+					filename[5], filename[0], filename[2]);
+}
+
 static void load_skybox_textures(char *filenameprefix)
 {
 	/*
@@ -11798,6 +13044,17 @@ static void load_skybox_textures(char *filenameprefix)
 		sprintf(filename[i], "%s/%s%d.png", asset_dir, filenameprefix, i);
 
 	graph_dev_load_skybox_texture(filename[3], filename[1], filename[4],
+					filename[5], filename[0], filename[2]);
+}
+
+static void expire_skybox_texture(char *filenameprefix)
+{
+	int i;
+	char filename[6][PATH_MAX + 1];
+
+	for (i = 0; i < 6; i++)
+		sprintf(filename[i], "%s/%s%d.png", asset_dir, filenameprefix, i);
+	graph_dev_expire_cubemap_texture(1, filename[3], filename[1], filename[4],
 					filename[5], filename[0], filename[2]);
 }
 
@@ -11876,22 +13133,27 @@ static gint main_da_configure(GtkWidget *w, GdkEventConfigure *event)
 	return TRUE;
 }
 
-static int read_solarsystem_config(const char *solarsystem_name)
+static int read_solarsystem_config(const char *solarsystem_name,
+	struct solarsystem_asset_spec **assets)
 {
 	char path[PATH_MAX];
 
 	printf("Reading solarsystem specifications...");
 	fflush(stdout);
 	sprintf(path, "%s/solarsystems/%s/assets.txt", asset_dir, solarsystem_name);
-	if (solarsystem_assets)
-		solarsystem_asset_spec_free(solarsystem_assets);
-	solarsystem_assets = solarsystem_asset_spec_read(path);
-	if (!solarsystem_assets)
+	if (*assets)
+		solarsystem_asset_spec_free(*assets);
+	*assets = solarsystem_asset_spec_read(path);
+	if (!*assets)
 		return -1;
+#if 0
+	if (planet_material)
+		free(planet_material);
 	planet_material = malloc(sizeof(planet_material[0]) *
-				solarsystem_assets->nplanet_textures * (NPLANETARY_RING_MATERIALS + 1));
+				(*assets)->nplanet_textures * (NPLANETARY_RING_MATERIALS + 1));
 	memset(planet_material, 0, sizeof(planet_material[0]) *
-		solarsystem_assets->nplanet_textures * (NPLANETARY_RING_MATERIALS + 1));
+		(*assets)->nplanet_textures * (NPLANETARY_RING_MATERIALS + 1));
+#endif
 	printf("done\n");
 	fflush(stdout);
 	return 0;
@@ -11904,10 +13166,10 @@ static struct mesh **allocate_starbase_mesh_ptrs(int nstarbase_meshes)
 	return m;
 }
 
-static void load_static_textures(void)
+static int load_static_textures(void)
 {
 	if (static_textures_loaded)
-		return;
+		return 0;
 
 	material_init_textured_particle(&green_phaser_material);
 	green_phaser_material.textured_particle.texture_id = load_texture("textures/green-burst.png");
@@ -12010,15 +13272,21 @@ static void load_static_textures(void)
 	warp_tunnel_material.texture_mapped_unlit.alpha = 0.25;
 
 	static_textures_loaded = 1;
+	return 1;
 }
 
-static void load_per_solarsystem_textures()
+static int load_per_solarsystem_textures()
 {
-	int i;
+	int i, j;
 	char path[PATH_MAX];
 
 	if (per_solarsystem_textures_loaded)
-		return;
+		return 0;
+	if (strcmp(old_solarsystem_name, "") == 0)
+		strcpy(old_solarsystem_name, DEFAULT_SOLAR_SYSTEM);
+	reload_per_solarsystem_textures(old_solarsystem_name, solarsystem_name,
+					old_solarsystem_assets, solarsystem_assets);
+	fprintf(stderr, "load_per_solarsystem_textures, loading\n");
 	sprintf(path, "solarsystems/%s/%s", solarsystem_name, solarsystem_assets->skybox_prefix);
 	load_skybox_textures(path);
 
@@ -12032,28 +13300,88 @@ static void load_per_solarsystem_textures()
 		sprintf(path, "solarsystems/%s/%s", solarsystem_name, solarsystem_assets->planet_texture[i]);
 		material_init_textured_planet(&planet_material[i]);
 		planet_material[i].textured_planet.texture_id = load_cubemap_textures(0, path);
-		planet_material[i].textured_planet.ring_material = 0;
+		if (i < NPLANET_MATERIALS / 2)
+			planet_material[i].textured_planet.ring_material =
+					&planetary_ring_material[i % NPLANETARY_RING_MATERIALS];
+		else
+			planet_material[i].textured_planet.ring_material = NULL;
 		if (strcmp(solarsystem_assets->planet_normalmap[i], "no-normal-map") == 0) {
 			planet_material[i].textured_planet.normalmap_id = -1;
 		} else {
 			sprintf(path, "solarsystems/%s/%s", solarsystem_name, solarsystem_assets->planet_normalmap[i]);
 			planet_material[i].textured_planet.normalmap_id = load_cubemap_textures(0, path);
 		}
-
+#if 0
 		int k;
 		for (k = 0; k < NPLANETARY_RING_MATERIALS; k++) {
 			int pm_index = (k + 1) * solarsystem_assets->nplanet_textures + i;
 			planet_material[pm_index] = planet_material[i];
 			planet_material[pm_index].textured_planet.ring_material = &planetary_ring_material[k];
 		}
+#endif
 	}
+	j = 0;
+	for (i = solarsystem_assets->nplanet_textures; i < NPLANET_MATERIALS; i++) {
+		planet_material[i] = planet_material[j];
+		if (i < NPLANET_MATERIALS / 2)
+			planet_material[i].textured_planet.ring_material =
+					&planetary_ring_material[i % NPLANETARY_RING_MATERIALS];
+		else
+			planet_material[i].textured_planet.ring_material = NULL;
+		j = (j + 1) % solarsystem_assets->nplanet_textures;
+	}
+#if 0
+	fprintf(stderr, "XXXXXXX ----------- planetary_ring_texture id before = %d\n", planetary_ring_texture_id);
+	planetary_ring_texture_id = load_texture("textures/planetary-ring0.png");
+	fprintf(stderr, "XXXXXXX ----------- planetary_ring_texture id after = %d\n", planetary_ring_texture_id);
+#endif
 	per_solarsystem_textures_loaded = 1;
+	return 1;
+}
+
+static void expire_per_solarsystem_textures(char *old_solarsystem, struct solarsystem_asset_spec *assets)
+{
+	int i;
+	char path[PATH_MAX];
+
+	fprintf(stderr, "xxxxxxx asset_dir='%s', old_solarsystem='%s'\n", asset_dir, old_solarsystem);
+	sprintf(path, "solarsystems/%s/%s", old_solarsystem, assets->skybox_prefix);
+	expire_skybox_texture(path);
+
+	sprintf(path, "%s/solarsystems/%s/%s", asset_dir, old_solarsystem, assets->sun_texture);
+	graph_dev_expire_texture(path);
+
+	for (i = 0; i < assets->nplanet_textures; i++) {
+		sprintf(path, "solarsystems/%s/%s", old_solarsystem, assets->planet_texture[i]);
+		expire_cubemap_texture(0, path);
+		if (strcmp(assets->planet_normalmap[i], "no-normal-map") != 0) {
+			sprintf(path, "solarsystems/%s/%s", old_solarsystem, assets->planet_normalmap[i]);
+			expire_cubemap_texture(0, path);
+		}
+	}
+}
+
+static void reload_per_solarsystem_textures(char *old_solarsystem, char *new_solarsystem,
+						struct solarsystem_asset_spec *old_assets,
+						struct solarsystem_asset_spec *new_assets)
+{
+	fprintf(stderr, "Re-loading per solarsystem textures\n");
+	if (old_assets) {
+		expire_per_solarsystem_textures(old_solarsystem, old_assets);
+		solarsystem_asset_spec_free(old_assets);
+	}
+	solarsystem_assets = new_assets;
+	per_solarsystem_textures_loaded = 0;
+	// load_per_solarsystem_textures();
 }
 
 static void load_textures(void)
 {
-	load_static_textures();
-	load_per_solarsystem_textures();
+	int loaded_something;
+	loaded_something = load_static_textures();
+	loaded_something += load_per_solarsystem_textures();
+	if (loaded_something)
+		glFinish();
 }
 
 static int main_da_button_press(GtkWidget *w, GdkEventButton *event,
@@ -12061,7 +13389,9 @@ static int main_da_button_press(GtkWidget *w, GdkEventButton *event,
 {
 	switch (displaymode) {
 		case DISPLAYMODE_DEMON:
-			demon_button_press(event->button, event->x, event->y);
+			demon_button_press(event->button,
+					SCREEN_WIDTH * event->x / real_screen_width,
+					SCREEN_HEIGHT * event->y / real_screen_height);
 			break;
 		default:
 			break;
@@ -12114,6 +13444,9 @@ static int main_da_button_release(GtkWidget *w, GdkEventButton *event,
 			do_torpedo();
 			load_torpedo_button_pressed();
 		}
+		break;
+	case DISPLAYMODE_DAMCON:
+		do_damcon_button_release(event->button, event->x, event->y);
 		break;
 	default:
 		break;
@@ -12529,6 +13862,9 @@ static void process_physical_device_io(unsigned short opcode, unsigned short val
 	case DEVIO_OPCODE_NAV_DOCKING_MAGNETS:
 		docking_magnets_button_pressed((void *) 0);
 		break;
+	case DEVIO_OPCODE_NAV_STANDARD_ORBIT:
+		standard_orbit_button_pressed((void *) 0);
+		break;
 	case DEVIO_OPCODE_NAV_THROTTLE:
 		snis_slider_poke_input(nav_ui.throttle_slider, d, 1);
 		break;
@@ -12712,8 +14048,53 @@ static void setup_physical_io_socket(void)
 			close(physical_io_socket);
 			physical_io_socket = -1;
 		}
+		pthread_setname_np(physical_io_thread, "snisc-devio");
 	}
 #endif
+}
+
+#define SNIS_NL_FIFO "/tmp/snis-natural-language-fifo"
+static void *monitor_natural_language_fifo(__attribute__((unused)) void *arg)
+{
+	pthread_setname_np(natural_language_thread, "snis-nat-lang");
+	char *rc, line[256];
+	FILE *f;
+
+	do {
+		f = fopen(SNIS_NL_FIFO, "r");
+		if (!f) {
+			fprintf(stderr, "snis_client: Failed to open '%s': %s\n", SNIS_NL_FIFO, strerror(errno));
+			break;
+		}
+
+		do {
+			rc = fgets(line, 255, f);
+			if (!rc)
+				break;
+			trim_whitespace(line);
+			clean_spaces(line);
+			if (strcmp(line, "") == 0) /* skip blank lines */
+				continue;
+			send_natural_language_request_to_server(line);
+		} while (1);
+		fclose(f);
+	} while (1);
+	fprintf(stderr, "snis_client: natural language thread exiting.\n");
+	return NULL;
+}
+
+static void setup_natural_language_fifo(void)
+{
+	int rc;
+
+	rc = mkfifo(SNIS_NL_FIFO, 0644);
+	if (rc != 0 && errno != EEXIST) {
+		fprintf(stderr, "snis_client: mkfifo(%s): %s\n", SNIS_NL_FIFO, strerror(errno));
+	}
+	rc = pthread_create(&natural_language_thread, &natural_language_thread_attr,
+			monitor_natural_language_fifo, NULL);
+	if (rc)
+		fprintf(stderr, "Failed to create natural language fifo monitor thread.\n");
 }
 
 static void setup_joystick(GtkWidget *window)
@@ -12825,6 +14206,7 @@ static void init_meshes()
 	}
 
 	sphere_mesh = mesh_unit_spherified_cube(16);
+	low_poly_sphere_mesh = mesh_unit_spherified_cube(5);
 	warp_tunnel_mesh = mesh_tube(XKNOWN_DIM, 450.0, 20);
 	planetary_ring_mesh = mesh_fabricate_planetary_ring(MIN_RING_RADIUS, MAX_RING_RADIUS);
 
@@ -12898,6 +14280,7 @@ static void init_meshes()
 	nebula_mesh = mesh_fabricate_billboard(0, 0, 2, 2);
 	sun_mesh = mesh_fabricate_billboard(0, 0, 30000, 30000);
 	thrust_animation_mesh = init_thrust_mesh(10, 7, 3, 1);
+	warpgate_mesh = snis_read_model(d, "warpgate.stl");
 
 	mtwist_free(mt);
 }
@@ -13305,7 +14688,7 @@ int main(int argc, char *argv[])
 	read_keymap_config_file();
 	init_vects();
 	initialize_random_orientations_and_spins(COMMON_MTWIST_SEED);
-	if (read_solarsystem_config(solarsystem_name)) {
+	if (read_solarsystem_config(solarsystem_name, &solarsystem_assets)) {
 		fprintf(stderr, "Failed reading solarsystem metadata\n");
 		exit(1);
 	}
@@ -13417,6 +14800,7 @@ int main(int argc, char *argv[])
 	init_net_setup_ui();
 	setup_joystick(window);
 	setup_physical_io_socket();
+	setup_natural_language_fifo();
 	ecx = entity_context_new(5000, 1000);
 
 	snis_protocol_debugging(1);

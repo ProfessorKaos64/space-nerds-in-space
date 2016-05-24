@@ -151,12 +151,23 @@ float quat_len(const union quat *q)
 	return sqrtf(s);
 }
 
-void quat_conj(union quat *q_out, const union quat *q_in)
+void quat_inverse(union quat *q_out, const union quat *q_in)
 {
 	q_out->v.x = -q_in->v.x;
 	q_out->v.y = -q_in->v.y;
 	q_out->v.z = -q_in->v.z;
 	q_out->v.w = q_in->v.w;
+}
+
+union quat *quat_conjugate(union quat *qo, union quat *rotation, union quat *new_coord_system)
+{
+	union quat temp, inverse;
+
+	/* Convert rotation to new coordinate system */
+	quat_mul(&temp, new_coord_system, rotation);
+	quat_inverse(&inverse, new_coord_system);
+	quat_mul(qo, &temp, &inverse);
+	return qo;
 }
 
 union vec3* heading_mark_to_vec3(float r, double heading, double mark, union vec3 *dir)
@@ -716,7 +727,7 @@ union vec3* vec3_lerp(union vec3* vo, const union vec3* vfrom, const union vec3*
 union quat *quat_apply_relative_yaw_pitch_roll(union quat *q,
 					double yaw, double pitch, double roll)
 {
-	union quat qyaw, qpitch, qroll, qrot, q1, q2, q3, q4;
+	union quat qyaw, qpitch, qroll, qrot, tempq, local_rotation, rotated_q;
 
 	/* calculate amount of yaw to impart this iteration... */
 	quat_init_axis(&qyaw, 0.0, 1.0, 0.0, yaw);
@@ -725,17 +736,15 @@ union quat *quat_apply_relative_yaw_pitch_roll(union quat *q,
 	/* Calculate amount of roll to impart this iteration... */
 	quat_init_axis(&qroll, 1.0, 0.0, 0.0, roll);
 	/* Combine pitch, roll and yaw */
-	quat_mul(&q1, &qyaw, &qpitch);
-	quat_mul(&qrot, &q1, &qroll);
+	quat_mul(&tempq, &qyaw, &qpitch);
+	quat_mul(&qrot, &tempq, &qroll);
 
 	/* Convert rotation to local coordinate system */
-	quat_mul(&q1, q, &qrot);
-	quat_conj(&q2, q);
-	quat_mul(&q3, &q1, &q2);
+	quat_conjugate(&local_rotation, &qrot, q);
 	/* Apply to local orientation */
-	quat_mul(&q4, &q3, q);
-	quat_normalize_self(&q4);
-	*q = q4;
+	quat_mul(&rotated_q, &local_rotation, q);
+	quat_normalize_self(&rotated_q);
+	*q = rotated_q;
 	return q;
 }
 
@@ -761,9 +770,9 @@ void quat_decompose_twist_swing(const union quat *q, const union vec3 *v1, union
 	quat_rot_vec(&v2, v1, q);
 
 	quat_from_u2v(swing, v1, &v2, 0);
-	union quat swing_conj;
-	quat_conj(&swing_conj, swing);
-	quat_mul(twist, q, &swing_conj);
+	union quat swing_inverse;
+	quat_inverse(&swing_inverse, swing);
+	quat_mul(twist, q, &swing_inverse);
 }
 
 void quat_decompose_swing_twist(const union quat *q, const union vec3 *v1, union quat *swing, union quat *twist)
@@ -772,9 +781,9 @@ void quat_decompose_swing_twist(const union quat *q, const union vec3 *v1, union
 	quat_rot_vec(&v2, v1, q);
 
 	quat_from_u2v(swing, v1, &v2, 0);
-	union quat swing_conj;
-	quat_conj(&swing_conj, swing);
-	quat_mul(twist, &swing_conj, q);
+	union quat swing_inverse;
+	quat_inverse(&swing_inverse, swing);
+	quat_mul(twist, &swing_inverse, q);
 }
 
 /* find the two endpoints of a line segment that are inside a given sphere
@@ -897,6 +906,16 @@ int ray_intersects_sphere(const union vec3 *ray_origin,
 
 	/* Now ray must hit sphere */
 	return 1;
+}
+
+/* Returns distance from point to plane defined by plane_point and plane_normal */
+float plane_to_point_dist(const union vec3 plane_point, const union vec3 plane_normal,
+			const union vec3 point)
+{
+	union vec3 diff;
+
+	vec3_sub(&diff, &point, &plane_point);
+	return vec3_dot(&plane_normal, &diff);
 }
 
 /* See "Real Time Collision Detection", by Christer Ericson, p. 224 */

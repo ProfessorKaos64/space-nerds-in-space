@@ -81,6 +81,7 @@ SNG_GLOBAL void sng_abs_xy_draw_string(char *s, int font, float x, float y);
 SNG_GLOBAL void sng_abs_xy_draw_string_with_cursor(
 				char *s, int font, float x, float y, int cursor_pos, int cursor_on) ;
 SNG_GLOBAL void sng_center_xy_draw_string(char *s, int font, float x, float y);
+SNG_GLOBAL void sng_center_xz_draw_string(char *s, int font, float x, float y);
 SNG_GLOBAL void sng_string_bounding_box(char *s, int font, float *bbx1, float *bby1, float *bbx2, float *bby2);
 SNG_GLOBAL void sng_draw_point(float x, float y);
 SNG_GLOBAL void sng_setup_colors(void *w, char *user_color_file);
@@ -108,6 +109,10 @@ SNG_GLOBAL char *sng_load_png_texture(const char *filename, int flipVertical, in
 	int pre_multiply_alpha, int *w, int *h, int *hasAlpha, char *whynot, int whynotlen);
 
 SNG_GLOBAL int add_user_color(uint8_t r, uint8_t g, uint8_t b);
+
+/* convert from physical (e.g. mouse) coords to extent coords */
+SNG_GLOBAL float sng_pixelx_to_screenx(float x);
+SNG_GLOBAL float sng_pixely_to_screeny(float y);
 
 #undef SNG_GLOBAL
 #endif

@@ -18,6 +18,9 @@
 	along with Spacenerds in Space; if not, write to the Free Software
 	Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 */
+
+#define _GNU_SOURCE
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -35,6 +38,7 @@
 #include <errno.h>
 #include <time.h>
 #include <ctype.h>
+#include <getopt.h>
 #include <math.h>
 #include <netinet/tcp.h>
 #include <stddef.h>
@@ -82,6 +86,13 @@
 #include "build_info.h"
 #include "starbase_metadata.h"
 #include "elastic_collision.h"
+#include "snis_nl.h"
+#include "snis_server_tracker.h"
+#include "snis_multiverse.h"
+#include "snis_hash.h"
+#include "snis_bridge_update_packet.h"
+#include "solarsystem_config.h"
+#include "a_star.h"
 
 #define CLIENT_UPDATE_PERIOD_NSECS 500000000
 #define MAXCLIENTS 100
@@ -99,6 +110,30 @@ static struct starbase_file_metadata *starbase_metadata;
 static struct docking_port_attachment_point **docking_port_info;
 static struct passenger_data passenger[MAX_PASSENGERS];
 static int npassengers;
+
+static struct multiverse_server_info {
+	int sock;
+	uint32_t ipaddr;
+	uint16_t port;
+	pthread_t read_thread;
+	pthread_t write_thread;
+	pthread_attr_t read_attr, write_attr;
+	pthread_cond_t write_cond;
+	struct packed_buffer_queue mverse_queue;
+	pthread_mutex_t queue_mutex;
+	pthread_mutex_t event_mutex;
+	pthread_mutex_t exit_mutex;
+	struct ssgl_game_server *mverse;
+	int mverse_count;
+	int have_packets_to_xmit;
+	int writer_time_to_exit;
+	int reader_time_to_exit;
+#define LOCATIONSIZE (sizeof((struct ssgl_game_server *) 0)->location)
+	char location[LOCATIONSIZE];
+} *multiverse_server = NULL;
+
+static char *solarsystem_name = DEFAULT_SOLAR_SYSTEM;
+static struct solarsystem_asset_spec *solarsystem_assets = NULL;
 
 #define GATHER_OPCODE_STATS 0
 
@@ -122,6 +157,8 @@ static void npc_menu_item_not_implemented(struct npc_menu_item *item,
 static void npc_menu_item_travel_advisory(struct npc_menu_item *item,
 				char *npcname, struct npc_bot_state *botstate);
 static void npc_menu_item_request_dock(struct npc_menu_item *item,
+				char *npcname, struct npc_bot_state *botstate);
+static void npc_menu_item_warp_gate_tickets(struct npc_menu_item *item,
 				char *npcname, struct npc_bot_state *botstate);
 static void npc_menu_item_buy_cargo(struct npc_menu_item *item,
 				char *npcname, struct npc_bot_state *botstate);
@@ -194,6 +231,7 @@ static struct npc_menu_item starbase_main_menu[] = {
 	{ "STARBASE MAIN MENU", 0, 0, 0 },  /* by convention, first element is menu title */
 	{ "LOCAL TRAVEL ADVISORY", 0, 0, npc_menu_item_travel_advisory },
 	{ "REQUEST PERMISSION TO DOCK", 0, 0, npc_menu_item_request_dock },
+	{ "BUY WARP-GATE TICKETS", 0, 0, npc_menu_item_warp_gate_tickets },
 	{ "REQUEST REMOTE FUEL DELIVERY", 0, 0, npc_menu_item_not_implemented },
 	{ "BUY FUEL", 0, 0, npc_menu_item_not_implemented },
 	{ "REPAIRS AND MAINTENANCE", 0, repairs_and_maintenance_menu, 0 },
@@ -265,6 +303,17 @@ struct bridge_data {
 	struct npc_bot_state npcbot;
 	int last_docking_permission_denied_time;
 	uint32_t science_selection;
+	int current_displaymode;
+	struct ssgl_game_server warp_gate_ticket;
+	unsigned char pwdhash[20];
+	int verified; /* whether this bridge has verified with multiverse server */
+#define BRIDGE_UNVERIFIED 0
+#define BRIDGE_VERIFIED 1
+#define BRIDGE_FAILED_VERIFICATION 2
+#define BRIDGE_REFUSED 3
+	int requested_verification; /* Whether we've requested verification from multiverse server yet */
+	int requested_creation; /* whether user has requested creating new ship */
+	int nclients;
 } bridgelist[MAXCLIENTS];
 int nbridges = 0;
 static pthread_mutex_t universe_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -275,6 +324,7 @@ int listener_port = -1;
 static int default_snis_server_port = -1; /* -1 means choose a random port */
 pthread_t lobbythread;
 char *lobbyserver = NULL;
+static struct server_tracker *server_tracker;
 static int snis_log_level = 2;
 static struct ship_type_entry *ship_type;
 int nshiptypes;
@@ -340,12 +390,27 @@ static void remove_client(int client_index)
 }
 
 /* assumes universe and client locks are held. */
+static void delete_bridge(int b);
 static void put_client(struct game_client *c)
 {
+	int bridge_to_delete = -1;
 	assert(c->refcount > 0);
 	c->refcount--;
-	if (c->refcount == 0)
+	fprintf(stderr, "snis_server: client refcount = %d\n", c->refcount);
+	if (c->refcount == 0) {
+		if (c->bridge >= 0 && c->bridge < nbridges) {
+			bridgelist[c->bridge].nclients--;
+			fprintf(stderr, "snis_server: client count of bridge %d = %d\n", c->bridge, bridgelist[c->bridge].nclients);
+			if (bridgelist[c->bridge].nclients <= 0) {
+				bridge_to_delete = c->bridge;
+			}
+		}
+		fprintf(stderr, "snis_server: calling remove_client %ld\n", client_index(c));
 		remove_client(client_index(c));
+		fprintf(stderr, "snis_server: remove_client %ld returned\n", client_index(c));
+	}
+	if (bridge_to_delete >= 0)
+		delete_bridge(bridge_to_delete);
 }
 
 /* assumes universe and client locks are held. */
@@ -616,6 +681,17 @@ static void get_peer_name(int connection, char *buffer)
 	printf("put '%s' in buffer\n", buffer);
 }
 
+static char *logprefix(void)
+{
+	static char logprefixstrbuffer[100];
+	static char *logprefixstr = NULL;
+	if (logprefixstr != NULL)
+		return logprefixstr;
+	sprintf(logprefixstrbuffer, "%s(%s):", "snis_server", solarsystem_name);
+	logprefixstr = logprefixstrbuffer;
+	return logprefixstr;
+}
+
 static void log_client_info(int level, int connection, char *info)
 {
 	char client_ip[50];
@@ -624,8 +700,71 @@ static void log_client_info(int level, int connection, char *info)
 		return;
 
 	get_peer_name(connection, client_ip);
-	snis_log(level, "snis_server: %s: %s",
-			client_ip, info);
+	snis_log(level, "%s: %s: %s", logprefix(), client_ip, info);
+}
+
+static void delete_from_clients_and_server_helper(struct snis_entity *o, int take_client_lock);
+static void delete_object(struct snis_entity *o);
+static void remove_from_attack_lists(uint32_t victim_id);
+
+static void delete_bridge(int b)
+{
+	/* Assumes universe mutex is held.
+	 * Assumes client lock held.
+	 */
+
+	int i;
+	int clients_still_active = 0;
+
+	fprintf(stderr, "snis_server: delete_bridge %d, nbridges = %d\n", b, nbridges);
+	if (nbridges <= 0)
+		return;
+	for (i = 0; i < nclients; i++) {
+		if (!client[i].refcount)
+			continue;
+		if (client[i].bridge == b)
+			clients_still_active = 1;
+	}
+	fprintf(stderr, "snis_server: delete_bridge, clients_still_active = %d\n", clients_still_active);
+	if (clients_still_active) {
+		fprintf(stderr, "%s: attempted to delete bridge clients still uses.\n",
+			logprefix());
+		return;
+	}
+	fprintf(stderr, "snis_server: deleting player ship\n");
+	for (i = 0; i <= snis_object_pool_highest_object(pool); i++) {
+		if (go[i].type == OBJTYPE_SHIP1 && go[i].id == bridgelist[b].shipid) {
+			delete_from_clients_and_server_helper(&go[i], 0);
+			break;
+		}
+	}
+	fprintf(stderr, "snis_server: deleting bridge %d\n", b);
+	/* delete the bridge */
+	for (i = b + 1; i < nbridges; i++)
+		bridgelist[i - 1] = bridgelist[i];
+	nbridges--;
+	fprintf(stderr, "%s: deleted bridge %d\n", logprefix(), b);
+}
+
+static void print_hash(char *s, unsigned char *pwdhash)
+{
+	int i;
+
+	fprintf(stderr, "%s: %s", logprefix(), s);
+	for (i = 0; i < 20; i++)
+		fprintf(stderr, "%02x", pwdhash[i]);
+	fprintf(stderr, "\n");
+}
+
+static int lookup_bridge_by_pwdhash(unsigned char *pwdhash)
+{
+	/* assumes universe_mutex held */
+	int i;
+
+	for (i = 0; i < nbridges; i++)
+		if (memcmp(bridgelist[i].pwdhash, pwdhash, 20) == 0)
+			return i;
+	return -1;
 }
 
 static void generic_move(__attribute__((unused)) struct snis_entity *o)
@@ -787,6 +926,9 @@ static void gather_opcode_not_sent_stats(struct snis_entity *o)
 	case OBJTYPE_WORMHOLE:
 		opcode[0] = OPCODE_UPDATE_WORMHOLE;
 		break;
+	case OBJTYPE_WARPGATE:
+		opcode[0] = OPCODE_UPDATE_WARPGATE;
+		break;
 	case OBJTYPE_STARBASE:
 		opcode[0] = OPCODE_UPDATE_STARBASE;
 		break;
@@ -897,6 +1039,16 @@ static void delete_object(struct snis_entity *o)
 	o->alive = 0;
 }
 
+static void snis_queue_delete_object_helper(struct snis_entity *o)
+{
+	int i;
+	uint32_t oid = o->id;
+
+	for (i = 0; i < nclients; i++)
+		if (client[i].refcount)
+			queue_delete_oid(&client[i], oid);
+}
+
 static void snis_queue_delete_object(struct snis_entity *o)
 {
 	/* Iterate over all clients and inform them that
@@ -909,13 +1061,9 @@ static void snis_queue_delete_object(struct snis_entity *o)
 	 * and when we build the packet, we'll need the
 	 * client_write_queue_mutexes.  Hope there's no deadlocks.
 	 */
-	int i;
-	uint32_t oid = o->id;
 
 	client_lock();
-	for (i = 0; i < nclients; i++)
-		if (client[i].refcount)
-			queue_delete_oid(&client[i], oid);
+	snis_queue_delete_object_helper(o);
 	client_unlock();
 }
 
@@ -966,7 +1114,6 @@ static void remove_from_attack_lists(uint32_t victim_id)
 	}
 }
 
-static void delete_from_clients_and_server(struct snis_entity *o);
 static void delete_starbase_docking_ports(struct snis_entity *o)
 {
 	int i;
@@ -980,9 +1127,12 @@ static void delete_starbase_docking_ports(struct snis_entity *o)
 	}
 }
 
-static void delete_from_clients_and_server(struct snis_entity *o)
+static void delete_from_clients_and_server_helper(struct snis_entity *o, int take_client_lock)
 {
-	snis_queue_delete_object(o);
+	if (take_client_lock)
+		snis_queue_delete_object(o);
+	else
+		snis_queue_delete_object_helper(o);
 	switch (o->type) {
 	case OBJTYPE_DEBRIS:
 	case OBJTYPE_SPARK:
@@ -1006,6 +1156,11 @@ static void delete_from_clients_and_server(struct snis_entity *o)
 		fleet_leave(o->id); /* leave any fleets ship might be a member of */
 	remove_from_attack_lists(o->id);
 	delete_object(o);
+}
+
+static void delete_from_clients_and_server(struct snis_entity *o)
+{
+	delete_from_clients_and_server_helper(o, 1);
 }
 
 #define ANY_SHIP_ID (0xffffffff)
@@ -1105,6 +1260,24 @@ static void queue_add_sound(struct game_client *c, uint16_t sound_number)
 	pb_queue_to_client(c, packed_buffer_new("bh", OPCODE_PLAY_SOUND, sound_number));
 }
 
+static void queue_add_text_to_speech(struct game_client *c, const char *text)
+{
+	struct packed_buffer *pb;
+	char tmpbuf[256];
+	uint8_t length;
+
+	length = strlen(text) & 0x0ff;
+	if (length >= 255)
+		length = 254;
+	snprintf(tmpbuf, 255, "%s", text);
+	tmpbuf[255] = '\0';
+	pb = packed_buffer_allocate(512);
+	packed_buffer_append(pb, "bbb", OPCODE_NATURAL_LANGUAGE_REQUEST,
+				OPCODE_NL_SUBCOMMAND_TEXT_TO_SPEECH, (uint8_t) strlen(tmpbuf) + 1);
+	packed_buffer_append_raw(pb, tmpbuf, length + 1);
+	pb_queue_to_client(c, pb);
+}
+
 static void snis_queue_add_sound(uint16_t sound_number, uint32_t roles, uint32_t shipid)
 {
 	int i;
@@ -1119,12 +1292,34 @@ static void snis_queue_add_sound(uint16_t sound_number, uint32_t roles, uint32_t
 	client_unlock();
 }
 
-static void snis_queue_add_global_sound(uint16_t sound_number)
+static void snis_queue_add_text_to_speech(const char *text, uint32_t roles, uint32_t shipid)
+{
+	int i;
+	struct game_client *c;
+
+	client_lock();
+	for (i = 0; i < nclients; i++) {
+		c = &client[i];
+		if (c->refcount && (c->role & roles) && c->shipid == shipid)
+			queue_add_text_to_speech(c, text);
+	}
+	client_unlock();
+}
+
+static void __attribute__((unused)) snis_queue_add_global_sound(uint16_t sound_number)
 {
 	int i;
 
 	for (i = 0; i < nbridges; i++)
 		snis_queue_add_sound(sound_number, ROLE_ALL, bridgelist[i].shipid);
+}
+
+static void snis_queue_add_global_text_to_speech(const char *text)
+{
+	int i;
+
+	for (i = 0; i < nbridges; i++)
+		snis_queue_add_text_to_speech(text, ROLE_ALL, bridgelist[i].shipid);
 }
 
 static int add_explosion(double x, double y, double z, uint16_t velocity,
@@ -1976,6 +2171,7 @@ static int projectile_collides(double x1, double y1, double z1,
 	return moving_spheres_intersection(&s1, (float) r1, &v1, &s2, (float) r2, &v2, 1.0f, time);
 }
 
+static void do_collision_impulse(struct snis_entity *player, struct snis_entity *object);
 static void torpedo_collision_detection(void *context, void *entity)
 {
 	struct snis_entity *t = entity;  /* target */
@@ -2045,6 +2241,7 @@ static void torpedo_collision_detection(void *context, void *entity)
 	}
 
 	if (t->type == OBJTYPE_SHIP1 || t->type == OBJTYPE_SHIP2) {
+		do_collision_impulse(t, o);
 		calculate_torpedo_damage(t);
 		send_ship_damage_packet(t);
 		send_detonate_packet(t, ix, iy, iz, impact_time, impact_fractional_time);
@@ -3701,12 +3898,448 @@ static void damcon_repair_socket_move(struct snis_damcon_entity *o,
 	}
 }
 
+static void *damcon_robot_nth_neighbor(__attribute__((unused)) void *context, void *node, int n)
+{
+	struct snis_damcon_entity *n1 = node;
+
+	if (n < 0 || n > 9)
+		return NULL;
+	if (n1->type != DAMCON_TYPE_WAYPOINT)
+		return NULL;
+	return n1->tsd.waypoint.neighbor[n];
+}
+
+static float damcon_robot_movement_cost(void *context, void *node1, void *node2)
+{
+	struct snis_damcon_entity *n1, *n2;
+	float dx, dy;
+	assert(node1 != NULL);
+	assert(node2 != NULL);
+	n1 = node1;
+	n2 = node2;
+	assert(n1->type == DAMCON_TYPE_WAYPOINT);
+	assert(n2->type == DAMCON_TYPE_WAYPOINT);
+
+	dx = n1->x - n2->x;
+	dy = n1->y - n2->y;
+	return fabsf(dx) + fabsf(dy); /* Manhattan distance */
+}
+
+static struct snis_damcon_entity *find_nearest_waypoint(struct damcon_data *d, float x, float y)
+{
+	int i, nearest = -1;
+	float dx, dy, dist, nearest_dist;
+
+	for (i = 0; i <= snis_object_pool_highest_object(d->pool); i++) {
+		if (d->o[i].type != DAMCON_TYPE_WAYPOINT)
+			continue;
+		dx = x - d->o[i].x;
+		dy = y - d->o[i].y;
+		dist = dx * dx + dy * dy;
+		if (nearest < 0 || dist < nearest_dist) {
+			nearest = i;
+			nearest_dist = dist;
+		}
+	}
+	if (nearest < 0)
+		return NULL;
+	return &d->o[nearest];
+}
+
+static struct snis_damcon_entity *find_nearest_waypoint_to_obj(struct damcon_data *d, struct snis_damcon_entity *target)
+{
+	return find_nearest_waypoint(d, target->x, target->y);
+}
+
+static struct snis_damcon_entity *damcon_find_closest_damaged_part_by_damage(struct damcon_data *d,
+									uint8_t damage_limit)
+{
+	struct snis_damcon_entity *part, *damaged_part = NULL;
+	uint8_t max_damage = 0;
+	float dist, min_dist;
+	int i;
+
+	/* Find the *closest* (by manhattan distance) part that is more than damage_limit damaged */
+	damaged_part = NULL;
+	max_damage = 0;
+	min_dist = 0;
+	for (i = 0; i <= snis_object_pool_highest_object(d->pool); i++) {
+		if (d->o[i].type != DAMCON_TYPE_PART)
+			continue;
+		part = &d->o[i];
+		if (part->tsd.part.damage > max_damage && part->tsd.part.damage > damage_limit) {
+			dist = fabsf(d->robot->x - part->x) + fabsf(d->robot->y - part->y);
+			if (dist < min_dist || damaged_part == NULL) {
+				damaged_part = part;
+				max_damage = part->tsd.part.damage;
+				min_dist = dist;
+			}
+		}
+	}
+	return damaged_part;
+}
+
+static struct snis_damcon_entity *damcon_find_next_thing_to_repair(struct damcon_data *d)
+{
+	struct snis_damcon_entity *part, *damaged_part = NULL;
+	uint8_t max_damage = 0;
+	int i;
+
+	/* First get anything sitting around in the repair socket */
+	for (i = 0; i <= snis_object_pool_highest_object(d->pool); i++) {
+		if (d->o[i].type == DAMCON_TYPE_SOCKET &&
+			d->o[i].tsd.socket.system == DAMCON_TYPE_REPAIR_STATION &&
+			d->o[i].tsd.socket.contents_id != DAMCON_SOCKET_EMPTY) {
+			i = lookup_by_damcon_id(d, d->o[i].tsd.socket.contents_id);
+			if (i < 0)
+				continue;
+			return &d->o[i];
+		}
+	}
+
+	/* Next repair any shields below 60% */
+	max_damage = 0;
+	for (i = 0; i <= snis_object_pool_highest_object(d->pool); i++) {
+		part = &d->o[i];
+		if (part->type != DAMCON_TYPE_PART || part->tsd.part.system != DAMCON_TYPE_SHIELDSYSTEM)
+			continue;
+		if (part->tsd.part.damage > max_damage) {
+			damaged_part = part;
+			max_damage = part->tsd.part.damage;
+		}
+	}
+	if (max_damage > 153) /* 60% of 256 */
+		return damaged_part;
+
+	/* Next find the *closest* (by manhattan distance) part that is more than 75%, 50%, 25%, or 0% damaged */
+	damaged_part = damcon_find_closest_damaged_part_by_damage(d, 192);
+	if (damaged_part)
+		return damaged_part;
+	damaged_part = damcon_find_closest_damaged_part_by_damage(d, 127);
+	if (damaged_part)
+		return damaged_part;
+	damaged_part = damcon_find_closest_damaged_part_by_damage(d, 65);
+	if (damaged_part)
+		return damaged_part;
+	damaged_part = damcon_find_closest_damaged_part_by_damage(d, 0);
+	return damaged_part;
+}
+
+static struct snis_damcon_entity *find_repair_socket(struct damcon_data *d)
+{
+	int i;
+
+	for (i = 0; i <= snis_object_pool_highest_object(d->pool); i++) {
+		if (d->o[i].type != DAMCON_TYPE_SOCKET)
+			continue;
+		if (d->o[i].tsd.part.system != DAMCON_TYPE_REPAIR_STATION)
+			continue;
+		return &d->o[i];
+	}
+	return NULL;
+}
+
+static struct snis_damcon_entity *find_socket_for_part(struct damcon_data *d, struct snis_damcon_entity *part)
+{
+	int i;
+
+	for (i = 0; i <= snis_object_pool_highest_object(d->pool); i++) {
+		if (d->o[i].type != DAMCON_TYPE_SOCKET)
+			continue;
+		if (d->o[i].tsd.socket.part == part->tsd.part.part &&
+			d->o[i].tsd.socket.system == part->tsd.part.system)
+				return &d->o[i];
+	}
+	return NULL;
+}
+
+static struct snis_damcon_entity *find_nth_waypoint(struct damcon_data *d, int n);
+static struct snis_damcon_entity *find_robot_goal(struct damcon_data *d)
+{
+	struct snis_damcon_entity *part, *socket, *waypoint;
+	float dx, dy, dist2;
+	int i, next_state;
+
+	/* Is the robot carrying something? */
+	if (d->robot->tsd.robot.cargo_id != ROBOT_CARGO_EMPTY) {
+		i = lookup_by_damcon_id(d, d->robot->tsd.robot.cargo_id);
+		if (i < 0)
+			return NULL;
+		part = &d->o[i];
+		if (part->tsd.part.damage >= DAMCON_EASY_REPAIR_THRESHOLD) {
+			/* have to take it to the repair station */
+			socket = find_repair_socket(d);
+			waypoint = find_nearest_waypoint_to_obj(d, socket);
+			d->robot->tsd.robot.repair_socket_id = socket->id;
+			next_state = DAMCON_ROBOT_REPAIR;
+		} else {
+			socket = find_socket_for_part(d, part);
+			if (!socket)
+				return NULL;
+			waypoint = find_nearest_waypoint_to_obj(d, socket);
+			next_state = DAMCON_ROBOT_REPLACE;
+		}
+		dx = waypoint->x - d->robot->x;
+		dy = waypoint->y - d->robot->y;
+		dist2 = (dx * dx) + (dy * dy);
+		if (dist2 < 20 * 20)
+			d->robot->tsd.robot.robot_state = next_state;
+		return waypoint;
+	}
+
+	d->robot->tsd.robot.damaged_part_id = (uint32_t) -1;
+	part = damcon_find_next_thing_to_repair(d);
+	if (part)
+		waypoint = find_nearest_waypoint_to_obj(d, part);
+	else
+		waypoint = find_nth_waypoint(d, 17); /* default destination */
+	if (waypoint && !part)
+		return waypoint;
+	if (waypoint && part) {
+		if (part && part->type == DAMCON_TYPE_PART)
+			d->robot->tsd.robot.damaged_part_id = part->id;
+		dx = d->robot->x - waypoint->x;
+		dy = d->robot->y - waypoint->y;
+		dist2 = (dx * dx) + (dy * dy);
+		if (dist2 < 50 * 50 && part->type == DAMCON_TYPE_PART)
+			d->robot->tsd.robot.robot_state = DAMCON_ROBOT_PICKUP;
+		return waypoint;
+	} else {
+		return find_nearest_waypoint(d, d->robot->tsd.robot.long_term_goal_x,
+						d->robot->tsd.robot.long_term_goal_y);
+	}
+}
+
+typedef void (*robot_claw_action_fn)(struct damcon_data *d);
+typedef int (*robot_claw_condition_fn)(struct damcon_data *d);
+
+static void print_waypoint_table(struct damcon_data *d, int tablesize);
+static void do_robot_drop(struct damcon_data *d);
+static void do_robot_pickup(struct damcon_data *d);
+
+static int damcon_part_sufficiently_repaired(struct damcon_data *d)
+{
+	int i;
+	struct snis_damcon_entity *part;
+
+	i = lookup_by_damcon_id(d, d->robot->tsd.robot.damaged_part_id);
+	if (i < 0) {
+		d->robot->tsd.robot.robot_state = DAMCON_ROBOT_DECIDE_LTG;
+		return 0;
+	}
+	part = &d->o[i];
+	return part->tsd.part.damage < DAMCON_EASY_REPAIR_THRESHOLD;
+}
+
+/* damcon_robot_claw_object():
+ *   Make the robot aim its claw at something and either pick it up or put it down,
+ *   then transition to a new state
+ */
+static void damcon_robot_claw_object(struct damcon_data *d, struct snis_damcon_entity *object,
+					robot_claw_action_fn robot_claw_action,
+					robot_claw_condition_fn robot_claw_condition,
+					int next_robot_state)
+{
+	double dx, dy, goal_heading, desired_delta_angle;
+
+	dx = robot_clawx(d->robot) - object->x;
+	dy = robot_clawy(d->robot) - object->y;
+	if (dx * dx + dy * dy < ROBOT_MAX_GRIP_DIST2) {
+		if (robot_claw_condition) {
+			if (!robot_claw_condition(d))
+				return; /* condition not met */
+		}
+		robot_claw_action(d);
+		d->robot->tsd.robot.robot_state = next_robot_state;
+		return;
+	} else {
+		dx = d->robot->x - object->x;
+		dy = d->robot->y - object->y;
+		goal_heading = atan2(-dx, dy) - M_PI / 4;
+		normalize_angle(&goal_heading);
+		desired_delta_angle = goal_heading - d->robot->heading;
+		normalize_angle(&desired_delta_angle);
+		while (desired_delta_angle > M_PI)
+			desired_delta_angle = desired_delta_angle - 2.0 * M_PI;
+		while (desired_delta_angle < -M_PI)
+			desired_delta_angle = desired_delta_angle + 2.0 * M_PI;
+		desired_delta_angle = 0.25 * desired_delta_angle;
+		if (desired_delta_angle > 5.0 * M_PI / 180.0)
+			desired_delta_angle = 5 * M_PI / 180.0;
+		if (desired_delta_angle < -5.0 * M_PI / 180.0)
+			desired_delta_angle = -5.0 * M_PI / 180.0;
+		d->robot->tsd.robot.desired_heading += desired_delta_angle;
+		d->robot->tsd.robot.desired_velocity = 0;
+		normalize_angle(&d->robot->tsd.robot.desired_heading);
+	}
+}
+
+static void damcon_robot_think(struct snis_damcon_entity *o, struct damcon_data *d)
+{
+	double goal_heading, desired_delta_angle;
+	double dist, dx, dy;
+	struct a_star_path *path;
+	struct snis_damcon_entity *part, *socket, *goal;
+	struct snis_damcon_entity *start;
+	int i;
+
+	if (o->tsd.robot.autonomous_mode == DAMCON_ROBOT_MANUAL_MODE)
+		return;
+
+	switch (o->tsd.robot.robot_state) {
+	case  DAMCON_ROBOT_DECIDE_LTG:
+		start = find_nearest_waypoint_to_obj(d, d->robot);
+		goal = find_robot_goal(d);
+		d->robot->tsd.robot.long_term_goal_x = goal->x;
+		d->robot->tsd.robot.long_term_goal_y = goal->y;
+		path = a_star(d, start, goal, snis_object_pool_highest_object(d->pool),
+				damcon_robot_movement_cost,
+				damcon_robot_movement_cost,
+				damcon_robot_nth_neighbor);
+		if (d->robot->tsd.robot.robot_state == DAMCON_ROBOT_REPAIR)
+			break;
+		if (d->robot->tsd.robot.robot_state == DAMCON_ROBOT_REPLACE)
+			break;
+		if (d->robot->tsd.robot.robot_state == DAMCON_ROBOT_PICKUP)
+			break;
+		if (!path) {
+			fprintf(stderr, "%s: path is null at %s:%dn", logprefix(), __FILE__, __LINE__);
+			break;
+		}
+		if (path->node_count <= 0) {
+			fprintf(stderr, "%s: path->node_count is %d\n", logprefix(), path->node_count);
+			break;
+		}
+		if (path->node_count > 1)
+			goal = path->path[1];
+		else if (path->node_count > 0)
+			goal = path->path[0];
+		d->robot->tsd.robot.short_term_goal_x = goal->x;
+		d->robot->tsd.robot.short_term_goal_y = goal->y;
+		d->robot->tsd.robot.autonomous_mode = DAMCON_ROBOT_FULLY_AUTONOMOUS;
+		d->robot->tsd.robot.robot_state = DAMCON_ROBOT_CRUISE;
+		free(path);
+		break;
+	case DAMCON_ROBOT_CRUISE:
+		dx = o->tsd.robot.short_term_goal_x - o->x;
+		dy = o->tsd.robot.short_term_goal_y - o->y;
+		dist = dx * dx + dy * dy;
+		if (dist < 400) { /* we have arrived */
+			if (o->tsd.robot.autonomous_mode == DAMCON_ROBOT_SEMI_AUTONOMOUS)
+				o->tsd.robot.robot_state = DAMCON_ROBOT_DECIDE_LTG;
+			if (o->tsd.robot.autonomous_mode == DAMCON_ROBOT_FULLY_AUTONOMOUS)
+				o->tsd.robot.robot_state = DAMCON_ROBOT_DECIDE_LTG;
+			return;
+		}
+		goal_heading = atan2(dy, dx) + M_PI / 2;
+		normalize_angle(&goal_heading);
+		desired_delta_angle = goal_heading - o->tsd.robot.desired_heading;
+		if (desired_delta_angle > M_PI)
+			desired_delta_angle = desired_delta_angle - 2.0 * M_PI;
+		else if (desired_delta_angle < -M_PI)
+			desired_delta_angle = desired_delta_angle + 2.0 * M_PI;
+
+		if (fabs(desired_delta_angle) < 15.0 * M_PI / 180.0 && dist > 600)
+			o->tsd.robot.desired_velocity =
+					-MAX_ROBOT_VELOCITY / ((fabs(desired_delta_angle) * 180.0 / M_PI) + 1.0) / 3.0;
+		else if (fabs(desired_delta_angle) < 40.0 * M_PI / 180.0 && dist > 200)
+			o->tsd.robot.desired_velocity = 0.5 *
+					-MAX_ROBOT_VELOCITY / ((fabs(desired_delta_angle) * 180.0 / M_PI) + 1.0) / 3.0;
+		else
+			o->tsd.robot.desired_velocity = 0;
+
+		desired_delta_angle = 0.25 * desired_delta_angle;
+		o->tsd.robot.desired_heading += desired_delta_angle;
+		normalize_angle(&o->tsd.robot.desired_heading);
+		break;
+	case DAMCON_ROBOT_PICKUP:
+		i = lookup_by_damcon_id(d, d->robot->tsd.robot.damaged_part_id);
+		if (i < 0) {
+			d->robot->tsd.robot.robot_state = DAMCON_ROBOT_DECIDE_LTG;
+			return;
+		}
+		damcon_robot_claw_object(d, &d->o[i], do_robot_pickup, NULL, DAMCON_ROBOT_DECIDE_LTG);
+		break;
+	case DAMCON_ROBOT_REPAIR:
+		if (d->robot->tsd.robot.cargo_id == DAMCON_SOCKET_EMPTY) {
+			d->robot->tsd.robot.robot_state = DAMCON_ROBOT_DECIDE_LTG;
+			return;
+		}
+		i = lookup_by_damcon_id(d, d->robot->tsd.robot.cargo_id);
+		if (i < 0) {
+			d->robot->tsd.robot.robot_state = DAMCON_ROBOT_DECIDE_LTG;
+			return;
+		}
+		part = &d->o[i];
+		if (part->tsd.part.damage < DAMCON_EASY_REPAIR_THRESHOLD) {
+			d->robot->tsd.robot.robot_state = DAMCON_ROBOT_DECIDE_LTG;
+			return;
+		}
+		if (d->robot->tsd.robot.repair_socket_id != ROBOT_CARGO_EMPTY) {
+			i = lookup_by_damcon_id(d, d->robot->tsd.robot.repair_socket_id);
+			if (i < 0)
+				socket = NULL;
+			else
+				socket = &d->o[i];
+		}
+		if (!socket) {
+			socket = find_repair_socket(d);
+			if (!socket) {
+				d->robot->tsd.robot.robot_state = DAMCON_ROBOT_DECIDE_LTG;
+				return;
+			}
+		}
+		damcon_robot_claw_object(d, socket, do_robot_drop, NULL, DAMCON_ROBOT_REPAIR_WAIT);
+		break;
+	case DAMCON_ROBOT_REPAIR_WAIT:
+		if (d->robot->tsd.robot.repair_socket_id == DAMCON_SOCKET_EMPTY) {
+			d->robot->tsd.robot.robot_state = DAMCON_ROBOT_DECIDE_LTG;
+			return;
+		}
+		i = lookup_by_damcon_id(d, d->robot->tsd.robot.repair_socket_id);
+		if (i < 0) {
+			d->robot->tsd.robot.robot_state = DAMCON_ROBOT_DECIDE_LTG;
+			return;
+		}
+		socket = &d->o[i];
+		i = lookup_by_damcon_id(d, d->robot->tsd.robot.damaged_part_id);
+		if (i < 0) {
+			d->robot->tsd.robot.robot_state = DAMCON_ROBOT_DECIDE_LTG;
+			return;
+		}
+		part = &d->o[i];
+		damcon_robot_claw_object(d, socket, do_robot_pickup, damcon_part_sufficiently_repaired,
+					DAMCON_ROBOT_DECIDE_LTG);
+		break;
+	case DAMCON_ROBOT_REPLACE:
+		i = lookup_by_damcon_id(d, d->robot->tsd.robot.cargo_id);
+		if (i < 0) {
+			d->robot->tsd.robot.robot_state = DAMCON_ROBOT_DECIDE_LTG;
+			return;
+		}
+		part = &d->o[i];
+		if (part->tsd.part.damage > 0)
+			return; /* just wait for it to repair */
+		socket = find_socket_for_part(d, part);
+		if (!socket) {
+			d->robot->tsd.robot.robot_state = DAMCON_ROBOT_DECIDE_LTG;
+			return;
+		}
+		damcon_robot_claw_object(d, socket, do_robot_drop, NULL, DAMCON_ROBOT_DECIDE_LTG);
+		break;
+	default:
+		break;
+	}
+}
+
 static void damcon_robot_move(struct snis_damcon_entity *o, struct damcon_data *d)
 {
 	double vx, vy, lastx, lasty, lasth, dv;
 	int bounds_hit = 0;
 	struct snis_damcon_entity *cargo = NULL;
 	double clawx, clawy;
+
+	damcon_robot_think(o, d);
 
 	lastx = o->x;
 	lasty = o->y;
@@ -3822,7 +4455,7 @@ static void damcon_robot_move(struct snis_damcon_entity *o, struct damcon_data *
 			normalize_angle(&cargo->heading);
 
 			/* If part is lightly damaged, the robot can repair in place */
-			if (cargo->tsd.part.damage < 200) {
+			if (cargo->tsd.part.damage < DAMCON_EASY_REPAIR_THRESHOLD) {
 				new_damage = cargo->tsd.part.damage - 8;
 				if (new_damage < 0)
 					new_damage = 0;
@@ -4088,6 +4721,18 @@ static int lookup_bridge_by_shipid(uint32_t shipid)
 	return -1;
 }
 
+static int lookup_bridge_by_ship_name(char *name)
+{
+	/* assumes universe lock is held */
+	int i;
+
+	for (i = 0; i < nbridges; i++) {
+		if (strcasecmp((char *) bridgelist[i].shipname, name) == 0)
+			return i;
+	}
+	return -1;
+}
+
 static void calculate_ship_scibeam_info(struct snis_entity *ship)
 {
 	double range, tx, tz, angle, A1, A2;
@@ -4254,6 +4899,25 @@ void do_docking_action(struct snis_entity *ship, struct snis_entity *starbase,
 			"player-docked-event", (double) ship->id, starbase->id);
 }
 
+static int player_attempt_warpgate_jump(struct snis_entity *warpgate, struct snis_entity *player)
+{
+	struct packed_buffer *pb;
+	int b = lookup_bridge_by_shipid(player->id);
+
+	if (b < 0 || b >= nbridges) {
+		fprintf(stderr, "BUG: %s:%d player ship has no bridge\n", __FILE__, __LINE__);
+		return 0;
+	}
+	if (bridgelist[b].warp_gate_ticket.ipaddr == 0) /* No ticket? No warp. */
+		return 0;
+	pb = packed_buffer_allocate(3 + 20);
+	packed_buffer_append(pb, "bb", OPCODE_SWITCH_SERVER,
+		(uint8_t) warpgate->tsd.warpgate.warpgate_number);
+	packed_buffer_append_raw(pb, bridgelist[b].warp_gate_ticket.location, 20);
+	send_packet_to_all_clients_on_a_bridge(player->id, pb, ROLE_ALL);
+	return 1;
+}
+
 static void player_attempt_dock_with_starbase(struct snis_entity *docking_port,
 						struct snis_entity *player)
 {
@@ -4367,12 +5031,24 @@ static void player_collision_detection(void *player, void *object)
 	case OBJTYPE_NEBULA:
 	case OBJTYPE_WORMHOLE:
 	case OBJTYPE_SPACEMONSTER:
+	case OBJTYPE_STARBASE:
 		return;
 	default:
 		break;
 	}
 	if (t == o) /* skip self */
 		return;
+
+	/* Prevent our own mining bot from bumping us. */
+	if (t->type == OBJTYPE_SHIP2 && t->tsd.ship.shiptype == SHIP_CLASS_ASTEROIDMINER) {
+		int n = t->tsd.ship.nai_entries - 1;
+		if (n < MAX_AI_STACK_ENTRIES && n >= 0) {
+			if (t->tsd.ship.ai[n].ai_mode == AI_MODE_MINING_BOT &&
+				t->tsd.ship.ai[n].u.mining_bot.parent_ship == o->id)
+				return;
+		}
+	}
+
 	dist2 = dist3dsqrd(o->x - t->x, o->y - t->y, o->z - t->z);
 	if (t->type == OBJTYPE_CARGO_CONTAINER && dist2 < 150.0 * 150.0) {
 			scoop_up_cargo(o, t);
@@ -4381,6 +5057,10 @@ static void player_collision_detection(void *player, void *object)
 	if (t->type == OBJTYPE_DOCKING_PORT && dist2 < 50.0 * 50.0 &&
 		o->tsd.ship.docking_magnets) {
 		player_attempt_dock_with_starbase(t, o);
+	}
+	if (t->type == OBJTYPE_WARPGATE && dist2 < 50.0 * 50.0) {
+		if (player_attempt_warpgate_jump(t, o))
+			return;
 	}
 	if (t->type == OBJTYPE_PLANET) {
 		const float surface_dist2 = t->tsd.planet.radius * t->tsd.planet.radius;
@@ -4444,6 +5124,83 @@ static void player_collision_detection(void *player, void *object)
 
 static void update_player_orientation(struct snis_entity *o)
 {
+	int i;
+	struct snis_entity *planet;
+	double v;
+
+	/* This is where "standard orbit" is implemented */
+	if (o->tsd.ship.orbiting_object_id != 0xffffffff) {
+
+		/* If we're moving too slowly, numerical problems result */
+		v = sqrt(o->vx * o->vx + o->vy * o->vy + o->vz * o->vz);
+		if (v < 0.01) {
+			o->tsd.ship.orbiting_object_id = 0xffffffff;
+			goto skip_standard_orbit;
+		}
+
+		i = lookup_by_id(o->tsd.ship.orbiting_object_id);
+		if (i < 0) {
+			o->tsd.ship.orbiting_object_id = 0xffffffff;
+		} else {
+			/* Find where we would like to be pointed for "standard orbit"
+			 * Take vector P, from planet to us, and make it the standard length.
+			 * Take velocity vector V, project to be parallel to surface of sphere,
+			 * then scale to some constant fraction of planet radius (2.5 degrees, say).
+			 * Add V to P to produce D.  This is where we want to aim.
+			 */
+			union vec3 p, d, direction, right;
+			union quat new_orientation;
+			planet = &go[i];
+			p.v.x = o->x - planet->x;
+			p.v.y = o->y - planet->y;
+			p.v.z = o->z - planet->z;
+			vec3_normalize_self(&p);
+			vec3_mul_self(&p, planet->tsd.planet.radius * STANDARD_ORBIT_RADIUS_FACTOR);
+			d.v.x = o->vx;
+			d.v.y = o->vy;
+			d.v.z = o->vz;
+			vec3_add_self(&d, &p);
+			vec3_normalize_self(&d);
+			vec3_mul_self(&d, planet->tsd.planet.radius * STANDARD_ORBIT_RADIUS_FACTOR);
+			vec3_sub_self(&d, &p);
+			vec3_normalize_self(&d);
+			vec3_mul_self(&d, planet->tsd.planet.radius * 2.5 / M_PI); /* 2.5 degrees */
+			vec3_add_self(&d, &p);
+			d.v.x += planet->x;
+			d.v.y += planet->y;
+			d.v.z += planet->z;
+
+			/* Compute new orientation to point us at d */
+			/* Calculate new desired orientation of ship pointing towards destination */
+			right.v.x = 1.0;
+			right.v.y = 0.0;
+			right.v.z = 0.0;
+
+			direction.v.x = d.v.x - o->x;
+			direction.v.y = d.v.y - o->y;
+			direction.v.z = d.v.z - o->z;
+			vec3_normalize_self(&direction);
+
+			quat_from_u2v(&new_orientation, &right, &direction, NULL);
+
+			o->tsd.ship.computer_desired_orientation = new_orientation;
+			o->tsd.ship.computer_steering_time_left = 10; /* let the computer steer */
+		}
+	}
+skip_standard_orbit:
+
+	if (o->tsd.ship.computer_steering_time_left > 0) {
+		float time = (COMPUTER_STEERING_TIME - o->tsd.ship.computer_steering_time_left) / COMPUTER_STEERING_TIME;
+		union quat new_orientation;
+		float slerp_power_factor = 0.3 * (float) (o->tsd.ship.power_data.maneuvering.i) / 255.0;
+
+		quat_slerp(&new_orientation, &o->orientation, &o->tsd.ship.computer_desired_orientation,
+				time * slerp_power_factor);
+		o->orientation = new_orientation;
+		o->tsd.ship.computer_steering_time_left--;
+	}
+
+	/* Apply current rotational velocities... (player's input comes into play via this path) */
 	quat_apply_relative_yaw_pitch_roll(&o->orientation,
 			o->tsd.ship.yaw_velocity,
 			o->tsd.ship.pitch_velocity,
@@ -4615,10 +5372,14 @@ static void update_player_position_and_velocity(struct snis_entity *o)
 	o->tsd.ship.in_secure_area = 0;  /* player_collision_detection fills this in. */
 	space_partition_process(space_partition, o, o->x, o->z, o,
 				player_collision_detection);
-	if (o->tsd.ship.in_secure_area == 0 && previous_security > 0)
-		snis_queue_add_sound(LEAVING_SECURE_AREA, ROLE_SOUNDSERVER, o->id);
-	if (o->tsd.ship.in_secure_area > 0 && previous_security == 0)
-		snis_queue_add_sound(ENTERING_SECURE_AREA, ROLE_SOUNDSERVER, o->id);
+	if (o->tsd.ship.in_secure_area == 0 && previous_security > 0) {
+		/* snis_queue_add_sound(LEAVING_SECURE_AREA, ROLE_SOUNDSERVER, o->id); */
+		snis_queue_add_text_to_speech("Leaving high security area.", ROLE_TEXT_TO_SPEECH, o->id);
+	}
+	if (o->tsd.ship.in_secure_area > 0 && previous_security == 0) {
+		/* snis_queue_add_sound(ENTERING_SECURE_AREA, ROLE_SOUNDSERVER, o->id); */
+		snis_queue_add_text_to_speech("Entering high security area.", ROLE_TEXT_TO_SPEECH, o->id);
+	}
 }
 
 static int calc_sunburn_damage(struct snis_entity *o, struct damcon_data *d,
@@ -5127,6 +5888,11 @@ static void starbase_move(struct snis_entity *o)
 	}
 }
 
+static void warpgate_move(struct snis_entity *o)
+{
+	o->timestamp = universe_timestamp;
+}
+
 static void explosion_move(struct snis_entity *o)
 {
 	if (o->alive > 0)
@@ -5504,7 +6270,10 @@ static void init_player(struct snis_entity *o, int clear_cargo_bay, float *charg
 	o->tsd.ship.ncargo_bays = 8;
 	o->tsd.ship.passenger_berths = 2;
 	o->tsd.ship.mining_bots = 1;
+	o->tsd.ship.orbiting_object_id = 0xffffffff;
 	o->tsd.ship.nav_damping_suppression = 0.0;
+	quat_init_axis(&o->tsd.ship.computer_desired_orientation, 0, 1, 0, 0);
+	o->tsd.ship.computer_steering_time_left = 0;
 	if (clear_cargo_bay) {
 		/* The clear_cargo_bay param is a stopgap until real docking code
 		 * is done.
@@ -5532,7 +6301,7 @@ static void init_player(struct snis_entity *o, int clear_cargo_bay, float *charg
 	}
 }
 
-static void respawn_player(struct snis_entity *o)
+static void respawn_player(struct snis_entity *o, uint8_t warpgate_number)
 {
 	int b, i, found;
 	double x, y, z, a1, a2, rf;
@@ -5542,6 +6311,19 @@ static void respawn_player(struct snis_entity *o)
 		mt = mtwist_init(mtwist_seed);
 
 	/* Find a friendly location to respawn... */
+	if (warpgate_number != (uint8_t) -1) {
+		for (i = 0; i <= snis_object_pool_highest_object(pool); i++) {
+			struct snis_entity *f = &go[i];
+			if (!f->alive || f->type != OBJTYPE_WARPGATE)
+				continue;
+			if (f->tsd.warpgate.warpgate_number != warpgate_number)
+				continue;
+			/* put player near at gate */
+			set_object_location(o, f->x, f->y, f->z);
+			goto finished;
+		}
+	}
+
 	found = 0;
 	for (i = 0; i <= snis_object_pool_highest_object(pool); i++) {
 		struct snis_entity *f = &go[i];
@@ -5578,6 +6360,8 @@ static void respawn_player(struct snis_entity *o)
 		set_object_location(o, x, y, z);
 		o->tsd.ship.in_secure_area = 0;
 	}
+
+finished:
 	/* Stop any warp that might be in progress */
 	b = lookup_bridge_by_shipid(o->id);
 	if (b >= 0)
@@ -5595,14 +6379,14 @@ static void respawn_player(struct snis_entity *o)
 	o->alive = 1;
 }
 
-static int add_player(double x, double z, double vx, double vz, double heading)
+static int add_player(double x, double z, double vx, double vz, double heading, uint8_t warpgate_number)
 {
 	int i;
 
 	i = add_generic_object(x, 0.0, z, vx, 0.0, vz, heading, OBJTYPE_SHIP1);
 	if (i < 0)
 		return i;
-	respawn_player(&go[i]);
+	respawn_player(&go[i], warpgate_number);
 	return i;
 }
 
@@ -5657,6 +6441,7 @@ static int add_ship(int faction, int auto_respawn)
 	go[i].tsd.ship.nai_entries = 0;
 	memset(go[i].tsd.ship.ai, 0, sizeof(go[i].tsd.ship.ai));
 	go[i].tsd.ship.lifeform_count = ship_type[go[i].tsd.ship.shiptype].crew_max;
+	go[i].tsd.ship.tractor_beam = 0xffffffff; /* turn off tractor beam */
 	memset(&go[i].tsd.ship.damage, 0, sizeof(go[i].tsd.ship.damage));
 	memset(&go[i].tsd.ship.power_data, 0, sizeof(go[i].tsd.ship.power_data));
 	go[i].tsd.ship.braking_factor = 1.0f;
@@ -5666,6 +6451,9 @@ static int add_ship(int faction, int auto_respawn)
 	go[i].tsd.ship.ncargo_bays = 0;
 	go[i].tsd.ship.home_planet = choose_ship_home_planet();
 	go[i].tsd.ship.auto_respawn = (uint8_t) auto_respawn;
+	quat_init_axis(&go[i].tsd.ship.computer_desired_orientation, 0, 1, 0, 0);
+	go[i].tsd.ship.computer_steering_time_left = 0;
+	go[i].tsd.ship.orbiting_object_id = 0xffffffff;
 	memset(go[i].tsd.ship.cargo, 0, sizeof(go[i].tsd.ship.cargo));
 	if (faction >= 0 && faction < nfactions())
 		go[i].sdata.faction = faction;
@@ -6281,10 +7069,25 @@ static int add_explosion(double x, double y, double z, uint16_t velocity,
 static int lookup_by_id(uint32_t id)
 {
 	int i;
+	const int cachebits = 13;
+	const int cachesize = 1 << cachebits;
+	const int cachemask = cachesize - 1;
+	static int *cache = NULL;
+
+	if (cache == NULL) {
+		cache = malloc(sizeof(int) * cachesize);
+		memset(cache, -1, sizeof(int) * cachesize);
+	}
+
+	i = cache[id & cachemask];
+	if (i != -1 && go[i].id == id)
+		return i;
 
 	for (i = 0; i <= snis_object_pool_highest_object(pool); i++)
-		if (go[i].id == id)
+		if (go[i].id == id) {
+			cache[id & cachemask] = i;
 			return i;
+		}
 	return -1;
 }
 
@@ -6788,6 +7591,11 @@ static int choose_contraband(void)
 	return -1;
 }
 
+static int has_atmosphere(int i)
+{
+	return (strcmp(solarsystem_assets->planet_type[i], "rocky") != 0);
+}
+
 static int add_planet(double x, double y, double z, float radius, uint8_t security)
 {
 	int i;
@@ -6812,6 +7620,9 @@ static int add_planet(double x, double y, double z, float radius, uint8_t securi
 	go[i].tsd.planet.description_seed = snis_rand();
 	go[i].tsd.planet.radius = radius;
 	go[i].tsd.planet.ring = snis_randn(100) < 50;
+	go[i].tsd.planet.solarsystem_planet_type = (uint8_t) (go[i].id % solarsystem_assets->nplanet_textures);
+	go[i].tsd.planet.has_atmosphere = has_atmosphere(go[i].tsd.planet.solarsystem_planet_type);
+	go[i].tsd.planet.ring_selector = snis_randn(256);
 	go[i].tsd.planet.security = security;
 	go[i].tsd.planet.contraband = choose_contraband();
 
@@ -6969,6 +7780,62 @@ static void add_wormholes(void)
 	}
 }
 
+static int add_warpgate(double x, double y, double z,
+			double vx, double vz, double heading, int n, uint32_t assoc_planet_id)
+{
+	int i;
+
+	i = add_generic_object(x, y, z, vx, 0.0, vz, heading, OBJTYPE_WARPGATE);
+	if (i < 0)
+		return i;
+	if (n < 0)
+		n = -n;
+	n %= 99;
+	go[i].move = warpgate_move;
+	go[i].type = OBJTYPE_WARPGATE;
+	go[i].sdata.shield_strength = 255;
+	go[i].tsd.warpgate.warpgate_number = n;
+	sprintf(go[i].tsd.starbase.name, "WG-%02d", n);
+	sprintf(go[i].sdata.name, "WG-%02d", n);
+	return i;
+}
+
+static void add_warpgates(void)
+{
+	int i, j;
+	double x, y, z;
+	uint32_t assoc_planet_id;
+
+	for (i = 0; i < NWARPGATES; i++) {
+		int p = 0;
+		int found = 0;
+		for (j = 0; j <= snis_object_pool_highest_object(pool); j++) {
+			if (go[j].type == OBJTYPE_PLANET)
+				p++;
+			if (p == i + 1) {
+				float dx, dy, dz;
+				random_point_on_sphere(go[j].tsd.planet.radius * 1.3 + 400.0f +
+						snis_randn(400), &dx, &dy, &dz);
+				x = go[j].x + dx;
+				y = go[j].y + dy;
+				z = go[j].z + dz;
+				found = 1;
+				assoc_planet_id = go[j].id;
+				break;
+			}
+		}
+		if (!found)  {
+			/* If we get here, it's a bug... */
+			printf("Nonfatal bug at %s:%d\n", __FILE__, __LINE__);
+			x = ((double) snis_randn(1000)) * XKNOWN_DIM / 1000.0;
+			y = ((double) snis_randn(1000) - 500.0) * YKNOWN_DIM / 1000.0;
+			z = ((double) snis_randn(1000)) * ZKNOWN_DIM / 1000.0;
+			assoc_planet_id = (uint32_t) -1;
+		}
+		add_warpgate(x, y, z, 0.0, 0.0, 0.0, i, assoc_planet_id);
+	}
+}
+
 static void add_eships(void)
 {
 	int i;
@@ -7101,6 +7968,7 @@ static void make_universe(void)
 	add_asteroids();
 	add_planets();
 	add_starbases();
+	add_warpgates();
 	add_wormholes();
 	add_eships();
 	add_enforcers();
@@ -7145,11 +8013,57 @@ static void add_damcon_robot(struct damcon_data *d)
 		return;
 	d->robot = &d->o[i];
 	d->robot->tsd.robot.cargo_id = ROBOT_CARGO_EMPTY;
+	d->robot->tsd.robot.short_term_goal_x = 50.0;
+	d->robot->tsd.robot.short_term_goal_y = 50.0;
+	d->robot->tsd.robot.long_term_goal_x = -1.0;
+	d->robot->tsd.robot.long_term_goal_y = -1.0;
+	d->robot->tsd.robot.robot_state = DAMCON_ROBOT_DECIDE_LTG;
+	d->robot->tsd.robot.repair_socket_id = ROBOT_CARGO_EMPTY;
+}
+
+static int inside_damcon_system(struct damcon_data *d, int x, int y)
+{
+	int i;
+	const int w = 270; /* These must match placeholder-system-points.h */
+	const int h = 180 / 2;
+
+	for (i = 0; i <= snis_object_pool_highest_object(d->pool); i++) {
+		switch (d->o[i].type) {
+		case DAMCON_TYPE_SHIELDSYSTEM:
+		case DAMCON_TYPE_IMPULSE:
+		case DAMCON_TYPE_WARPDRIVE:
+		case DAMCON_TYPE_MANEUVERING:
+		case DAMCON_TYPE_PHASERBANK:
+		case DAMCON_TYPE_SENSORARRAY:
+		case DAMCON_TYPE_COMMUNICATIONS:
+		case DAMCON_TYPE_TRACTORSYSTEM:
+		case DAMCON_TYPE_REPAIR_STATION:
+			break;
+		default:
+			continue;
+		}
+		if (x >= d->o[i].x && x <= d->o[i].x + w &&
+			y >= d->o[i].y - h && y <= d->o[i].y + h)
+			return 1;
+	}
+	return 0;
+}
+
+static int add_damcon_waypoint(struct damcon_data *d, int x, int y)
+{
+	if (inside_damcon_system(d, x, y)) /* reject waypoints robot can't reach */
+		return -1;
+	if (x < -DAMCONXDIM / 2 || x > DAMCONXDIM / 2 ||
+		y < -DAMCONYDIM / 2  || y > DAMCONYDIM / 2) /* reject waypoints outside damcon area */
+		return -1;
+	return add_generic_damcon_object(d, x, y, DAMCON_TYPE_WAYPOINT, NULL);
 }
 
 /* offsets for sockets... */
-static int dcxo[] = { 20, 160, 205, 160, 20 };
-static int dcyo[] = { -65, -65, 0, 65, 65 };
+static const int dcxo[] = { 20, 160, 205, 160, 20 };
+static const int dcyo[] = { -65, -65, 0, 65, 65 };
+static const int socket_waypoint_xoff[] = { -70, 0, 70, 0 };
+static const int socket_waypoint_yoff[] = { 0, 90, 0, -90 };
 
 static void add_damcon_sockets(struct damcon_data *d, int x, int y,
 				uint8_t system, int left_side)
@@ -7251,6 +8165,168 @@ static void add_damcon_parts(struct damcon_data *d)
 {
 }
 
+static struct snis_damcon_entity *find_nth_waypoint(struct damcon_data *d, int n)
+{
+	int i;
+
+	for (i = 0; i <= snis_object_pool_highest_object(d->pool); i++) {
+		if (d->o[i].type != DAMCON_TYPE_WAYPOINT)
+			continue;
+		if (d->o[i].tsd.waypoint.n == n)
+			return &d->o[i];
+	}
+	return NULL;
+}
+
+/******************************************************************************
+
+The waypoint_data below describes the following network of waypoints:
+
+    ------------------------------------------------------------------------
+    |                                                                      |
+    |           0 ---------------------- 1 ------------------ 2            |
+    |         /    \                  /  |  \              /     \         |
+    |       24     25             /      |      \        26        27      |
+    |                          40 ------ 3 ------ 41                       |
+    |                              \     |      /                          |
+    |                                  \ |   /                             |
+    |           4 ---------------------- 5 ------------------- 6           |
+    |         /   \                   /  |   \               /   \         |
+    |       28      29             /     |      \          30      31      |
+    |                          42 ------ 7 ------ 43                       |
+    |                              \     |       /                         |
+    |                                 \  |    /                            |
+    |           8 ---------------------- 9 ------------------- 10          |
+    |         /   \                  /   |  \                /   \         |
+    |       32     33              /     |    \            34     35       |
+    |                          44 ------ 11 ----- 45                       |
+    |                             \      |     /                           |
+    |                                \   |  /                              |
+    |           12---------------------- 13------------------- 14          |
+    |         /   \                  /   |  \                /   \         |
+    |       36     37             /      |     \           38     39       |
+    |                          46 ------ 15 ----- 47                       |
+    |                             \      |     /                           |
+    |                                \   |  /                              |
+    |           16---------------------- 17------------------- 18          |
+    |            |                     /     \                  |          |
+    |            |                  /           \               |          |
+    |            |              48               49             |          |
+    |            |                                              |          |
+    |           19                                             20          |
+    |            |                                              |          |
+    |            |                                              |          |
+    |            |                                              |          |
+    |           21---------------------- 22------------------- 23          |
+    |                                                                      |
+    ------------------------------------------------------------------------
+*******************************************************************************/
+
+static struct waypoint_data_entry {
+	int n, x, y;
+	int neighbor[10];
+} damcon_waypoint_data[] = {
+#define WAYPOINTBASE -850
+#define WAYPOINTY(n) (WAYPOINTBASE + n * 170)
+	{  0, -256, WAYPOINTY(0), { 1, 24, 25, -1 }, },
+	{  1,    0, WAYPOINTY(0), { 0, 2, 3, 40, 41, -1  }, },
+	{  2,  256, WAYPOINTY(0), { 1, 26, 27, -1 }, },
+	{  3,    0, WAYPOINTY(1), { 1, 5, 40, 41, -1 }, },
+	{  4, -256, WAYPOINTY(2), { 5, 28, 29, -1 }, },
+	{  5,    0, WAYPOINTY(2), { 3, 4, 6, 7, 40, 45, 42, 43, -1  }, },
+	{  6,  256, WAYPOINTY(2), { 5, 30, 31, -1 }, },
+	{  7,    0, WAYPOINTY(3), { 5, 9, 42, 43, -1 }, },
+	{  8, -256, WAYPOINTY(4), { 9, 32, 33, -1 }, },
+	{  9,    0, WAYPOINTY(4), { 7, 8, 10, 11, 42, 43, 44, 45, -1 }, },
+	{ 10,  256, WAYPOINTY(4), { 9, 34, 35, -1 }, },
+	{ 11,    0, WAYPOINTY(5), { 9, 13, 44, 45, -1 }, },
+	{ 12, -256, WAYPOINTY(6), { 13, 36, 37, -1 }, },
+	{ 13,    0, WAYPOINTY(6), { 11, 12, 14, 15, 44, 45, 46, 47, -1 }, },
+	{ 14,  256, WAYPOINTY(6), { 13, 38, 39, -1 }, },
+	{ 15,    0, WAYPOINTY(7), { 13, 17, 46, 47, -1 }, },
+	{ 16, -256, WAYPOINTY(8), { 17, 19, -1 }, },
+	{ 17,    0, WAYPOINTY(8), { 15, 16, 18, 46, 47, 48, 49, -1 }, },
+	{ 18,  256, WAYPOINTY(8), { 17, 20, -1 }, },
+	{ 19, -256, WAYPOINTY(9), { 16, 21, -1 }, },
+	{ 20,  256, WAYPOINTY(9), { 18, 23, -1 }, },
+	{ 21, -256, WAYPOINTY(10), { 19, 22, -1 }, },
+	{ 22,    0, WAYPOINTY(10), { 21, 23, -1 }, },
+	{ 23,  256, WAYPOINTY(10), { 20, 22, -1 }, },
+	{ 24, -340, WAYPOINTY(0) + 50, { 0, -1 }, },
+	{ 25, -220, WAYPOINTY(0) + 50, { 0, -1 }, },
+	{ 26,  340, WAYPOINTY(0) + 50, { 2, -1 }, },
+	{ 27,  220, WAYPOINTY(0) + 50, { 2, -1 }, },
+	{ 28, -340, WAYPOINTY(2) + 50, { 4, -1 }, },
+	{ 29, -220, WAYPOINTY(2) + 50, { 4, -1 }, },
+	{ 30,  340, WAYPOINTY(2) + 50, { 6, -1 }, },
+	{ 31,  220, WAYPOINTY(2) + 50, { 6, -1 }, },
+	{ 32, -340, WAYPOINTY(4) + 50, { 8, -1 }, },
+	{ 33, -220, WAYPOINTY(4) + 50, { 8, -1 }, },
+	{ 34,  340, WAYPOINTY(4) + 50, { 10, -1 }, },
+	{ 35,  220, WAYPOINTY(4) + 50, { 10, -1 }, },
+	{ 36, -340, WAYPOINTY(6) + 50, { 12, -1 }, },
+	{ 37, -220, WAYPOINTY(6) + 50, { 12, -1 }, },
+	{ 38,  340, WAYPOINTY(6) + 50, { 14, -1 }, },
+	{ 39,  220, WAYPOINTY(6) + 50, { 14, -1 }, },
+	{ 40, -100, WAYPOINTY(1), { 3, 1, 5, 42, -1 }, },
+	{ 41,  100, WAYPOINTY(1), { 3, 1, 5, 43, -1 }, },
+	{ 42, -100, WAYPOINTY(3), { 7, 5, 9, -1 }, },
+	{ 43,  100, WAYPOINTY(3), { 7, 5, 9, -1 }, },
+	{ 44, -100, WAYPOINTY(5), { 11, 9, 13, -1 }, },
+	{ 45,  100, WAYPOINTY(5), { 11, 9, 13, -1 }, },
+	{ 46, -100, WAYPOINTY(7), { 15, 13, 17, -1 }, },
+	{ 47,  100, WAYPOINTY(7), { 15, 13, 17, -1 }, },
+	{ 48, -60, WAYPOINTY(8) + 40, { 17, -1 }, },
+	{ 49,  60, WAYPOINTY(8) + 40, { 17, -1 }, },
+};
+
+static void __attribute__((unused)) print_waypoint_table(struct damcon_data *d, int tablesize)
+{
+	int i, j;
+	struct snis_damcon_entity *w;
+
+	printf("--- Begin Travel table ------------------\n");
+	for (i = 0; i < tablesize; i++) {
+		struct waypoint_data_entry *e = &damcon_waypoint_data[i];
+		w = find_nth_waypoint(d, e->n);
+		for (j = 0; e->neighbor[j] > 0; j++) {
+			printf("    %d[%d]) --> %d\n", w->tsd.waypoint.n, j,
+				w->tsd.waypoint.neighbor[j] ? w->tsd.waypoint.neighbor[j]->tsd.waypoint.n : -1);
+		}
+	}
+	printf("--- End Travel table ------------------\n");
+
+}
+
+static void add_damcon_waypoints(struct damcon_data *d)
+{
+	int i, j, rc;
+	struct snis_damcon_entity *w, *n;
+
+	for (i = 0; i < ARRAYSIZE(damcon_waypoint_data); i++) {
+		struct waypoint_data_entry *e = &damcon_waypoint_data[i];
+		rc = add_damcon_waypoint(d, e->x, e->y);
+		if (rc < 0) {
+			fprintf(stderr, "%s: Failed to add waypoint, i = %d at %s:%d\n",
+				logprefix(), i, __FILE__, __LINE__);
+			break;
+		}
+		d->o[rc].tsd.waypoint.n = e->n;
+	}
+	for (i = 0; i < ARRAYSIZE(damcon_waypoint_data); i++) {
+		struct waypoint_data_entry *e = &damcon_waypoint_data[i];
+		w = find_nth_waypoint(d, e->n);
+		for (j = 0; e->neighbor[j] >= 0; j++) {
+			n = find_nth_waypoint(d, e->neighbor[j]);
+			if (!n) {
+				fprintf(stderr, "%s: n is unexpectedly null at %s:%d.\n",
+					logprefix(), __FILE__, __LINE__);
+			}
+			w->tsd.waypoint.neighbor[j] = n;
+		}
+	}
+}
+
 static void populate_damcon_arena(struct damcon_data *d)
 {
 	snis_object_pool_setup(&d->pool, MAXDAMCONENTITIES);
@@ -7258,6 +8334,7 @@ static void populate_damcon_arena(struct damcon_data *d)
 	add_damcon_systems(d);
 	add_damcon_labels(d);
 	add_damcon_parts(d);
+	add_damcon_waypoints(d);
 }
 
 typedef void (*thrust_function)(struct game_client *c, int thrust);
@@ -7313,6 +8390,7 @@ static void do_yaw(struct game_client *c, int yaw)
 	double max_yaw_velocity =
 		(MAX_YAW_VELOCITY * ship->tsd.ship.power_data.maneuvering.i) / 255;
 
+	ship->tsd.ship.computer_steering_time_left = 0; /* cancel any computer steering in progress */
 	do_generic_yaw(&ship->tsd.ship.yaw_velocity, yaw, max_yaw_velocity,
 			YAW_INCREMENT, YAW_INCREMENT_FINE);
 }
@@ -7323,6 +8401,7 @@ static void do_pitch(struct game_client *c, int pitch)
 	double max_pitch_velocity =
 		(MAX_PITCH_VELOCITY * ship->tsd.ship.power_data.maneuvering.i) / 255;
 
+	ship->tsd.ship.computer_steering_time_left = 0; /* cancel any computer steering in progress */
 	do_generic_yaw(&ship->tsd.ship.pitch_velocity, pitch, max_pitch_velocity,
 			PITCH_INCREMENT, PITCH_INCREMENT_FINE);
 }
@@ -7333,6 +8412,7 @@ static void do_roll(struct game_client *c, int roll)
 	double max_roll_velocity =
 		(MAX_ROLL_VELOCITY * ship->tsd.ship.power_data.maneuvering.i) / 255;
 
+	ship->tsd.ship.computer_steering_time_left = 0; /* cancel any computer steering in progress */
 	do_generic_yaw(&ship->tsd.ship.roll_velocity, roll, max_roll_velocity,
 			ROLL_INCREMENT, ROLL_INCREMENT_FINE);
 }
@@ -7517,11 +8597,12 @@ static int process_demon_move_object(struct game_client *c)
 	struct snis_entity *o;
 	unsigned char buffer[sizeof(struct demon_move_object_packet)];
 	uint32_t oid;
-	double dx, dz;
+	double dx, dy, dz;
 	int i, rc;
 
-	rc = read_and_unpack_buffer(c, buffer, "wSS", &oid,
+	rc = read_and_unpack_buffer(c, buffer, "wSSS", &oid,
 			&dx, (int32_t) UNIVERSE_DIM,
+			&dy, (int32_t) UNIVERSE_DIM,
 			&dz, (int32_t) UNIVERSE_DIM);
 	if (rc)
 		return rc;
@@ -7534,7 +8615,7 @@ static int process_demon_move_object(struct game_client *c)
 	o = &go[i];
 	if (o->type == OBJTYPE_SHIP2 || o->type == OBJTYPE_SHIP1)
 		add_warp_effect(o->id, o->x, o->y, o->z, o->x + dx, o->y, o->z + dz);
-	set_object_location(o, o->x + dx, o->y, o->z + dz);
+	set_object_location(o, o->x + dx, o->y + dy, o->z + dz);
 	o->timestamp = universe_timestamp;
 out:
 	pthread_mutex_unlock(&universe_mutex);
@@ -7544,6 +8625,43 @@ out:
 static int process_request_robot_thrust(struct game_client *c)
 {
 	return process_generic_request_thrust(c, do_robot_thrust);
+}
+
+static int process_request_robot_cmd(struct game_client *c)
+{
+	double x, y;
+	struct damcon_data *d;
+	int rc;
+	uint8_t subcmd;
+	unsigned char buffer[30];
+
+	rc = read_and_unpack_buffer(c, buffer, "b", &subcmd);
+	if (rc < 0)
+		return rc;
+	switch (subcmd) {
+	case OPCODE_ROBOT_SUBCMD_STG:
+	case OPCODE_ROBOT_SUBCMD_LTG:
+		rc = read_and_unpack_buffer(c, buffer, "SS",
+					&x, (int32_t) DAMCONXDIM, &y, (int32_t) DAMCONYDIM);
+		if (rc < 0)
+			return rc;
+		pthread_mutex_lock(&universe_mutex);
+		d = &bridgelist[c->bridge].damcon;
+		if (subcmd == OPCODE_ROBOT_SUBCMD_STG) {
+			d->robot->tsd.robot.short_term_goal_x = x;
+			d->robot->tsd.robot.short_term_goal_y = y;
+		} else {
+			d->robot->tsd.robot.long_term_goal_x = x;
+			d->robot->tsd.robot.long_term_goal_y = y;
+		}
+		if (d->robot->tsd.robot.autonomous_mode == DAMCON_ROBOT_MANUAL_MODE)
+			d->robot->tsd.robot.autonomous_mode = DAMCON_ROBOT_SEMI_AUTONOMOUS;
+		pthread_mutex_unlock(&universe_mutex);
+		break;
+	default:
+		return -1;
+	}
+	return 0;
 }
 
 static void send_ship_sdata_packet(struct game_client *c, struct ship_sdata_packet *sip);
@@ -7694,6 +8812,7 @@ static int process_role_onscreen(struct game_client *c)
 	send_packet_to_all_clients_on_a_bridge(c->shipid, 
 			packed_buffer_new("bb", OPCODE_ROLE_ONSCREEN, new_displaymode),
 			ROLE_MAIN);
+	bridgelist[c->bridge].current_displaymode = new_displaymode;
 	return 0;
 }
 
@@ -7756,6 +8875,16 @@ static int process_request_weapons_yaw_pitch(struct game_client *c)
 	return 0;
 }
 
+static void science_select_target(struct game_client *c, uint32_t id)
+{
+	/* just turn it around and fan it out to all the right places */
+	send_packet_to_all_clients_on_a_bridge(c->shipid,
+			packed_buffer_new("bw", OPCODE_SCI_SELECT_TARGET, id),
+			ROLE_SCIENCE);
+	/* remember sci selection for retargeting mining bot */
+	bridgelist[c->bridge].science_selection = id;
+}
+
 static int process_sci_select_target(struct game_client *c)
 {
 	unsigned char buffer[10];
@@ -7765,12 +8894,7 @@ static int process_sci_select_target(struct game_client *c)
 	rc = read_and_unpack_buffer(c, buffer, "w", &id);
 	if (rc)
 		return rc;
-	/* just turn it around and fan it out to all the right places */
-	send_packet_to_all_clients_on_a_bridge(c->shipid, 
-			packed_buffer_new("bw", OPCODE_SCI_SELECT_TARGET, id),
-			ROLE_SCIENCE);
-	/* remember sci selection for retargeting mining bot */
-	bridgelist[c->bridge].science_selection = id;
+	science_select_target(c, id);
 	return 0;
 }
 
@@ -7826,6 +8950,7 @@ static void meta_comms_help(char *name, struct game_client *c, char *txt)
 		"  COMMANDS",
 		"  * COMMANDS ARE PRECEDED BY FORWARD SLASH ->  /",
 		"  * /help",
+		"  * /computer <english request for computer>",
 		"  * /channel channel-number - change current channel",
 		"  * /eject cargo-bay-number - eject cargo",
 		"  * /hail ship-name - hail ship or starbase on current channel",
@@ -7983,7 +9108,7 @@ static void meta_comms_channel(char *name, struct game_client *c, char *txt)
 	uint32_t newchannel;
 	char msg[100];
 
-	rc = sscanf(txt, "/channel %u\n", &newchannel);
+	rc = sscanf(txt, "%*[/chanel] %u\n", &newchannel);
 	if (rc != 1) {
 		snprintf(msg, sizeof(msg), "INVALID CHANNEL - CURRENT CHANNEL %u",
 				bridgelist[c->bridge].comms_channel);
@@ -8738,6 +9863,89 @@ void npc_menu_item_request_dock(struct npc_menu_item *item,
 	starbase_grant_docker_permission(sb, o->id, b, npcname, ch);
 }
 
+static void warp_gate_ticket_buying_npc_bot(struct snis_entity *o, int bridge,
+		char *name, char *msg)
+{
+	struct ssgl_game_server *gameserver = NULL;
+	int selection, rc, i, nservers;
+	char buf[100];
+	int ch = bridgelist[bridge].npcbot.channel;
+
+	if (server_tracker_get_server_list(server_tracker, &gameserver, &nservers) != 0
+		|| nservers <= 0) {
+		send_comms_packet(name, ch, "NO WARP-GATE TICKETS AVAILABLE\n");
+		return;
+	}
+	send_comms_packet(name, ch, "WARP-GATE TICKETS:\n");
+	send_comms_packet(name, ch, "------------------\n");
+	int our_ss_index = 0;
+	int index = 1;
+	for (i = 0; i < nservers;) {
+		int len = strlen(solarsystem_name);
+		if (len > LOCATIONSIZE)
+			len = LOCATIONSIZE;
+
+		/* Do not list the solarsystem we're already in */
+		if (strncasecmp(gameserver[i].location, solarsystem_name, len) != 0) {
+			sprintf(buf, "%3d: %s\n", index, gameserver[i].location);
+			send_comms_packet(name, ch, buf);
+			index++;
+		} else {
+			/* Remember which index corresponds to our solar system */
+			our_ss_index = i + 1;
+		}
+		i++;
+	}
+	send_comms_packet(name, ch, "------------------\n");
+	send_comms_packet(name, ch, "  0: PREVIOUS MENU\n");
+	rc = sscanf(msg, "%d", &selection);
+	if (rc != 1)
+		selection = -1;
+	if (selection == 0) {
+		bridgelist[bridge].npcbot.special_bot = NULL; /* deactivate warpgate ticket bot */
+		free(gameserver);
+		send_to_npcbot(bridge, name, ""); /* poke generic bot so he says something */
+		return;
+	}
+	/* Can't buy a ticket to solarsystem we're in */
+	if (selection >= our_ss_index && our_ss_index > 0)
+		selection++;
+	if (selection < 1 || selection > nservers) {
+		free(gameserver);
+		return;
+	}
+	if (bridgelist[bridge].warp_gate_ticket.ipaddr == 0) { /* no current ticket held */
+		sprintf(buf, "WARP-GATE TICKET TO %s BOOKED\n", gameserver[selection - 1].location);
+		send_comms_packet(name, ch, buf);
+	} else {
+		sprintf(buf, "WARP-GATE TICKET TO %s EXCHANGED\n",
+			bridgelist[bridge].warp_gate_ticket.location);
+		send_comms_packet(name, ch, buf);
+		sprintf(buf, "FOR WARP-GATE TICKET TO %s\n", gameserver[selection - 1].location);
+		send_comms_packet(name, ch, buf);
+	}
+	bridgelist[bridge].warp_gate_ticket = gameserver[selection - 1];
+	free(gameserver);
+}
+
+void npc_menu_item_warp_gate_tickets(struct npc_menu_item *item,
+				char *npcname, struct npc_bot_state *botstate)
+{
+	struct snis_entity *o;
+	struct bridge_data *b = container_of(botstate, struct bridge_data, npcbot);
+	int i, bridge = b - bridgelist;
+
+	fprintf(stderr, "%s: npc_menu_item_warp_gate_tickets called for %s\n",
+			logprefix(), b->shipname);
+
+	i = lookup_by_id(b->shipid);
+	if (i < 0)
+		return;
+	o = &go[i];
+	botstate->special_bot = warp_gate_ticket_buying_npc_bot;
+	botstate->special_bot(o, bridge, npcname, "");
+}
+
 static void send_npc_menu(char *npcname,  int bridge)
 {
 	int i;
@@ -9048,6 +10256,15 @@ static void generic_npc_bot(struct snis_entity *o, int bridge, char *name, char 
 	}
 }
 
+static struct npc_menu_item *topmost_menu(struct npc_menu_item *m)
+{
+	if (!m)
+		return m;
+	if (!m->parent_menu)
+		return m;
+	return topmost_menu(m->parent_menu);
+}
+
 static void send_to_npcbot(int bridge, char *name, char *msg)
 {
 	int i;
@@ -9079,19 +10296,39 @@ static void send_to_npcbot(int bridge, char *name, char *msg)
 
 	switch (o->type) {
 	case OBJTYPE_STARBASE:
-		bridgelist[bridge].npcbot.current_menu = starbase_main_menu;
+		if (topmost_menu(bridgelist[bridge].npcbot.current_menu) != starbase_main_menu)
+			bridgelist[bridge].npcbot.current_menu = starbase_main_menu;
 		generic_npc_bot(o, bridge, name, msg);
 		break;
 	case OBJTYPE_SHIP2:
 		if (o->tsd.ship.ai[0].ai_mode != AI_MODE_MINING_BOT)
 			break;
-		bridgelist[bridge].npcbot.current_menu = mining_bot_main_menu;
+		if (topmost_menu(bridgelist[bridge].npcbot.current_menu) != mining_bot_main_menu)
+			bridgelist[bridge].npcbot.current_menu = mining_bot_main_menu;
 		generic_npc_bot(o, bridge, name, msg);
 		break;
 	default:
 		break;
 	}
 	return;
+}
+
+static void perform_natural_language_request(struct game_client *c, char *txt);
+static void meta_comms_computer(char *name, struct game_client *c, char *txt)
+{
+	char *duptxt;
+	char *x;
+
+	printf("meta_comms_computer, txt = '%s'\n", txt);
+	duptxt = strdup(txt);
+
+	x = index(duptxt, ' ');
+	if (x) {
+		x++;
+		if (*x != '\0')
+			perform_natural_language_request(c, x);
+	}
+	free(duptxt);
 }
 
 static void meta_comms_hail(char *name, struct game_client *c, char *txt)
@@ -9208,20 +10445,57 @@ static const struct meta_comms_data {
 	{ "/eject", meta_comms_eject },
 	{ "/about", meta_comms_about },
 	{ "/help", meta_comms_help },
+	{ "/computer", meta_comms_computer },
 };
 
 static void process_meta_comms_packet(char *name, struct game_client *c, char *txt)
 {
-	int i;
+	int i, j;
+	struct meta_comms_data const * mcd = NULL;
+	int current_match_length = 0;
+	int len2 = strlen(txt);
+	int limit;
+	int ambiguous = 1;
 
+	/* allow user to get away with typing enough of the command
+	 * name to resolve ambiguity
+	 */
 	for (i = 0; i < ARRAYSIZE(meta_comms); i++) {
 		int len = strlen(meta_comms[i].command);
-		if (strncasecmp(txt, meta_comms[i].command, len) == 0)  {
-			meta_comms[i].f(name, c, txt);
-			return;
+		if (len < len2)
+			limit = len;
+		else
+			limit = len2;
+
+		for (j = 0; j < limit; j++) {
+			if (toupper(txt[j]) == toupper(meta_comms[i].command[j])) {
+				if (j == len - 1 || j == len2 - 1) { /* exact match */
+					mcd = &meta_comms[i];
+					ambiguous = 0;
+					current_match_length = j;
+					goto match;
+				}
+				continue;
+			}
+			if (j > current_match_length) {
+				current_match_length = j;
+				ambiguous = 0;
+				mcd = &meta_comms[i];
+			} else {
+				if (j == current_match_length) {
+					ambiguous = 1;
+				}
+			}
+			break;
 		}
 	}
-	meta_comms_error(name, c, txt);
+
+match:
+
+	if (current_match_length > 1 && !ambiguous)
+		mcd->f(name, c, txt);
+	else
+		meta_comms_error(name, c, txt);
 }
 
 static int process_comms_transmission(struct game_client *c, int use_real_name)
@@ -9257,6 +10531,49 @@ static int process_comms_transmission(struct game_client *c, int use_real_name)
 		send_to_npcbot(c->bridge, name, txt);
 	return 0;
 }
+
+static int process_natural_language_request(struct game_client *c)
+{
+	unsigned char buffer[sizeof(struct comms_transmission_packet)];
+	char txt[256];
+	uint8_t subcommand, len;
+	int rc, b;
+	char *ship_name, *ch;
+
+	rc = read_and_unpack_buffer(c, buffer, "bb", &subcommand, &len);
+	if (rc)
+		return rc;
+	rc = snis_readsocket(c->socket, txt, len);
+	if (rc)
+		return rc;
+	txt[len] = '\0';
+	switch (subcommand) {
+	case OPCODE_NL_SUBCOMMAND_TEXT_REQUEST:
+		perform_natural_language_request(c, txt);
+		break;
+	case OPCODE_NL_SUBCOMMAND_TEXT_TO_SPEECH:
+		/* Assume the string is of the form "shipname: text to send" */
+		ch = index(txt, ':');
+		if (!ch)
+			return 0;
+		if (strlen(txt) - (ch - txt) <= 1) /* nothing after the colon */
+			return 0;
+		/* look up the bridge with the given ship name */
+		ship_name = txt;
+		*ch = '\0';
+		pthread_mutex_lock(&universe_mutex);
+		b = lookup_bridge_by_ship_name(ship_name);
+		pthread_mutex_unlock(&universe_mutex);
+		if (b < 0)
+			return 0;
+		snis_queue_add_text_to_speech(ch + 1, ROLE_TEXT_TO_SPEECH, bridgelist[b].shipid);
+		break;
+	default:
+		return -1;
+	}
+	return 0;
+}
+
 
 static void enscript_prologue(FILE *f)
 {
@@ -9663,6 +10980,32 @@ error:
 	return 0;
 }
 
+static int l_text_to_speech(lua_State *l)
+{
+	int i;
+	const double receiver_id = luaL_checknumber(l, 1);
+	const char *transmission = luaL_checkstring(l, 2);
+	struct snis_entity *receiver;
+
+	pthread_mutex_lock(&universe_mutex);
+	i = lookup_by_id(receiver_id);
+	if (i < 0)
+		goto error;
+	receiver = &go[i];
+	switch (receiver->type) {
+	case OBJTYPE_SHIP1:
+		pthread_mutex_unlock(&universe_mutex);
+		snis_queue_add_text_to_speech(transmission, ROLE_TEXT_TO_SPEECH, receiver->id);
+		return 0;
+	default:
+		goto error;
+		break;
+	}
+error:
+	pthread_mutex_unlock(&universe_mutex);
+	return 0;
+}
+
 static int l_get_object_name(lua_State *l)
 {
 	const double id = luaL_checknumber(l, 1);
@@ -10019,6 +11362,12 @@ static int process_mainscreen_view_mode(struct game_client *c)
 	return 0;
 }
 
+static void set_red_alert_mode(struct game_client *c, unsigned char new_alert_mode)
+{
+	send_packet_to_all_clients_on_a_bridge(c->shipid,
+			packed_buffer_new("bb", OPCODE_REQUEST_REDALERT, new_alert_mode), ROLE_ALL);
+}
+
 static int process_request_redalert(struct game_client *c)
 {
 	int rc;
@@ -10028,8 +11377,7 @@ static int process_request_redalert(struct game_client *c)
 	rc = read_and_unpack_buffer(c, buffer, "b", &new_alert_mode);
 	if (rc)
 		return rc;
-	send_packet_to_all_clients_on_a_bridge(c->shipid,
-			packed_buffer_new("bb", OPCODE_REQUEST_REDALERT, new_alert_mode), ROLE_ALL);
+	set_red_alert_mode(c, new_alert_mode);
 	return 0;
 }
 
@@ -10170,13 +11518,15 @@ static int l_clear_all(__attribute__((unused)) lua_State *l)
 
 static int process_create_item(struct game_client *c)
 {
-	unsigned char buffer[10];
+	unsigned char buffer[14];
 	unsigned char item_type;
-	double x, z, r;
+	double x, y, z, r;
 	int rc, i = -1;
 
-	rc = read_and_unpack_buffer(c, buffer, "bSS", &item_type,
-			&x, (int32_t) UNIVERSE_DIM, &z, (int32_t) UNIVERSE_DIM);
+	rc = read_and_unpack_buffer(c, buffer, "bSSS", &item_type,
+			&x, (int32_t) UNIVERSE_DIM,
+			&y, (int32_t) UNIVERSE_DIM,
+			&z, (int32_t) UNIVERSE_DIM);
 	if (rc)
 		return rc;
 
@@ -10186,29 +11536,29 @@ static int process_create_item(struct game_client *c)
 		i = add_ship(-1, 1);
 		break;
 	case OBJTYPE_STARBASE:
-		i = add_starbase(x, 0, z, 0, 0, 0, snis_randn(100), -1);
+		i = add_starbase(x, y, z, 0, 0, 0, snis_randn(100), -1);
 		break;
 	case OBJTYPE_PLANET:
 		r = (float) snis_randn(MAX_PLANET_RADIUS - MIN_PLANET_RADIUS) +
 					MIN_PLANET_RADIUS;
-		i = add_planet(x, 0.0, z, r, 0);
+		i = add_planet(x, y, z, r, 0);
 		break;
 	case OBJTYPE_ASTEROID:
-		i = add_asteroid(x, 0.0, z, 0.0, 0.0, 0.0);
+		i = add_asteroid(x, y, z, 0.0, 0.0, 0.0);
 		break;
 	case OBJTYPE_NEBULA:
 		r = (double) snis_randn(NEBULA_RADIUS) +
 				(double) MIN_NEBULA_RADIUS;
-		i = add_nebula(x, 0, z, 0, 0, 0, r);
+		i = add_nebula(x, y, z, 0, 0, 0, r);
 		break;
 	case OBJTYPE_SPACEMONSTER:
-		i = add_spacemonster(x, 0.0, z);
+		i = add_spacemonster(x, y, z);
 		break;
 	default:
 		break;
 	}
 	if (i >= 0)
-		set_object_location(&go[i], x, go[i].y, z);
+		set_object_location(&go[i], x, y, z);
 	pthread_mutex_unlock(&universe_mutex);
 	return 0;
 }
@@ -10252,6 +11602,7 @@ static int process_robot_auto_manual(struct game_client *c)
 	new_mode = !!new_mode;
 	d = &bridgelist[c->bridge].damcon;
 	d->robot->tsd.robot.autonomous_mode = new_mode;
+	d->robot->tsd.robot.robot_state = DAMCON_ROBOT_DECIDE_LTG;
 	d->robot->version++;
 	return 0;
 }
@@ -10454,20 +11805,112 @@ static int process_docking_magnets(struct game_client *c)
 	go[i].timestamp = universe_timestamp;
 	sound = go[i].tsd.ship.docking_magnets ? DOCKING_SYSTEM_ENGAGED : DOCKING_SYSTEM_DISENGAGED;
 	pthread_mutex_unlock(&universe_mutex);
-	snis_queue_add_sound(sound, ROLE_NAVIGATION, c->shipid);
+	/* snis_queue_add_sound(sound, ROLE_NAVIGATION, c->shipid); */
+	snis_queue_add_text_to_speech(sound == DOCKING_SYSTEM_ENGAGED ?
+				"Docking system engaged." : "Docking system disengaged",
+				ROLE_TEXT_TO_SPEECH, c->shipid);
 	return 0;
+}
+
+static int nl_find_nearest_object_of_type(uint32_t id, int objtype);
+
+/* Assumes universe lock is held, and releases it. */
+static void toggle_standard_orbit(struct game_client *c, struct snis_entity *ship)
+{
+	int planet_index;
+	struct snis_entity *planet;
+	double dx, dy, dz, d;
+
+	if (ship->tsd.ship.orbiting_object_id != 0xffffffff) {
+		ship->tsd.ship.orbiting_object_id = 0xffffffff;
+		ship->tsd.ship.computer_steering_time_left = 0; /* turn off computer steering */
+		pthread_mutex_unlock(&universe_mutex);
+		snis_queue_add_text_to_speech("Leaving standard orbit",
+					ROLE_TEXT_TO_SPEECH, c->shipid);
+		return;
+	}
+	/* Find nearest planet to ship */
+	planet_index = nl_find_nearest_object_of_type(c->shipid, OBJTYPE_PLANET);
+	if (planet_index < 0) { /* no planets around */
+		pthread_mutex_unlock(&universe_mutex);
+		snis_queue_add_text_to_speech("There are no nearby planets to orbit",
+					ROLE_TEXT_TO_SPEECH, c->shipid);
+		return;
+	}
+	planet = &go[planet_index];
+	dx = planet->x - ship->x;
+	dy = planet->y - ship->y;
+	dz = planet->z - ship->z;
+	d = sqrt(dx * dx + dy * dy + dz * dz);
+	if (d > planet->tsd.planet.radius * STANDARD_ORBIT_RADIUS_FACTOR * 3.00) {
+		pthread_mutex_unlock(&universe_mutex);
+		snis_queue_add_text_to_speech("We are too far from a planet to enter standard orbit",
+					ROLE_TEXT_TO_SPEECH, c->shipid);
+		printf("radius = %lf, d = %lf, limit = %lf\n", planet->tsd.planet.radius, d,
+			planet->tsd.planet.radius * STANDARD_ORBIT_RADIUS_FACTOR);
+		return;
+	}
+	ship->tsd.ship.orbiting_object_id = planet->id;
+	pthread_mutex_unlock(&universe_mutex);
+	snis_queue_add_text_to_speech("Entering standard orbit",
+				ROLE_TEXT_TO_SPEECH, c->shipid);
+	return;
+}
+
+static int process_standard_orbit(struct game_client *c)
+{
+	unsigned char buffer[10];
+	uint8_t v;
+	uint32_t id;
+	int i;
+	struct snis_entity *ship;
+
+	int rc = read_and_unpack_buffer(c, buffer, "wb", &id, &v);
+	if (rc)
+		return rc;
+	pthread_mutex_lock(&universe_mutex);
+	i = lookup_by_id(id);
+	if (i < 0) {
+		pthread_mutex_unlock(&universe_mutex);
+		return -1;
+	}
+	if (i != c->ship_index)
+		snis_log(SNIS_ERROR, "i != ship index at %s:%t\n", __FILE__, __LINE__);
+	ship = &go[i];
+	toggle_standard_orbit(c, ship);
+	return 0;
+}
+
+static int do_engage_warp_drive(struct snis_entity *o)
+{
+	int enough_oomph = ((double) o->tsd.ship.warpdrive / 255.0) > 0.075;
+	int b;
+	const union vec3 rightvec = { { 1.0f, 0.0f, 0.0f, } };
+	union vec3 warpvec;
+	double wfactor;
+
+	b = lookup_bridge_by_shipid(o->id);
+	if (b < 0) {
+		return 0;
+	}
+	if (enough_oomph) {
+		wfactor = ((double) o->tsd.ship.warpdrive / 255.0) * (XKNOWN_DIM / 2.0);
+		quat_rot_vec(&warpvec, &rightvec, &o->orientation);
+		bridgelist[b].warpx = o->x + wfactor * warpvec.v.x;
+		bridgelist[b].warpy = o->y + wfactor * warpvec.v.y;
+		bridgelist[b].warpz = o->z + wfactor * warpvec.v.z;
+		o->tsd.ship.warp_time = 85; /* 8.5 seconds */
+	}
+	return enough_oomph;
 }
 
 static int process_engage_warp(struct game_client *c)
 {
 	unsigned char buffer[10];
-	int b, i, rc;
+	int i, rc;
 	uint32_t id;
 	uint8_t __attribute__((unused)) v;
-	double wfactor;
 	struct snis_entity *o;
-	const union vec3 rightvec = { { 1.0f, 0.0f, 0.0f, } };
-	union vec3 warpvec;
 	int enough_oomph;
 
 	rc = read_and_unpack_buffer(c, buffer, "wb", &id, &v);
@@ -10486,22 +11929,7 @@ static int process_engage_warp(struct game_client *c)
 		pthread_mutex_unlock(&universe_mutex);
 		return 0;
 	}
-	b = lookup_bridge_by_shipid(o->id);
-	if (b < 0) {
-		snis_log(SNIS_ERROR, "Can't find bridge for shipid %u\n",
-				o->id, __FILE__, __LINE__);
-		pthread_mutex_unlock(&universe_mutex);
-		return 0;
-	}
-	enough_oomph = ((double) o->tsd.ship.warpdrive / 255.0) > 0.075;
-	if (enough_oomph) {
-		wfactor = ((double) o->tsd.ship.warpdrive / 255.0) * (XKNOWN_DIM / 2.0);
-		quat_rot_vec(&warpvec, &rightvec, &o->orientation);
-		bridgelist[b].warpx = o->x + wfactor * warpvec.v.x;
-		bridgelist[b].warpy = o->y + wfactor * warpvec.v.y;
-		bridgelist[b].warpz = o->z + wfactor * warpvec.v.z;
-		o->tsd.ship.warp_time = 85; /* 8.5 seconds */
-	}
+	enough_oomph = do_engage_warp_drive(o);
 	pthread_mutex_unlock(&universe_mutex);
 	send_initiate_warp_packet(c, enough_oomph);
 	return 0;
@@ -10831,38 +12259,44 @@ laserfail:
 #endif
 }
 
-static void turn_off_tractorbeam(struct snis_entity *ship)
+static int turn_off_tractorbeam(struct snis_entity *ship)
 {
 	int i;
 	struct snis_entity *tb;
 
 	/* universe lock must be held already. */
+	if (ship->tsd.ship.tractor_beam == (uint32_t) 0xffffffff)
+		return 0;
 	i = lookup_by_id(ship->tsd.ship.tractor_beam);
 	if (i < 0) {
 		/* thing we were tractoring died. */
 		ship->tsd.ship.tractor_beam = -1;
-		return;
+		return 0;
 	}
 	tb = &go[i];
 	delete_from_clients_and_server(tb);
 	ship->tsd.ship.tractor_beam = -1;
+	return 1;
 }
 
-static int process_request_tractor_beam(struct game_client *c)
+static int turn_on_tractor_beam(struct game_client *c, struct snis_entity *ship, uint32_t oid, int toggle)
 {
-	unsigned char buffer[10];
-	struct snis_entity *ship = &go[c->ship_index];
-	uint32_t oid;
-	int rc, i;
+	int i;
 
-	rc = read_and_unpack_buffer(c, buffer, "w", &oid);
-	if (rc)
-		return rc;
 	pthread_mutex_lock(&universe_mutex);
+	if (oid == (uint32_t) 0xffffffff && c)
+		oid = bridgelist[c->bridge].science_selection;
 	if (oid == (uint32_t) 0xffffffff) { /* nothing selected, turn off tractor beam */
-		turn_off_tractorbeam(ship);
-		pthread_mutex_unlock(&universe_mutex);
-		return 0;
+		if (toggle) {
+			turn_off_tractorbeam(ship);
+			pthread_mutex_unlock(&universe_mutex);
+			return 0;
+		} else {
+			pthread_mutex_unlock(&universe_mutex);
+			if (c)
+				queue_add_text_to_speech(c, "No target for tractor beam, beam not engaged.");
+			return 0;
+		}
 	}
 	i = lookup_by_id(oid);
 	if (i < 0)
@@ -10873,8 +12307,11 @@ static int process_request_tractor_beam(struct game_client *c)
 		i = lookup_by_id(ship->tsd.ship.tractor_beam);
 		if (i >= 0 && oid == go[i].tsd.laserbeam.target) {
 			/* if same thing selected, turn off beam and we're done */
-			turn_off_tractorbeam(ship);
+			if (toggle)
+				turn_off_tractorbeam(ship);
 			pthread_mutex_unlock(&universe_mutex);
+			if (!toggle && c)
+				queue_add_text_to_speech(c, "The tractor beam is already engaged");
 			return 0;
 		}
 		/* otherwise turn beam off then back on to newly selected item */
@@ -10892,6 +12329,8 @@ static int process_request_tractor_beam(struct game_client *c)
 	add_tractorbeam(ship, oid, 30);
 	/* TODO: tractor beam sound here. */
 	pthread_mutex_unlock(&universe_mutex);
+	if (!toggle && c)
+		queue_add_text_to_speech(c, "Tractor beam engaged");
 	return 0;
 
 tractorfail:
@@ -10901,16 +12340,23 @@ tractorfail:
 	return 0;
 }
 
-static int process_request_mining_bot(struct game_client *c)
+static int process_request_tractor_beam(struct game_client *c)
 {
 	unsigned char buffer[10];
 	struct snis_entity *ship = &go[c->ship_index];
 	uint32_t oid;
-	int rc, i;
+	int rc;
 
 	rc = read_and_unpack_buffer(c, buffer, "w", &oid);
 	if (rc)
 		return rc;
+	return turn_on_tractor_beam(NULL, ship, oid, 1);
+}
+
+static void launch_mining_bot(struct game_client *c, struct snis_entity *ship, uint32_t oid)
+{
+	int i;
+
 	pthread_mutex_lock(&universe_mutex);
 	if (oid == (uint32_t) 0xffffffff) /* nothing selected */
 		goto miningbotfail;
@@ -10925,18 +12371,33 @@ static int process_request_mining_bot(struct game_client *c)
 	i = add_mining_bot(ship, oid);
 	if (i < 0)
 		goto miningbotfail;
-	snis_queue_add_sound(MINING_BOT_DEPLOYED,
-				ROLE_COMMS | ROLE_SOUNDSERVER | ROLE_SCIENCE, ship->id);
+	/* snis_queue_add_sound(MINING_BOT_DEPLOYED,
+					ROLE_COMMS | ROLE_SOUNDSERVER | ROLE_SCIENCE, ship->id); */
 	pthread_mutex_unlock(&universe_mutex);
-	return 0;
+	queue_add_text_to_speech(c, "Mining robot deployed");
+	return;
 
 miningbotfail:
 	/* TODO: make special miningbot failure sound */
 	snis_queue_add_sound(LASER_FAILURE, ROLE_SOUNDSERVER, ship->id);
 	pthread_mutex_unlock(&universe_mutex);
-	return 0;
+	queue_add_text_to_speech(c, "No target selected for mining robot");
+	return;
 }
 
+static int process_request_mining_bot(struct game_client *c)
+{
+	unsigned char buffer[10];
+	struct snis_entity *ship = &go[c->ship_index];
+	uint32_t oid;
+	int rc;
+
+	rc = read_and_unpack_buffer(c, buffer, "w", &oid);
+	if (rc)
+		return rc;
+	launch_mining_bot(c, ship, oid);
+	return 0;
+}
 
 static int process_demon_fire_phaser(struct game_client *c)
 {
@@ -11071,6 +12532,11 @@ static void process_instructions_from_client(struct game_client *c)
 			if (rc)
 				goto protocol_error;
 			break;
+		case OPCODE_REQUEST_STANDARD_ORBIT:
+			rc = process_standard_orbit(c);
+			if (rc)
+				goto protocol_error;
+			break;
 		case OPCODE_REQUEST_LASER_WAVELENGTH:
 			rc = process_request_laser_wavelength(c);
 			if (rc)
@@ -11178,6 +12644,11 @@ static void process_instructions_from_client(struct game_client *c)
 			break;
 		case OPCODE_REQUEST_ROBOT_YAW:
 			rc = process_request_yaw(c, do_robot_yaw);
+			if (rc)
+				goto protocol_error;
+			break;
+		case OPCODE_REQUEST_ROBOT_CMD:
+			rc = process_request_robot_cmd(c);
 			if (rc)
 				goto protocol_error;
 			break;
@@ -11363,6 +12834,11 @@ static void process_instructions_from_client(struct game_client *c)
 			if (rc)
 				goto protocol_error;
 			break;
+		case OPCODE_NATURAL_LANGUAGE_REQUEST:
+			rc = process_natural_language_request(c);
+			if (rc)
+				goto protocol_error;
+			break;
 		default:
 			goto protocol_error;
 	}
@@ -11493,6 +12969,8 @@ static void send_update_wormhole_packet(struct game_client *c,
 	struct snis_entity *o);
 static void send_update_starbase_packet(struct game_client *c,
 	struct snis_entity *o);
+static void send_update_warpgate_packet(struct game_client *c,
+	struct snis_entity *o);
 static void send_update_explosion_packet(struct game_client *c,
 	struct snis_entity *o);
 static void send_update_torpedo_packet(struct game_client *c,
@@ -11552,6 +13030,9 @@ static void queue_up_client_object_update(struct game_client *c, struct snis_ent
 		break;
 	case OBJTYPE_STARBASE:
 		send_update_starbase_packet(c, o);
+		break;
+	case OBJTYPE_WARPGATE:
+		send_update_warpgate_packet(c, o);
 		break;
 	case OBJTYPE_NEBULA:
 		send_update_nebula_packet(c, o);
@@ -11654,6 +13135,8 @@ static void queue_up_client_damcon_object_update(struct game_client *c,
 		case DAMCON_TYPE_SOCKET:
 			send_update_damcon_socket_packet(c, o);
 			break;
+		case DAMCON_TYPE_WAYPOINT:
+			break;
 		default:
 			send_update_damcon_obj_packet(c, o);
 			break;
@@ -11735,6 +13218,20 @@ static void queue_up_client_id(struct game_client *c)
 	pb_queue_to_client(c, packed_buffer_new("bw", OPCODE_ID_CLIENT_SHIP, c->shipid));
 }
 
+static void queue_set_solarsystem(struct game_client *c)
+{
+	char solarsystem[100];
+	struct packed_buffer *pb;
+
+	pb = packed_buffer_allocate(101);
+	if (!pb)
+		return;
+	memset(solarsystem, 0, sizeof(solarsystem));
+	strncpy(solarsystem, solarsystem_name, 99);
+	packed_buffer_append(pb, "br", OPCODE_SET_SOLARSYSTEM, solarsystem, (uint16_t) 100);
+	pb_queue_to_client(c, pb);
+}
+
 #define SIMULATE_SLOW_SERVER 0
 #if SIMULATE_SLOW_SERVER
 static void simulate_slow_server(__attribute__((unused)) int x)
@@ -11749,11 +13246,13 @@ static void simulate_slow_server(__attribute__((unused)) int x)
 static void *per_client_write_thread(__attribute__((unused)) void /* struct game_client */ *client)
 {
 	struct game_client *c = (struct game_client *) client;
+	int bridge_status;
 
 	/* Wait for client[] array to get fully updated before proceeding. */
 	client_lock();
 	get_client(c);
 	client_unlock();
+	double disconnect_timer = -1.0;
 
 	const uint8_t over_clock = 4;
 	const double maxTimeBehind = 0.5;
@@ -11765,6 +13264,16 @@ static void *per_client_write_thread(__attribute__((unused)) void /* struct game
 	while (1) {
 		if (c->socket < 0)
 			break;
+
+		bridge_status = bridgelist[c->bridge].verified;
+		if (bridge_status == BRIDGE_FAILED_VERIFICATION ||
+			bridge_status == BRIDGE_REFUSED) {
+			unsigned char player_error = ADD_PLAYER_ERROR_FAILED_VERIFICATION;
+			if (bridge_status == BRIDGE_REFUSED)
+				player_error = ADD_PLAYER_ERROR_TOO_MANY_BRIDGES;
+			pb_queue_to_client(c, packed_buffer_new("bb", OPCODE_ADD_PLAYER_ERROR, player_error));
+			disconnect_timer = 1.0;
+		}
 
 		currentTime = time_now_double();
 
@@ -11782,6 +13291,16 @@ static void *per_client_write_thread(__attribute__((unused)) void /* struct game
 				sleep_double(timeToSleep);
 		}
 		simulate_slow_server(0);
+		if (disconnect_timer > 0.0)
+			break;
+	}
+	if (disconnect_timer > 0.0) {
+		fprintf(stderr, "%s: disconnecting client for failed bridge verification\n",
+			logprefix());
+		sleep_double(disconnect_timer);
+		shutdown(c->socket, SHUT_RDWR);
+		close(c->socket);
+		c->socket = -1;
 	}
 	log_client_info(SNIS_INFO, c->socket, "client writer thread exiting.\n");
 	pthread_mutex_lock(&universe_mutex);
@@ -12163,7 +13682,7 @@ static void send_update_planet_packet(struct game_client *c,
 	else
 		ring = 1.0;
 
-	pb_queue_to_client(c, packed_buffer_new("bwwSSSSwbbbbhbbbS", OPCODE_UPDATE_PLANET, o->id, o->timestamp,
+	pb_queue_to_client(c, packed_buffer_new("bwwSSSSwbbbbhbbbSbbb", OPCODE_UPDATE_PLANET, o->id, o->timestamp,
 					o->x, (int32_t) UNIVERSE_DIM,
 					o->y, (int32_t) UNIVERSE_DIM,
 					o->z, (int32_t) UNIVERSE_DIM,
@@ -12177,7 +13696,10 @@ static void send_update_planet_packet(struct game_client *c,
 					o->tsd.planet.atmosphere_r,
 					o->tsd.planet.atmosphere_g,
 					o->tsd.planet.atmosphere_b,
-					o->tsd.planet.atmosphere_scale, (int32_t) UNIVERSE_DIM));
+					o->tsd.planet.atmosphere_scale, (int32_t) UNIVERSE_DIM,
+					o->tsd.planet.has_atmosphere,
+					o->tsd.planet.solarsystem_planet_type,
+					o->tsd.planet.ring_selector));
 }
 
 static void send_update_wormhole_packet(struct game_client *c,
@@ -12194,6 +13716,17 @@ static void send_update_starbase_packet(struct game_client *c,
 	struct snis_entity *o)
 {
 	pb_queue_to_client(c, packed_buffer_new("bwwSSSQ", OPCODE_UPDATE_STARBASE,
+					o->id, o->timestamp,
+					o->x, (int32_t) UNIVERSE_DIM,
+					o->y, (int32_t) UNIVERSE_DIM,
+					o->z, (int32_t) UNIVERSE_DIM,
+					&o->orientation));
+}
+
+static void send_update_warpgate_packet(struct game_client *c,
+	struct snis_entity *o)
+{
+	pb_queue_to_client(c, packed_buffer_new("bwwSSSQ", OPCODE_UPDATE_WARPGATE,
 					o->id, o->timestamp,
 					o->x, (int32_t) UNIVERSE_DIM,
 					o->y, (int32_t) UNIVERSE_DIM,
@@ -12297,12 +13830,16 @@ static int add_new_player(struct game_client *c)
 {
 	int rc;
 	struct add_player_packet app;
+	uint8_t no_write_count = 0;
 
+	fprintf(stderr, "%s: reading update player packet\n", logprefix());
 	rc = snis_readsocket(c->socket, &app, sizeof(app));
+	fprintf(stderr, "%s: read update player packet, rc = %d\n", logprefix(), rc);
 	if (rc)
 		return rc;
 	app.role = ntohl(app.role);
 	if (app.opcode != OPCODE_UPDATE_PLAYER) {
+		fprintf(stderr, "%s: bad opcode %d\n", logprefix(), app.opcode);
 		snis_log(SNIS_ERROR, "bad opcode %d\n", app.opcode);
 		goto protocol_error;
 	}
@@ -12310,14 +13847,19 @@ static int add_new_player(struct game_client *c)
 	app.password[19] = '\0';
 
 	if (insane(app.shipname, 20) || insane(app.password, 20)) {
+		fprintf(stderr, "%s: name or password\n", logprefix());
 		snis_log(SNIS_ERROR, "Bad ship name or password\n");
 		goto protocol_error;
 	}
+	fprintf(stderr, "%s: new client: sn='%s', pw='%s', create = %hhu\n",
+			logprefix(), app.shipname, app.password, app.new_ship);
 
 	c->bridge = lookup_bridge(app.shipname, app.password);
+	fprintf(stderr, "%s: c->bridge = %d\n", logprefix(), c->bridge);
 	c->role = app.role;
-	if (c->bridge == -1) { /* did not find our bridge, have to make a new one. */
+	if (c->bridge == -1) { /* didn't find our bridge, make a new one. */
 		double x, z;
+		fprintf(stderr, "%s: didn't find bridge, make new one\n", logprefix());
 
 		for (int i = 0; i < 100; i++) {
 			x = XKNOWN_DIM * (double) rand() / (double) RAND_MAX;
@@ -12325,7 +13867,7 @@ static int add_new_player(struct game_client *c)
 			if (dist3d(x - SUNX, 0, z - SUNZ) > SUN_DIST_LIMIT)
 				break;
 		}
-		c->ship_index = add_player(x, z, 0.0, 0.0, M_PI / 2.0);
+		c->ship_index = add_player(x, z, 0.0, 0.0, M_PI / 2.0, app.warpgate_number);
 		c->shipid = go[c->ship_index].id;
 		strcpy(go[c->ship_index].sdata.name, (const char * restrict) app.shipname);
 		memset(&bridgelist[nbridges], 0, sizeof(bridgelist[nbridges]));
@@ -12336,18 +13878,35 @@ static int add_new_player(struct game_client *c)
 		bridgelist[nbridges].npcbot.channel = (uint32_t) -1;
 		bridgelist[nbridges].npcbot.object_id = (uint32_t) -1;
 		bridgelist[nbridges].damcon.bridge = nbridges;
+		bridgelist[nbridges].current_displaymode = DISPLAYMODE_MAINSCREEN;
+		bridgelist[nbridges].verified = BRIDGE_UNVERIFIED;
+		bridgelist[nbridges].requested_verification = 0;
+		bridgelist[nbridges].requested_creation = !!app.new_ship;
+		bridgelist[nbridges].nclients = 1;
 		c->bridge = nbridges;
 		populate_damcon_arena(&bridgelist[c->bridge].damcon);
 	
 		nbridges++;
 		schedule_callback(event_callback, &callback_schedule,
 				"player-respawn-event", (double) c->shipid);
-	} else {
+	} else if (c->bridge != -1 && !app.new_ship) { /* join existing ship */
+		fprintf(stderr, "%s: join existing ship\n", logprefix());
 		c->shipid = bridgelist[c->bridge].shipid;
 		c->ship_index = lookup_by_id(c->shipid);
+		bridgelist[c->bridge].nclients++;
+	} else if (c->bridge != -1 && app.new_ship) { /* ship already exists, can't create */
+		fprintf(stderr, "%s: ship already exists, can't create\n", logprefix());
+		pb_queue_to_client(c, packed_buffer_new("bb", OPCODE_ADD_PLAYER_ERROR,
+				ADD_PLAYER_ERROR_SHIP_ALREADY_EXISTS));
+		write_queued_updates_to_client(c, 4, &no_write_count);
+		return -1;
 	}
+
+	snis_sha1_hash(bridgelist[c->bridge].shipname, bridgelist[c->bridge].password,
+			bridgelist[c->bridge].pwdhash);
 	c->debug_ai = 0;
 	c->request_universe_timestamp = 0;
+	fprintf(stderr, "%s: queue client id %d\n", logprefix(), c->shipid);
 	queue_up_client_id(c);
 
 	c->go_clients = malloc(sizeof(*c->go_clients) * MAXGAMEOBJS);
@@ -12370,7 +13929,7 @@ static void service_connection(int connection)
 	int bridgenum, client_count;
 	int thread_count, iterations;
 
-	log_client_info(SNIS_INFO, connection, "snis_server: servicing snis_client connection\n");
+	log_client_info(SNIS_INFO, connection, "servicing snis_client connection\n");
         /* get connection moved off the stack so that when the thread needs it,
 	 * it's actually still around. 
 	 */
@@ -12381,9 +13940,11 @@ static void service_connection(int connection)
 
 	if (verify_client_protocol(connection)) {
 		log_client_info(SNIS_ERROR, connection, "disconnected, protocol violation\n");
+		fprintf(stderr, "%s: connection terminated protocol violation\n", logprefix());
 		close(connection);
 		return;
 	}
+	fprintf(stderr, "%s: connection 3\n", logprefix());
 
 	pthread_mutex_lock(&universe_mutex);
 	client_lock();
@@ -12409,7 +13970,14 @@ static void service_connection(int connection)
 	pthread_mutex_init(&client[i].client_write_queue_mutex, NULL);
 	packed_buffer_queue_init(&client[i].client_write_queue);
 
-	add_new_player(&client[i]);
+	fprintf(stderr, "%s: calling add new player\n", logprefix());
+	rc = add_new_player(&client[i]);
+	if (rc) {
+		nclients--;
+		client_unlock();
+		pthread_mutex_unlock(&universe_mutex);
+		return;
+	}
 
 	pthread_attr_init(&client[i].read_attr);
 	pthread_attr_setdetachstate(&client[i].read_attr, PTHREAD_CREATE_DETACHED);
@@ -12426,12 +13994,14 @@ static void service_connection(int connection)
 		snis_log(SNIS_ERROR, "per client read thread, pthread_create failed: %d %s %s\n",
 			rc, strerror(rc), strerror(errno));
 	}
+	pthread_setname_np(client[i].read_thread, "sniss-reader");
         rc = pthread_create(&client[i].write_thread,
 		&client[i].write_attr, per_client_write_thread, (void *) &client[i]);
 	if (rc) {
 		snis_log(SNIS_ERROR, "per client write thread, pthread_create failed: %d %s %s\n",
 			rc, strerror(rc), strerror(errno));
 	}
+	pthread_setname_np(client[i].write_thread, "sniss-writer");
 	client_count = 0;
 	bridgenum = client[i].bridge;
 	for (j = 0; j < nclients; j++) {
@@ -12442,11 +14012,15 @@ static void service_connection(int connection)
 	client_unlock();
 	pthread_mutex_unlock(&universe_mutex);
 
-	if (client_count == 1)
-		snis_queue_add_global_sound(STARSHIP_JOINED);
-	else
-		snis_queue_add_sound(CREWMEMBER_JOINED, ROLE_ALL,
+	if (client_count == 1) {
+		/* snis_queue_add_global_sound(STARSHIP_JOINED); */
+		snis_queue_add_global_text_to_speech("star ship has joined");
+	} else {
+		/* snis_queue_add_sound(CREWMEMBER_JOINED, ROLE_ALL,
+					bridgelist[bridgenum].shipid); */
+		snis_queue_add_text_to_speech("crew member has joined.", ROLE_TEXT_TO_SPEECH,
 					bridgelist[bridgenum].shipid);
+	}
 
 	/* Wait for at least one of the threads to prevent premature reaping */
 	iterations = 0;
@@ -12470,6 +14044,7 @@ static void service_connection(int connection)
 	client_unlock();
 	pthread_mutex_unlock(&universe_mutex);
 
+	queue_set_solarsystem(&client[i]);
 	snis_log(SNIS_INFO, "bottom of 'service connection'\n");
 }
 
@@ -12497,8 +14072,8 @@ static void *listener_thread(__attribute__((unused)) void * unused)
 		rc = sscanf(snis_server_port_var, "%d", &value);
 		if (rc == 1) {
 			default_snis_server_port = value & 0x0ffff;
-			printf("snis_server: Using SNISSERVERPORT value %d\n",
-				default_snis_server_port);
+			printf("%s: Using SNISSERVERPORT value %d\n",
+				logprefix(), default_snis_server_port);
 		}
 	}
 
@@ -12572,6 +14147,7 @@ static void *listener_thread(__attribute__((unused)) void * unused)
 		snis_log(SNIS_INFO, "Accepting connection...\n");
 		connection = accept(rendezvous, (struct sockaddr *) &remote_addr, &remote_addr_len);
 		snis_log(SNIS_INFO, "accept returned %d\n", connection);
+		fprintf(stderr, "%s: accept returned %d\n", logprefix(), connection);
 		if (connection < 0) {
 			/* handle failed connection... */
 			snis_log(SNIS_WARN, "accept() failed: %s\n", strerror(errno));
@@ -12609,6 +14185,7 @@ static int start_listener_thread(void)
 		snis_log(SNIS_ERROR, "Failed to create listener thread, pthread_create: %d %s %s\n",
 				rc, strerror(rc), strerror(errno));
 	}
+	pthread_setname_np(thread, "sniss-listener");
 
 	/* Wait for the listener thread to become ready... */
 	pthread_cond_wait(&listener_started, &listener_mutex);
@@ -12750,6 +14327,69 @@ static void dump_opcode_stats(struct opcode_stat *data)
 #define dump_opcode_stats(x)
 #endif
 
+static void wakeup_multiverse_writer(struct multiverse_server_info *msi);
+static void queue_to_multiverse(struct multiverse_server_info *msi, struct packed_buffer *pb)
+{
+	assert(pb);
+	packed_buffer_queue_add(&msi->mverse_queue, pb, &msi->queue_mutex);
+	wakeup_multiverse_writer(msi);
+}
+
+static void update_multiverse(struct snis_entity *o)
+{
+	struct packed_buffer *pb;
+	int bridge;
+
+	if (!multiverse_server)
+		return;
+
+	bridge = lookup_bridge_by_shipid(o->id);
+	if (bridge < 0) {
+		fprintf(stderr,
+			"%s: did not find bridge for id:%d, index=%lu, alive=%d: %s:%d\n",
+				logprefix(), o->id, go_index(o), o->alive, __FILE__, __LINE__);
+		return;
+	}
+
+	fprintf(stderr, "%s: update_multiverse: verified = '%s'\n", logprefix(),
+		bridgelist[bridge].verified == BRIDGE_UNVERIFIED ? "unverified" :
+		bridgelist[bridge].verified == BRIDGE_VERIFIED ? "verified" :
+		bridgelist[bridge].verified == BRIDGE_FAILED_VERIFICATION ? "failed verification" :
+		bridgelist[bridge].verified == BRIDGE_REFUSED ? "refused" : "unknown");
+
+	/* Verify that this ship does not already exist if creation was requested, or
+	 * that it does already exist if creation was not requested.  Only do this once.
+	 */
+	if (bridgelist[bridge].verified == BRIDGE_UNVERIFIED &&
+		!bridgelist[bridge].requested_verification && multiverse_server->sock != -1) {
+		unsigned char opcode;
+
+		print_hash("requesting verification of hash ", bridgelist[bridge].pwdhash);
+		pb = packed_buffer_allocate(21);
+		if (bridgelist[bridge].requested_creation)
+			opcode = SNISMV_OPCODE_VERIFY_CREATE;
+		else
+			opcode = SNISMV_OPCODE_VERIFY_EXISTS;
+		packed_buffer_append(pb, "br", opcode, bridgelist[bridge].pwdhash, (uint16_t) 20);
+		bridgelist[bridge].requested_verification = 1;
+		queue_to_multiverse(multiverse_server, pb);
+		return;
+	} else {
+		fprintf(stderr, "%s: not requesting verification\n", logprefix());
+	}
+
+	/* Skip updating multiverse server if the bridge isn't verified yet. */
+	if (bridgelist[bridge].verified != BRIDGE_VERIFIED) {
+		fprintf(stderr, "%s: bridge is not verified, not updating multiverse\n",
+			logprefix());
+		return;
+	}
+
+	/* Update the ship */
+	pb = build_bridge_update_packet(o, bridgelist[bridge].pwdhash);
+	queue_to_multiverse(multiverse_server, pb);
+}
+
 static void move_objects(double absolute_time, int discontinuity)
 {
 	int i;
@@ -12760,6 +14400,8 @@ static void move_objects(double absolute_time, int discontinuity)
 	netstats.nships = 0;
 	universe_timestamp++;
 	universe_timestamp_absolute = absolute_time;
+	static uint32_t multiverse_update_time = 0;
+	int b;
 
 	if (discontinuity) {
 		for (i = 0; i < nclients; i++)
@@ -12774,18 +14416,33 @@ static void move_objects(double absolute_time, int discontinuity)
 				go[i].sdata.faction < ARRAYSIZE(faction_population)) {
 				faction_population[go[i].sdata.faction]++;
 			}
+			if (go[i].type == OBJTYPE_SHIP1)  {
+				b = lookup_bridge_by_shipid(go[i].id);
+				if (b >= 0 && (universe_timestamp >= multiverse_update_time ||
+					(!bridgelist[b].verified && !bridgelist[b].requested_verification)))
+					update_multiverse(&go[i]);
+			}
 			netstats.nobjects++;
 		} else {
-			if (go[i].type == OBJTYPE_SHIP1 &&
-				universe_timestamp >= go[i].respawn_time) {
-				respawn_player(&go[i]);
-				schedule_callback(event_callback, &callback_schedule,
-					"player-respawn-event", (double) go[i].id);
-				send_ship_damage_packet(&go[i]);
-			} else
-				go[i].timestamp = universe_timestamp; /* respawn is counting down */
+			if (go[i].type == OBJTYPE_SHIP1)  {
+				int b = lookup_bridge_by_shipid(go[i].id);
+				if (b != -1) {
+					if (universe_timestamp >= go[i].respawn_time) {
+						respawn_player(&go[i], (uint8_t) -1);
+						schedule_callback(event_callback, &callback_schedule,
+							"player-respawn-event", (double) go[i].id);
+						send_ship_damage_packet(&go[i]);
+					} else {
+						go[i].timestamp = universe_timestamp; /* respawn is counting down */
+					}
+				}
+			}
 		}
 	}
+	/* Update multiverse every 10 seconds */
+	if (universe_timestamp >= multiverse_update_time)
+		multiverse_update_time = universe_timestamp + 100;
+
 	for (i = 0; i < nfactions(); i++)
 		if (i == 0 || faction_population[lowest_faction] > faction_population[i])
 			lowest_faction = i;
@@ -12823,8 +14480,10 @@ static void register_with_game_lobby(char *lobbyhost, int port,
 
 void usage(void)
 {
-	fprintf(stderr, "snis_server lobbyserver gameinstance servernick location\n");
-	fprintf(stderr, "For example: snis_server lobbyserver 'steves game' zuul Houston\n");
+	fprintf(stderr, "snis_server: usage:\n");
+	fprintf(stderr, "snis_server -l lobbyhost -L location [ -g gameinstance ] \\\n"
+			"          [ -m multiverse-location ] [ -n servernick ]\n");
+	fprintf(stderr, "For example: snis_server -l lobbyserver -g 'steves game' -n zuul -L Houston\n");
 	exit(0);
 }
 
@@ -12886,6 +14545,7 @@ static void setup_lua(void)
 	add_lua_callable_fn(l_ai_push_attack, "ai_push_attack");
 	add_lua_callable_fn(l_add_cargo_container, "add_cargo_container");
 	add_lua_callable_fn(l_set_faction, "set_faction");
+	add_lua_callable_fn(l_text_to_speech, "text_to_speech");
 }
 
 static int run_initial_lua_scripts(void)
@@ -12973,6 +14633,22 @@ static int read_factions(void)
 	return 0;
 }
 
+static struct solarsystem_asset_spec *read_solarsystem_assets(char *solarsystem_name)
+{
+	char path[PATH_MAX];
+	struct solarsystem_asset_spec *s;
+
+	sprintf(path, "%s/solarsystems/%s/assets.txt", asset_dir, solarsystem_name);
+
+	s = solarsystem_asset_spec_read(path);
+	if (!s) {
+		fprintf(stderr, "Unable to read solarsystem asset spec from '%s'", path);
+		if (errno)
+			fprintf(stderr, "%s: %s\n", path, strerror(errno));
+	}
+	return s;
+}
+
 static void set_random_seed(void)
 {
 	char *seed = getenv("SNISRAND");
@@ -13017,25 +14693,3073 @@ static struct docking_port_attachment_point **read_docking_port_info(
 }
 #endif
 
+/*****************************************************************************************
+ * Here begins the natural language parsing code.
+ *****************************************************************************************/
+
+/* callback used by natural language parser to look up game objects */
+static uint32_t natural_language_object_lookup(void *context, char *word)
+{
+	uint32_t answer = 0xffffffff; /* not found */
+	int i, b;
+
+	char *w = strdup(word);
+	uppercase(w);
+	pthread_mutex_lock(&universe_mutex);
+	for (i = 0; i < snis_object_pool_highest_object(pool); i++) {
+		switch (go[i].type) {
+		case OBJTYPE_STARBASE:
+			if (strcmp(go[i].tsd.starbase.name, w) == 0) {
+				answer = go[i].id;
+				goto done;
+			}
+			break;
+		case OBJTYPE_PLANET:
+		case OBJTYPE_ASTEROID:
+		case OBJTYPE_SHIP2:
+			if (strcmp(go[i].sdata.name, w) == 0) {
+				answer = go[i].id;
+				goto done;
+			}
+			break;
+		case OBJTYPE_SHIP1:
+			b = lookup_bridge_by_shipid(go[i].id);
+			if (b < 0)
+				break;
+			if (strcasecmp((char *) bridgelist[b].shipname, w) == 0) {
+				answer = go[i].id;
+				goto done;
+			}
+			break;
+		default:
+			break;
+		}
+	}
+done:
+	pthread_mutex_unlock(&universe_mutex);
+	free(w);
+	return answer;
+}
+
+static void perform_natural_language_request(struct game_client *c, char *txt)
+{
+	lowercase(txt);
+	printf("%s\n", txt);
+	snis_nl_parse_natural_language_request(c, txt);
+}
+
+static void init_synonyms(void)
+{
+	snis_nl_add_synonym("exit", "leave");
+	snis_nl_add_synonym("velocity", "speed");
+	snis_nl_add_synonym("max", "maximum");
+	snis_nl_add_synonym("min", "minimum");
+	snis_nl_add_synonym("cut", "lower");
+	snis_nl_add_synonym("reduce", "lower");
+	snis_nl_add_synonym("decrease", "lower");
+	snis_nl_add_synonym("boost", "raise");
+	snis_nl_add_synonym("increase", "raise");
+	snis_nl_add_synonym("calculate", "compute");
+	snis_nl_add_synonym("figure", "compute");
+	snis_nl_add_synonym("activate", "engage");
+	snis_nl_add_synonym("actuate", "engage");
+	snis_nl_add_synonym("start", "engage");
+	snis_nl_add_synonym("energize", "engage");
+	snis_nl_add_synonym("deactivate", "disengage");
+	snis_nl_add_synonym("deenergize", "disengage");
+	snis_nl_add_synonym("disable", "disengage");
+	snis_nl_add_synonym("shutdown", "disengage");
+	snis_nl_add_synonym("deploy", "launch");
+	snis_nl_add_synonym("path", "course");
+	snis_nl_add_synonym("route", "course");
+	snis_nl_add_synonym("towards", "toward");
+	snis_nl_add_synonym("tell me about", "describe");
+	snis_nl_add_synonym("energy", "power");
+	snis_nl_add_synonym("manuevering", "maneuvering");
+	snis_nl_add_synonym("cooling", "coolant");
+	snis_nl_add_synonym("throttle", "impulse drive");
+	snis_nl_add_synonym("engines", "impulse drive");
+	snis_nl_add_synonym("warp power", "warp drive power");
+	snis_nl_add_synonym("warp coolant", "warp drive coolant");
+	snis_nl_add_synonym("tractor power", "tractor beam power");
+	snis_nl_add_synonym("tractor coolant", "tractor beam coolant");
+	snis_nl_add_synonym("impulse power", "impulse drive power");
+	snis_nl_add_synonym("impulse coolant", "impulse drive coolant");
+	snis_nl_add_synonym("docking magnets", "docking system");
+	snis_nl_add_synonym("comms", "communications");
+	snis_nl_add_synonym("counter clockwise", "counterclockwise");
+	snis_nl_add_synonym("counter-clockwise", "counterclockwise");
+	snis_nl_add_synonym("anti clockwise", "counterclockwise");
+	snis_nl_add_synonym("anti-clockwise", "counterclockwise");
+	snis_nl_add_synonym("anticlockwise", "counterclockwise");
+	snis_nl_add_synonym("star base", "starbase");
+}
+
+static const struct noun_description_entry {
+	char *noun;
+	char *description;
+} noun_description[] = {
+	{ "drive", "The warp drive is a powerful sub-nuclear device that enables faster than light space travel." },
+	{ "warp drive", "The warp drive is a powerful sub-nuclear device that enables faster than light space travel." },
+	{ "impulse drive", "The impulse drive is a sub light speed conventional thruster." },
+	/* TODO: flesh this out more */
+};
+
+static int nl_find_next_word(int argc, int pos[], int part_of_speech, int start_with)
+{
+	int i;
+
+	for (i = start_with; i < argc; i++) {
+		if (pos[i] == part_of_speech)
+			return i;
+	}
+	return -1;
+}
+
+static void nl_describe_noun(struct game_client *c, char *word)
+{
+	int i;
+	printf("%s: describing '%s'\n", logprefix(), word);
+
+	for (i = 0; i < ARRAYSIZE(noun_description); i++) {
+		if (strcasecmp(word, noun_description[i].noun) == 0) {
+			queue_add_text_to_speech(c, noun_description[i].description);
+			return;
+		}
+	}
+	queue_add_text_to_speech(c, "I do not know anything about that.");
+}
+
+static char *nl_get_object_name(struct snis_entity *o)
+{
+	/* Assumes universe lock is held */
+	switch (o->type) {
+	case OBJTYPE_STARBASE:
+		return o->tsd.starbase.name;
+	case OBJTYPE_NEBULA:
+		return "nebula";
+	default:
+		return o->sdata.name;
+	}
+}
+
+static void nl_describe_game_object(struct game_client *c, uint32_t id)
+{
+	int i;
+	char description[254];
+	char extradescription[40];
+	static struct mtwist_state *mt = NULL;
+	int planet;
+
+	pthread_mutex_lock(&universe_mutex);
+	i = lookup_by_id(id);
+	if (i < 0) {
+		pthread_mutex_unlock(&universe_mutex);
+		queue_add_text_to_speech(c, "I do not know anything about that.");
+		return;
+	}
+	switch (go[i].type) {
+	case OBJTYPE_PLANET:
+		pthread_mutex_unlock(&universe_mutex);
+		mt = mtwist_init(go[i].tsd.planet.description_seed);
+		planet_description(mt, description, 250, 254);
+		mtwist_free(mt);
+		queue_add_text_to_speech(c, description);
+		return;
+	case OBJTYPE_ASTEROID:
+		pthread_mutex_unlock(&universe_mutex);
+		sprintf(description, "%s is a small and rather ordinary asteroid", go[i].sdata.name);
+		queue_add_text_to_speech(c, description);
+		return;
+	case OBJTYPE_STARBASE:
+		pthread_mutex_unlock(&universe_mutex);
+		sprintf(description, "%s is a starbase", go[i].tsd.starbase.name);
+		queue_add_text_to_speech(c, description);
+		return;
+	case OBJTYPE_SHIP2:
+		planet = lookup_by_id(go[i].tsd.ship.home_planet);
+		pthread_mutex_unlock(&universe_mutex);
+		if (planet >= 0)
+			sprintf(extradescription, " originating from the planet %s",
+				go[planet].sdata.name);
+		else
+			strcpy(extradescription, " of unknown origin");
+		sprintf(description, "%s is a %s class ship %s", go[i].sdata.name,
+				ship_type[go[i].tsd.ship.shiptype].class, extradescription);
+		queue_add_text_to_speech(c, description);
+		return;
+	case OBJTYPE_SHIP1:
+		pthread_mutex_unlock(&universe_mutex);
+		sprintf(description, "%s is a human piloted wombat class space ship", go[i].sdata.name);
+		queue_add_text_to_speech(c, description);
+		return;
+	default:
+		pthread_mutex_unlock(&universe_mutex);
+		queue_add_text_to_speech(c, "I do not know anything about that.");
+		return;
+	}
+	pthread_mutex_unlock(&universe_mutex);
+}
+
+static void nl_describe_n(void *context, int argc, char *argv[], int pos[],
+		union snis_nl_extra_data extra_data[])
+{
+	struct game_client *c = context;
+	int i;
+
+	for (i = 0; i < argc; i++) {
+		switch (pos[i]) {
+		case POS_NOUN:
+			nl_describe_noun(c, argv[i]);
+			return;
+		case POS_EXTERNAL_NOUN:
+			nl_describe_game_object(c, extra_data[i].external_noun.handle);
+			return;
+		default:
+			break;
+		}
+	}
+	queue_add_text_to_speech(c, "I do not know anything about that.");
+}
+
+/* Assumes universe lock is held */
+static int nl_find_nearest_object_of_type(uint32_t id, int objtype)
+{
+	int i;
+	double x, y, z;
+	double nearest_yet = -1.0;
+	double d;
+	struct snis_entity *o;
+	int nearest = -1;
+
+	i = lookup_by_id(id);
+	if (i < 0)
+		return -1;
+
+	o = &go[i];
+
+	for (i = 0; i <= snis_object_pool_highest_object(pool); i++) {
+		if (go[i].type != objtype)
+			continue;
+		if (!go[i].alive)
+			continue;
+		x = go[i].x - o->x;
+		y = go[i].y - o->y;
+		z = go[i].z - o->z;
+		d = x * x + y * y + z * z;
+		if (d < nearest_yet || nearest_yet < 0) {
+			nearest = i;
+			nearest_yet = d;
+		}
+	}
+	return nearest;
+}
+
+/* Assumes universe lock is held */
+static int nl_find_nearest_object(struct game_client *c, int argc, char *argv[], int pos[],
+					union snis_nl_extra_data extra_data[], int starting_word)
+{
+	int i, object, adj, objtype;
+
+	object = nl_find_next_word(argc, pos, POS_NOUN, starting_word);
+	if (object < 0)
+		goto no_understand;
+	adj = nl_find_next_word(argc, pos, POS_ADJECTIVE, starting_word);
+	if (adj > 0) {
+		if (strcmp(argv[adj], "nearest") != 0)
+			goto no_understand;
+	} /* else assume they meant nearest */
+	if (strcmp(argv[object], "planet") == 0)
+		objtype = OBJTYPE_PLANET;
+	else if (strcmp(argv[object], "starbase") == 0)
+		objtype = OBJTYPE_STARBASE;
+	else if (strcmp(argv[object], "nebula") == 0)
+		objtype = OBJTYPE_NEBULA;
+	else if (strcmp(argv[object], "ship") == 0)
+		objtype = OBJTYPE_SHIP2;
+	else if (strcmp(argv[object], "asteroid") == 0)
+		objtype = OBJTYPE_ASTEROID;
+	else
+		objtype = -1;
+	if (objtype < 0)
+		goto no_understand;
+	i = nl_find_nearest_object_of_type(c->shipid, objtype);
+	if (i < 0)
+		return -1;
+	return i;
+no_understand:
+	return -1;
+}
+
+static void nl_describe_an(void *context, int argc, char *argv[], int pos[],
+		union snis_nl_extra_data extra_data[])
+{
+	struct game_client *c = context;
+	int i, adj, noun;
+	uint32_t id;
+
+	noun = nl_find_next_word(argc, pos, POS_EXTERNAL_NOUN, 0);
+	if (noun >= 0) {
+		nl_describe_game_object(c, extra_data[noun].external_noun.handle);
+		return;
+	}
+	adj = nl_find_next_word(argc, pos, POS_ADJECTIVE, 0);
+	if (adj < 0)
+		goto no_understand;
+	if (strcmp(argv[adj], "nearest") == 0) {
+		pthread_mutex_lock(&universe_mutex);
+		i = nl_find_nearest_object(c, argc, argv, pos, extra_data, adj);
+		if (i < 0) {
+			pthread_mutex_unlock(&universe_mutex);
+			goto no_understand;
+		}
+		id = go[i].id;
+		pthread_mutex_unlock(&universe_mutex);
+		nl_describe_game_object(c, id);
+		return;
+	}
+no_understand:
+	queue_add_text_to_speech(c, "I do not know anything about that.");
+}
+
+static void nl_compute_npn(void *context, int argc, char *argv[], int pos[],
+				union snis_nl_extra_data extra_data[])
+{
+	int i, first_noun, second_noun;
+	struct game_client *c = context;
+	struct snis_entity *us, *dest;
+	union vec3 direction;
+	char directions[200];
+	double heading, mark;
+	int calculate_course = 0;
+	int calculate_distance = 0;
+	char destination_name[100];
+	double distance;
+
+	/* Find the first noun... it should be "course", or "distance". */
+
+	first_noun = -1;
+	first_noun = nl_find_next_word(argc, pos, POS_NOUN, 0);
+	if (first_noun < 0) /* didn't find first noun... */
+		goto no_understand;
+
+	if (strcasecmp(argv[first_noun], "course") == 0)
+		calculate_course = 1;
+	else if (strcasecmp(argv[first_noun], "distance") != 0)
+		calculate_distance = 1;
+
+	if (!calculate_course && !calculate_distance)
+		goto no_understand;
+	if (calculate_course && calculate_distance)
+		goto no_understand;
+
+	/* TODO:  check the preposition here. "away", "from", "around", change the meaning.
+	 * for now, assume "to", "toward", etc.
+	 */
+
+	/* Find the second noun, it should be a place... */
+	second_noun = nl_find_next_word(argc, pos, POS_EXTERNAL_NOUN, first_noun + 1);
+	pthread_mutex_lock(&universe_mutex);
+	if (second_noun < 0) {
+		i = nl_find_nearest_object(c, argc, argv, pos, extra_data, first_noun + 1);
+		if (i < 0) {
+			pthread_mutex_unlock(&universe_mutex);
+			goto no_understand;
+		}
+		sprintf(destination_name, "%s", nl_get_object_name(&go[i]));
+	} else {
+		i = lookup_by_id(extra_data[second_noun].external_noun.handle);
+		if (i < 0) {
+			pthread_mutex_unlock(&universe_mutex);
+			if (calculate_course)
+				queue_add_text_to_speech(c,
+					"Sorry, I cannot compute a course to an unknown location.");
+			else if (calculate_distance)
+				queue_add_text_to_speech(c,
+					"Sorry, I cannot compute the distance to an unknown location.");
+			return;
+		}
+		sprintf(destination_name, "%s", argv[second_noun]);
+	}
+	dest = &go[i];
+
+	i = lookup_by_id(c->shipid);
+	if (i < 0) {
+		pthread_mutex_unlock(&universe_mutex);
+		queue_add_text_to_speech(c, "Sorry, I do not seem to know our current location.");
+		return;
+	}
+	us = &go[i];
+
+	/* Compute course... */
+	direction.v.x = dest->x - us->x;
+	direction.v.y = dest->y - us->y;
+	direction.v.z = dest->z - us->z;
+	pthread_mutex_unlock(&universe_mutex);
+
+	distance = vec3_magnitude(&direction);
+	vec3_to_heading_mark(&direction, NULL, &heading, &mark);
+	heading = heading * 180.0 / M_PI;
+	heading = 360 - heading + 90; /* why?  why do I have to do this? */
+	mark = mark * 180.0 / M_PI;
+	if (calculate_course)
+		sprintf(directions, "Course to %s calculated.  Destination lies at bearing %3.0lf, mark %3.0lf",
+					destination_name, heading, mark);
+	if (calculate_distance)
+		sprintf(directions, "The distance to %s is %.0lf clicks", destination_name, distance);
+	queue_add_text_to_speech(c, directions);
+	return;
+
+no_understand:
+	queue_add_text_to_speech(c, "Sorry, I do not know how to compute that.");
+}
+
+static void nl_rotate_ship(struct game_client *c, union quat *rotation)
+{
+	int i;
+	struct snis_entity *o;
+	union quat local_rotation, new_orientation;
+
+	pthread_mutex_lock(&universe_mutex);
+	i = lookup_by_id(c->shipid);
+	if (i < 0) {
+		pthread_mutex_unlock(&universe_mutex);
+		queue_add_text_to_speech(c, "Sorry, I can't seem to steer, Computer needs maintenance.");
+		return;
+	}
+	o = &go[i];
+
+	/* Convert rotation to local coordinate system */
+	quat_conjugate(&local_rotation, rotation, &o->orientation);
+	/* Apply to local orientation */
+	quat_mul(&new_orientation, &local_rotation, &o->orientation);
+	quat_normalize_self(&new_orientation);
+
+	/* Now let the computer steer for awhile */
+	o->tsd.ship.computer_desired_orientation = new_orientation;
+	o->tsd.ship.computer_steering_time_left = COMPUTER_STEERING_TIME;
+	o->tsd.ship.orbiting_object_id = 0xffffffff;
+	// o->orientation = new_orientation;
+	pthread_mutex_unlock(&universe_mutex);
+
+}
+
+static int nl_calculate_ship_rotation(struct game_client *c,
+					int argc, char *argv[], int pos[],
+					union snis_nl_extra_data extra_data[],
+					int direction, int amount, char *reply,
+					union quat *rotation)
+{
+	float degrees = extra_data[amount].number.value;
+
+	strcpy(reply, "");
+
+	/* If the ship facing down the positive x axis, what rotation would we apply? */
+	if (strcasecmp(argv[direction], "starboard") == 0 ||
+		strcasecmp(argv[direction], "right") == 0) {
+		quat_init_axis(rotation, 0, 1, 0, -degrees * M_PI / 180.0);
+		sprintf(reply, "rotating %3.0f degrees to starboard", degrees);
+	} else if (strcasecmp(argv[direction], "port") == 0 ||
+			strcasecmp(argv[direction], "left") == 0) {
+		quat_init_axis(rotation, 0, 1, 0, degrees * M_PI / 180.0);
+		sprintf(reply, "rotating %3.0f degrees to port", degrees);
+	} else if (strcasecmp(argv[direction], "clockwise") == 0) {
+		quat_init_axis(rotation, 1, 0, 0, degrees * M_PI / 180.0);
+		sprintf(reply, "rolling %3.0f degrees clockwise", degrees);
+	} else if (strcasecmp(argv[direction], "counterclockwise") == 0) {
+		quat_init_axis(rotation, 1, 0, 0, -degrees * M_PI / 180.0);
+		sprintf(reply, "rolling %3.0f degrees counter clockwise", degrees);
+	} else if (strcasecmp(argv[direction], "up") == 0) {
+		quat_init_axis(rotation, 0, 0, 1, degrees * M_PI / 180.0);
+		sprintf(reply, "pitching %3.0f degrees up", degrees);
+	} else if (strcasecmp(argv[direction], "down") == 0) {
+		quat_init_axis(rotation, 0, 0, 1, -degrees * M_PI / 180.0);
+		sprintf(reply, "pitching %3.0f degrees down", degrees);
+	} else {
+		queue_add_text_to_speech(c, "Sorry, I do not understand which direction you want to turn.");
+		return -1;
+	}
+	return 0;
+}
+
+static void nl_turn_aq(void *context, int argc, char *argv[], int pos[],
+				union snis_nl_extra_data extra_data[])
+{
+	struct game_client *c = context;
+	int adj, number;
+	union quat rotation;
+	char reply[100];
+
+	adj = nl_find_next_word(argc, pos, POS_ADJECTIVE, 0);
+	if (adj < 0)
+		goto no_understand;
+	number = nl_find_next_word(argc, pos, POS_NUMBER, adj);
+	if (number < 0)
+		goto no_understand;
+
+	if (nl_calculate_ship_rotation(c, argc, argv, pos, extra_data,
+					adj, number, reply, &rotation))
+		return;
+
+	nl_rotate_ship(c, &rotation);
+	queue_add_text_to_speech(c, reply);
+	return;
+
+no_understand:
+	queue_add_text_to_speech(c, "Sorry, I do not understand which direction you want to turn.");
+}
+
+static void nl_turn_qa(void *context, int argc, char *argv[], int pos[],
+				union snis_nl_extra_data extra_data[])
+{
+	struct game_client *c = context;
+	int adj, number;
+	union quat rotation;
+	char reply[100];
+
+	number = nl_find_next_word(argc, pos, POS_NUMBER, 0);
+	if (number < 0)
+		goto no_understand;
+	adj = nl_find_next_word(argc, pos, POS_ADJECTIVE, number);
+	if (adj < 0)
+		goto no_understand;
+
+	if (nl_calculate_ship_rotation(c, argc, argv, pos, extra_data,
+					adj, number, reply, &rotation))
+		return;
+
+	nl_rotate_ship(c, &rotation);
+	queue_add_text_to_speech(c, reply);
+	return;
+
+no_understand:
+	queue_add_text_to_speech(c, "Sorry, I do not understand which direction you want to turn.");
+}
+
+/* Eg: "turn right 90 degrees" */
+static void nl_turn_aqa(void *context, int argc, char *argv[], int pos[],
+				union snis_nl_extra_data extra_data[])
+{
+	struct game_client *c = context;
+	int direction, amount, unit;
+	union quat rotation;
+	char reply[100];
+
+	direction = nl_find_next_word(argc, pos, POS_ADJECTIVE, 0);
+	if (direction < 0)
+		goto no_understand;
+	amount = nl_find_next_word(argc, pos, POS_NUMBER, direction + 1);
+	if (amount < 0)
+		goto no_understand;
+	unit = nl_find_next_word(argc, pos, POS_ADJECTIVE, amount + 1);
+	if (unit < 0)
+		goto no_understand;
+
+	if (strcasecmp(argv[unit], "degrees") != 0) {
+		queue_add_text_to_speech(c, "In degrees please?");
+		return;
+	}
+
+	if (nl_calculate_ship_rotation(c, argc, argv, pos, extra_data,
+					direction, amount, reply, &rotation))
+		return;
+	nl_rotate_ship(c, &rotation);
+	queue_add_text_to_speech(c, reply);
+	return;
+
+no_understand:
+	queue_add_text_to_speech(c, "Sorry, I do not understand which direction you want to turn.");
+}
+
+/* Eg: "turn 90 degrees right " */
+static void nl_turn_qaa(void *context, int argc, char *argv[], int pos[],
+				union snis_nl_extra_data extra_data[])
+{
+	struct game_client *c = context;
+	int direction, amount, unit;
+	union quat rotation;
+	char reply[100];
+
+	amount = nl_find_next_word(argc, pos, POS_NUMBER, 0);
+	if (amount < 0)
+		goto no_understand;
+	unit = nl_find_next_word(argc, pos, POS_ADJECTIVE, amount + 1);
+	if (unit < 0)
+		goto no_understand;
+	direction = nl_find_next_word(argc, pos, POS_ADJECTIVE, unit + 1);
+	if (direction < 0)
+		goto no_understand;
+
+	if (strcasecmp(argv[unit], "degrees") != 0) {
+		queue_add_text_to_speech(c, "In degrees please?");
+		return;
+	}
+
+	if (nl_calculate_ship_rotation(c, argc, argv, pos, extra_data,
+					direction, amount, reply, &rotation))
+		return;
+	nl_rotate_ship(c, &rotation);
+	queue_add_text_to_speech(c, reply);
+	return;
+
+no_understand:
+	queue_add_text_to_speech(c, "Sorry, I do not understand which direction you want to turn.");
+}
+
+static void nl_set_controllable_byte_value(struct game_client *c, char *word, float fraction, int offset,
+						 bytevalue_limit_function limit)
+{
+	char answer[100];
+	uint8_t *bytevalue;
+	uint8_t new_value;
+
+	if (fraction < 0)
+		fraction = 0.0;
+	if (fraction > 1.0)
+		fraction = 1.0;
+	new_value = (uint8_t) (255.0 * fraction);
+
+	int i;
+	pthread_mutex_lock(&universe_mutex);
+	i = lookup_by_id(c->shipid);
+	if (i < 0) {
+		pthread_mutex_unlock(&universe_mutex);
+		sprintf(answer, "Sorry, I can't seem to find the %s, it must be a memory error", word);
+		queue_add_text_to_speech(c, answer);
+		return;
+	}
+	bytevalue = (uint8_t *) &go[i];
+	bytevalue += offset;
+	new_value = limit(c, new_value);
+	*bytevalue = new_value;
+	pthread_mutex_unlock(&universe_mutex);
+	sprintf(answer, "setting the %s to %3.0f percent", word, fraction * 100.0);
+	queue_add_text_to_speech(c, answer);
+}
+
+static void nl_set_shields(struct game_client *c, char *word, float fraction)
+{
+	int offset = offsetof(struct snis_entity, tsd.ship.power_data.shields.r1);
+	nl_set_controllable_byte_value(c, word, fraction, offset, no_limit);
+}
+
+static void nl_set_impulse_drive(struct game_client *c, char *word, float fraction)
+{
+	int offset = offsetof(struct snis_entity, tsd.ship.power_data.impulse.r1);
+	nl_set_controllable_byte_value(c, word, fraction, offset, no_limit);
+}
+
+static void nl_set_maneuvering_power(struct game_client *c, char *word, float fraction)
+{
+	int offset = offsetof(struct snis_entity, tsd.ship.power_data.maneuvering.r2);
+	nl_set_controllable_byte_value(c, word, fraction, offset, no_limit);
+}
+
+static void nl_set_impulse_power(struct game_client *c, char *word, float fraction)
+{
+	int offset = offsetof(struct snis_entity, tsd.ship.power_data.impulse.r2);
+	nl_set_controllable_byte_value(c, word, fraction, offset, no_limit);
+}
+
+static void nl_set_warp_power(struct game_client *c, char *word, float fraction)
+{
+	int offset = offsetof(struct snis_entity, tsd.ship.power_data.warp.r2);
+	nl_set_controllable_byte_value(c, word, fraction, offset, no_limit);
+}
+
+static void nl_set_sensor_power(struct game_client *c, char *word, float fraction)
+{
+	int offset = offsetof(struct snis_entity, tsd.ship.power_data.sensors.r2);
+	nl_set_controllable_byte_value(c, word, fraction, offset, no_limit);
+}
+
+static void nl_set_comms_power(struct game_client *c, char *word, float fraction)
+{
+	int offset = offsetof(struct snis_entity, tsd.ship.power_data.comms.r2);
+	nl_set_controllable_byte_value(c, word, fraction, offset, no_limit);
+}
+
+static void nl_set_phaser_power(struct game_client *c, char *word, float fraction)
+{
+	int offset = offsetof(struct snis_entity, tsd.ship.power_data.phasers.r2);
+	nl_set_controllable_byte_value(c, word, fraction, offset, no_limit);
+}
+
+static void nl_set_shield_power(struct game_client *c, char *word, float fraction)
+{
+	int offset = offsetof(struct snis_entity, tsd.ship.power_data.shields.r2);
+	nl_set_controllable_byte_value(c, word, fraction, offset, no_limit);
+}
+
+static void nl_set_tractor_power(struct game_client *c, char *word, float fraction)
+{
+	int offset = offsetof(struct snis_entity, tsd.ship.power_data.tractor.r2);
+	nl_set_controllable_byte_value(c, word, fraction, offset, no_limit);
+}
+
+static void nl_set_warpdrive(struct game_client *c, char *word, float fraction)
+{
+	int offset = offsetof(struct snis_entity, tsd.ship.power_data.warp.r1);
+	nl_set_controllable_byte_value(c, word, fraction, offset, no_limit);
+}
+
+static void nl_set_maneuvering_coolant(struct game_client *c, char *word, float fraction)
+{
+	int offset = offsetof(struct snis_entity, tsd.ship.coolant_data.maneuvering.r2);
+	nl_set_controllable_byte_value(c, word, fraction, offset, no_limit);
+}
+
+static void nl_set_impulse_coolant(struct game_client *c, char *word, float fraction)
+{
+	int offset = offsetof(struct snis_entity, tsd.ship.coolant_data.impulse.r2);
+	nl_set_controllable_byte_value(c, word, fraction, offset, no_limit);
+}
+
+static void nl_set_warp_coolant(struct game_client *c, char *word, float fraction)
+{
+	int offset = offsetof(struct snis_entity, tsd.ship.coolant_data.warp.r2);
+	nl_set_controllable_byte_value(c, word, fraction, offset, no_limit);
+}
+
+static void nl_set_sensor_coolant(struct game_client *c, char *word, float fraction)
+{
+	int offset = offsetof(struct snis_entity, tsd.ship.coolant_data.sensors.r2);
+	nl_set_controllable_byte_value(c, word, fraction, offset, no_limit);
+}
+
+static void nl_set_comms_coolant(struct game_client *c, char *word, float fraction)
+{
+	int offset = offsetof(struct snis_entity, tsd.ship.coolant_data.comms.r2);
+	nl_set_controllable_byte_value(c, word, fraction, offset, no_limit);
+}
+
+static void nl_set_phaser_coolant(struct game_client *c, char *word, float fraction)
+{
+	int offset = offsetof(struct snis_entity, tsd.ship.coolant_data.phasers.r2);
+	nl_set_controllable_byte_value(c, word, fraction, offset, no_limit);
+}
+
+static void nl_set_shield_coolant(struct game_client *c, char *word, float fraction)
+{
+	int offset = offsetof(struct snis_entity, tsd.ship.coolant_data.shields.r2);
+	nl_set_controllable_byte_value(c, word, fraction, offset, no_limit);
+}
+
+static void nl_set_tractor_coolant(struct game_client *c, char *word, float fraction)
+{
+	int offset = offsetof(struct snis_entity, tsd.ship.coolant_data.tractor.r2);
+	nl_set_controllable_byte_value(c, word, fraction, offset, no_limit);
+}
+
+static void nl_set_scizoom(struct game_client *c, char *word, float fraction)
+{
+	int offset = offsetof(struct snis_entity, tsd.ship.scizoom);
+	nl_set_controllable_byte_value(c, word, fraction, offset, no_limit);
+}
+
+static void nl_set_navzoom(struct game_client *c, char *word, float fraction)
+{
+	int offset = offsetof(struct snis_entity, tsd.ship.navzoom);
+	nl_set_controllable_byte_value(c, word, fraction, offset, no_limit);
+}
+
+static void nl_set_weapzoom(struct game_client *c, char *word, float fraction)
+{
+	int offset = offsetof(struct snis_entity, tsd.ship.weapzoom);
+	nl_set_controllable_byte_value(c, word, fraction, offset, no_limit);
+}
+
+static void nl_set_mainzoom(struct game_client *c, char *word, float fraction)
+{
+	int offset = offsetof(struct snis_entity, tsd.ship.mainzoom);
+	nl_set_controllable_byte_value(c, word, fraction, offset, no_limit);
+}
+
+static void nl_set_zoom(struct game_client *c, char *word, float value)
+{
+	char *zoom_name;
+
+	switch (bridgelist[c->bridge].current_displaymode) {
+	case DISPLAYMODE_MAINSCREEN:
+		zoom_name = "main screen zoom";
+		nl_set_mainzoom(c, zoom_name, value);
+		break;
+	case DISPLAYMODE_NAVIGATION:
+		zoom_name = "navigation zoom";
+		nl_set_navzoom(c, zoom_name, value);
+		break;
+	case DISPLAYMODE_WEAPONS:
+		zoom_name = "weapons zoom";
+		nl_set_weapzoom(c, zoom_name, value);
+		break;
+	case DISPLAYMODE_SCIENCE:
+		zoom_name = "science zoom";
+		nl_set_scizoom(c, zoom_name, value);
+		break;
+	default:
+		goto no_understand;
+	}
+	return;
+
+no_understand:
+	queue_add_text_to_speech(c, "I do not understand your zoom request.");
+}
+
+typedef void (*nl_set_function)(struct game_client *c, char *word, float value);
+static struct settable_thing_entry {
+	char *name;
+	nl_set_function setfn;
+} nl_settable_power_thing[] = {
+	{ "impulse", nl_set_impulse_power, },
+	{ "impulse drive", nl_set_impulse_power, },
+	{ "warp", nl_set_warp_power, },
+	{ "warp drive", nl_set_warp_power, },
+	{ "maneuvering", nl_set_maneuvering_power, },
+	{ "sensors", nl_set_sensor_power, },
+	{ "sensor", nl_set_sensor_power, },
+	{ "communications", nl_set_comms_power, },
+	{ "phasers", nl_set_phaser_power, },
+	{ "shields", nl_set_shield_power, },
+	{ "tractor beam", nl_set_tractor_power, },
+	{ "tractor", nl_set_tractor_power, },
+};
+
+static struct settable_thing_entry nl_settable_coolant_thing[] = {
+	{ "impulse", nl_set_impulse_coolant, },
+	{ "impulse drive", nl_set_impulse_coolant, },
+	{ "warp", nl_set_warp_coolant, },
+	{ "warp drive", nl_set_warp_coolant, },
+	{ "maneuvering", nl_set_maneuvering_coolant, },
+	{ "sensors", nl_set_sensor_coolant, },
+	{ "sensor", nl_set_sensor_coolant, },
+	{ "communications", nl_set_comms_coolant, },
+	{ "phasers", nl_set_phaser_coolant, },
+	{ "shields", nl_set_shield_coolant, },
+	{ "tractor beam", nl_set_tractor_coolant, },
+	{ "tractor", nl_set_tractor_coolant, },
+};
+
+static struct settable_thing_entry nl_settable_thing[] = {
+	{ "shields", nl_set_shields, },
+	{ "impulse drive", nl_set_impulse_drive, },
+	{ "warp drive", nl_set_warpdrive, },
+	{ "maneuvering power", nl_set_maneuvering_power, },
+	{ "impulse drive power", nl_set_impulse_power, },
+	{ "warp drive power", nl_set_warp_power, },
+	{ "sensor power", nl_set_sensor_power, },
+	{ "communications power", nl_set_comms_power, },
+	{ "phaser power", nl_set_phaser_power, },
+	{ "shield power", nl_set_shield_power, },
+	{ "tractor beam power", nl_set_tractor_power, },
+
+	{ "maneuvering coolant", nl_set_maneuvering_coolant, },
+	{ "impulse drive coolant", nl_set_impulse_coolant, },
+	{ "warp drive coolant", nl_set_warp_coolant, },
+	{ "sensor coolant", nl_set_sensor_coolant, },
+	{ "communications coolant", nl_set_comms_coolant, },
+	{ "phaser coolant", nl_set_phaser_coolant, },
+	{ "shield coolant", nl_set_shield_coolant, },
+	{ "tractor beam coolant", nl_set_tractor_coolant, },
+	{ "zoom", nl_set_zoom, },
+};
+
+static void nl_set_npq(void *context, int argc, char *argv[], int pos[],
+		union snis_nl_extra_data extra_data[])
+{
+	struct game_client *c = context;
+	int i, noun, prep, value;
+	float fraction;
+	nl_set_function setit = NULL;
+	char answer[100];
+
+	noun = nl_find_next_word(argc, pos, POS_NOUN, 0);
+	if (noun < 0)
+		goto no_understand;
+
+	for (i = 0; i < ARRAYSIZE(nl_settable_thing); i++) {
+		if (strcasecmp(nl_settable_thing[i].name, argv[noun]) == 0) {
+			setit = nl_settable_thing[i].setfn;
+			break;
+		}
+	}
+	if (!setit) {
+		sprintf(answer, "Sorry, I do not know how to set the %s", argv[noun]);
+		queue_add_text_to_speech(c, answer);
+		return;
+	}
+	prep = nl_find_next_word(argc, pos, POS_PREPOSITION, noun + 1);
+	if (prep < 0)
+		goto no_understand2;
+	value = nl_find_next_word(argc, pos, POS_NUMBER, prep + 1);
+	if (value < 0)
+		goto no_understand2;
+	fraction = extra_data[value].number.value;
+	if (fraction > 1.0 && fraction <= 100.0)
+		fraction = fraction / 100.0;
+	setit(c, argv[noun], fraction);
+	return;
+
+no_understand:
+	queue_add_text_to_speech(c, "Sorry, I do not know how to set that.");
+	return;
+no_understand2:
+	sprintf(answer, "Sorry, I do not understand how you want me to set the %s", argv[noun]);
+	queue_add_text_to_speech(c, answer);
+	return;
+}
+
+/* Eg: "set a course for blah..." */
+static void nl_set_npn(void *context, int argc, char *argv[], int pos[],
+		union snis_nl_extra_data extra_data[])
+{
+	struct game_client *c = context;
+	int setthing, prep, settowhat;
+	char *name, *namecopy, reply[100];
+	int i = -1;
+	union vec3 direction, right;
+	union quat new_orientation;
+	struct snis_entity *dest, *ship;
+
+	setthing = nl_find_next_word(argc, pos, POS_NOUN, 0);
+	if (setthing < 0)
+		goto no_understand;
+	prep = nl_find_next_word(argc, pos, POS_PREPOSITION, 0);
+	if (prep < 0)
+		goto no_understand;
+	settowhat = nl_find_next_word(argc, pos, POS_EXTERNAL_NOUN, prep);
+	pthread_mutex_lock(&universe_mutex);
+	if (settowhat < 0) {
+		i = nl_find_nearest_object(c, argc, argv, pos, extra_data, prep);
+		if (i < 0) {
+			pthread_mutex_unlock(&universe_mutex);
+			goto no_understand;
+		}
+	}
+
+	if (strcasecmp(argv[prep], "for") != 0 &&
+		strcasecmp(argv[prep], "to") != 0 &&
+		strcasecmp(argv[prep], "toward") != 0) {
+		pthread_mutex_unlock(&universe_mutex);
+		goto no_understand;
+	}
+
+	if (strcasecmp(argv[setthing], "course") != 0) {
+		pthread_mutex_unlock(&universe_mutex);
+		goto no_understand;
+	}
+
+	if (i < 0)
+		i = lookup_by_id(extra_data[settowhat].external_noun.handle);
+	if (i < 0) {
+		pthread_mutex_unlock(&universe_mutex);
+		queue_add_text_to_speech(c, "Sorry, I am not sure where that is.");
+		return;
+	}
+	dest = &go[i];
+	name = nl_get_object_name(dest);
+	if (!name) {
+		pthread_mutex_unlock(&universe_mutex);
+		queue_add_text_to_speech(c, "Sorry, I am not sure where that is.");
+		return;
+	}
+	namecopy = strdup(name);
+	i = lookup_by_id(c->shipid);
+	if (i < 0) {
+		pthread_mutex_unlock(&universe_mutex);
+		queue_add_text_to_speech(c, "Sorry, I am not quite sure where we are.");
+		return;
+	}
+	ship = &go[i];
+
+	/* Calculate new desired orientation of ship pointing towards destination */
+	right.v.x = 1.0;
+	right.v.y = 0.0;
+	right.v.z = 0.0;
+
+	direction.v.x = dest->x - ship->x;
+	direction.v.y = dest->y - ship->y;
+	direction.v.z = dest->z - ship->z;
+	vec3_normalize_self(&direction);
+
+	quat_from_u2v(&new_orientation, &right, &direction, NULL);
+
+	ship->tsd.ship.computer_desired_orientation = new_orientation;
+	ship->tsd.ship.computer_steering_time_left = COMPUTER_STEERING_TIME;
+	ship->tsd.ship.orbiting_object_id = 0xffffffff;
+
+	pthread_mutex_unlock(&universe_mutex);
+	sprintf(reply, "Setting course for %s.", namecopy);
+	queue_add_text_to_speech(c, reply);
+	free(namecopy);
+	return;
+
+no_understand:
+	queue_add_text_to_speech(c, "Sorry, I am not sure what you're asking me to do.");
+	return;
+}
+
+static void nl_disengage_n(void *context, int argc, char *argv[], int pos[],
+		union snis_nl_extra_data extra_data[])
+{
+	struct game_client *c = context;
+	int i, device;
+	char response[100];
+
+	device = nl_find_next_word(argc, pos, POS_NOUN, 0);
+	if (device < 0)
+		goto no_understand;
+
+	pthread_mutex_lock(&universe_mutex);
+	i = lookup_by_id(c->shipid);
+	if (i < 0) {
+		pthread_mutex_unlock(&universe_mutex);
+		sprintf(response, "Sorry, I cannot seem to disengage the %s.", argv[device]);
+		queue_add_text_to_speech(c, response);
+		return;
+	}
+
+	if (strcasecmp("docking system", argv[device]) == 0) {
+		if (!go[i].tsd.ship.docking_magnets) {
+			pthread_mutex_unlock(&universe_mutex);
+			queue_add_text_to_speech(c, "The docking system is already disengaged");
+			return;
+		} else {
+			go[i].tsd.ship.docking_magnets = 0;
+			pthread_mutex_unlock(&universe_mutex);
+			queue_add_text_to_speech(c, "Docking system disengaged");
+			return;
+		}
+	} else {
+		if (strcasecmp("tractor beam", argv[device]) == 0) {
+			int did_something = turn_off_tractorbeam(&go[i]);
+			pthread_mutex_unlock(&universe_mutex);
+			if (did_something)
+				queue_add_text_to_speech(c, "Tractor beam disengaged");
+			else
+				queue_add_text_to_speech(c, "The tractor beam is already disengaged");
+			return;
+		} else {
+			if (strcasecmp("red alert", argv[device]) == 0) {
+				pthread_mutex_unlock(&universe_mutex);
+				set_red_alert_mode(c, 0);
+				return;
+			} else {
+				pthread_mutex_unlock(&universe_mutex);
+				goto no_understand;
+			}
+		}
+	}
+
+no_understand:
+	queue_add_text_to_speech(c, "Sorry, I do not know how to disengage that.");
+	return;
+}
+
+/* increase power to impulse, increase coolant to blah, raise shields to maximum */
+static void nl_raise_or_lower_npa(void *context, int argc, char *argv[], int pos[],
+		union snis_nl_extra_data extra_data[], int raise)
+{
+	struct game_client *c = context;
+	nl_set_function setit = NULL;
+	char answer[100];
+	int i, noun, prep, adj;
+
+	noun = nl_find_next_word(argc, pos, POS_NOUN, 0);
+	if (noun < 0)
+		goto no_understand;
+	prep = nl_find_next_word(argc, pos, POS_PREPOSITION, noun + 1);
+	if (prep < 0)
+		goto no_understand;
+	adj = nl_find_next_word(argc, pos, POS_ADJECTIVE, prep + 1);
+	if (adj < 0)
+		goto no_understand;
+
+	for (i = 0; i < ARRAYSIZE(nl_settable_thing); i++) {
+		if (strcasecmp(nl_settable_thing[i].name, argv[noun]) == 0) {
+			setit = nl_settable_thing[i].setfn;
+			break;
+		}
+	}
+	if (setit) {
+		if (raise && strcasecmp(argv[adj], "maximum") == 0) {
+			setit(c, argv[noun], 1.0);
+			return;
+		}
+		if (!raise && strcasecmp(argv[adj], "minimum") == 0) {
+			setit(c, argv[noun], 0.0);
+			return;
+		}
+		sprintf(answer, "I don't know how to %s %s %s %s\n", raise ? "increase" : "decrease",
+				argv[noun], argv[prep], argv[adj]);
+		queue_add_text_to_speech(c, answer);
+		return;
+	} else if (strcasecmp(argv[noun], "power") == 0) {
+		for (i = 0; i < ARRAYSIZE(nl_settable_power_thing); i++) {
+			if (strcasecmp(nl_settable_power_thing[i].name, argv[adj]) == 0) {
+				setit = nl_settable_power_thing[i].setfn;
+				break;
+			}
+		}
+		if (!setit) {
+			sprintf(answer, "I don't know how to increase power to that.\n");
+			queue_add_text_to_speech(c, answer);
+			return;
+		}
+		setit(c, argv[adj], raise ? 1.0 : 0.0);
+		return;
+	} else if (strcasecmp(argv[noun], "coolant") == 0) {
+		for (i = 0; i < ARRAYSIZE(nl_settable_coolant_thing); i++) {
+			if (strcasecmp(nl_settable_coolant_thing[i].name, argv[adj]) == 0) {
+				setit = nl_settable_coolant_thing[i].setfn;
+				break;
+			}
+		}
+		if (!setit) {
+			sprintf(answer, "I don't know how to decrease power to that.\n");
+			queue_add_text_to_speech(c, answer);
+			return;
+		}
+		setit(c, argv[adj], raise ? 1.0 : 0.0);
+		return;
+	}
+no_understand:
+	queue_add_text_to_speech(c, "I don't know how to adjust that.");
+}
+
+static void nl_raise_npa(void *context, int argc, char *argv[], int pos[],
+		union snis_nl_extra_data extra_data[])
+{
+	nl_raise_or_lower_npa(context, argc, argv, pos, extra_data, 1);
+}
+
+static void nl_lower_npa(void *context, int argc, char *argv[], int pos[],
+		union snis_nl_extra_data extra_data[])
+{
+	nl_raise_or_lower_npa(context, argc, argv, pos, extra_data, 0);
+}
+
+/* "raise shields" */
+static void nl_shields_p(void *context, int argc, char *argv[], int pos[],
+		union snis_nl_extra_data extra_data[])
+{
+	struct game_client *c = context;
+	int prep;
+
+	prep = nl_find_next_word(argc, pos, POS_PREPOSITION, 0);
+	if (prep < 0)
+		goto no_understand;
+	if (strcasecmp(argv[prep], "up") == 0)
+		nl_set_shields(c, "shields", 1.0);
+	else if (strcasecmp(argv[prep], "down") == 0)
+		nl_set_shields(c, "shields", 0.0);
+	else
+		goto no_understand;
+	return;
+
+no_understand:
+	queue_add_text_to_speech(c, "Sorry, I do not know what you want me to do with the shields.");
+}
+
+/* "raise shields" */
+static void nl_raise_or_lower_n(void *context, int argc, char *argv[], int pos[],
+		union snis_nl_extra_data extra_data[], int raise)
+{
+	struct game_client *c = context;
+	nl_set_function setit = NULL;
+	char answer[100];
+	int i, noun;
+
+	noun = nl_find_next_word(argc, pos, POS_NOUN, 0);
+	if (noun < 0)
+		goto no_understand;
+
+	for (i = 0; i < ARRAYSIZE(nl_settable_thing); i++) {
+		if (strcasecmp(nl_settable_thing[i].name, argv[noun]) == 0) {
+			setit = nl_settable_thing[i].setfn;
+			break;
+		}
+	}
+	if (!setit) {
+		sprintf(answer, "Sorry, I do not know how to raise the %s", argv[noun]);
+		queue_add_text_to_speech(c, answer);
+		return;
+	}
+	setit(c, argv[noun], raise ? 1.0 : 0.0);
+	return;
+
+no_understand:
+	if (raise)
+		queue_add_text_to_speech(c, "Sorry, I do not know how to increase that.");
+	else
+		queue_add_text_to_speech(c, "Sorry, I do not know how to decrease that.");
+}
+
+static void nl_raise_n(void *context, int argc, char *argv[], int pos[],
+		union snis_nl_extra_data extra_data[])
+{
+	nl_raise_or_lower_n(context, argc, argv, pos, extra_data, 1);
+}
+
+static void nl_lower_n(void *context, int argc, char *argv[], int pos[],
+		union snis_nl_extra_data extra_data[])
+{
+	nl_raise_or_lower_n(context, argc, argv, pos, extra_data, 0);
+}
+
+static void nl_engage_n(void *context, int argc, char *argv[], int pos[],
+		union snis_nl_extra_data extra_data[])
+{
+	struct game_client *c = context;
+	int i;
+	int device, enough_oomph;
+	char response[100];
+
+	device = nl_find_next_word(argc, pos, POS_NOUN, 0);
+	if (device < 0)
+		goto no_understand;
+
+	pthread_mutex_lock(&universe_mutex);
+	i = lookup_by_id(c->shipid);
+	if (i < 0) {
+		pthread_mutex_unlock(&universe_mutex);
+		sprintf(response, "Sorry, I cannot seem to engage the %s.", argv[device]);
+		queue_add_text_to_speech(c, response);
+		return;
+	}
+
+	if (strcasecmp("warp drive", argv[device]) == 0) {
+		pthread_mutex_unlock(&universe_mutex);
+		enough_oomph = do_engage_warp_drive(&go[i]);
+		send_initiate_warp_packet(c, enough_oomph);
+		sprintf(response, "%s engaged", argv[device]);
+		queue_add_text_to_speech(c, response);
+		return;
+	} else if (strcasecmp("docking system", argv[device]) == 0) {
+		if (go[i].tsd.ship.docking_magnets) {
+			pthread_mutex_unlock(&universe_mutex);
+			queue_add_text_to_speech(c, "The docking system is already engaged");
+			return;
+		} else {
+			go[i].tsd.ship.docking_magnets = 1;
+			pthread_mutex_unlock(&universe_mutex);
+			queue_add_text_to_speech(c, "Docking system engaged");
+			return;
+		}
+	} else if (strcasecmp("tractor beam", argv[device]) == 0) {
+		pthread_mutex_unlock(&universe_mutex);
+		turn_on_tractor_beam(c, &go[i], 0xffffffff, 0);
+		return;
+	} else if (strcasecmp("red alert", argv[device]) == 0) {
+		pthread_mutex_unlock(&universe_mutex);
+		set_red_alert_mode(c, 1);
+		return;
+	} else {
+		pthread_mutex_unlock(&universe_mutex);
+		goto no_understand;
+	}
+
+no_understand:
+	queue_add_text_to_speech(c, "Sorry, I do not know how to engage that.");
+	return;
+}
+
+static void nl_engage_npn(void *context, int argc, char *argv[], int pos[],
+		union snis_nl_extra_data extra_data[])
+{
+	struct game_client *c = context;
+	int i, device, prep, target;
+	char reply[100];
+
+	device = nl_find_next_word(argc, pos, POS_NOUN, 0);
+	if (device < 0)
+		goto no_understand;
+	prep = nl_find_next_word(argc, pos, POS_PREPOSITION, 0);
+	if (prep < 0)
+		goto no_understand;
+	target = nl_find_next_word(argc, pos, POS_EXTERNAL_NOUN, 0);
+	if (target < 0)
+		goto no_understand;
+
+	if (strcasecmp("tractor beam", argv[device]) == 0) {
+		pthread_mutex_lock(&universe_mutex);
+		i = lookup_by_id(c->shipid);
+		if (i < 0) {
+			pthread_mutex_unlock(&universe_mutex);
+			sprintf(reply, "Sorry, I cannot seem to engage the %s.", argv[device]);
+			queue_add_text_to_speech(c, reply);
+			return;
+		}
+		pthread_mutex_unlock(&universe_mutex);
+		turn_on_tractor_beam(c, &go[i], extra_data[target].external_noun.handle, 0);
+		return;
+	} else {
+		sprintf(reply, "I do not understand how engaging the %s relates to the %s\n",
+				argv[device], argv[target]);
+		queue_add_text_to_speech(c, reply);
+		return;
+	}
+	return;
+
+no_understand:
+	queue_add_text_to_speech(c, "Sorry, I am unfamiliar with the way you are using the word engage");
+}
+
+static void nl_leave_or_enter_n(void *context, int argc, char *argv[], int pos[],
+			__attribute__((unused)) union snis_nl_extra_data extra_data[], int entering)
+{
+	struct game_client *c = context;
+	int i, noun;
+
+	noun = nl_find_next_word(argc, pos, POS_NOUN, 0);
+	if (noun < 0)
+		goto no_understand;
+	pthread_mutex_lock(&universe_mutex);
+	i = lookup_by_id(c->shipid);
+	if (i < 0) {
+		pthread_mutex_unlock(&universe_mutex);
+		queue_add_text_to_speech(c, "Sorry, I seem to have lost my mind.");
+		return;
+	}
+	if (strcasecmp(argv[noun], "orbit") == 0) {
+		if (entering && go[i].tsd.ship.orbiting_object_id != 0xffffffff) {
+			pthread_mutex_unlock(&universe_mutex);
+			queue_add_text_to_speech(c, "Already in standard orbit");
+			return;
+		}
+		if (!entering && go[i].tsd.ship.orbiting_object_id == 0xffffffff) {
+			pthread_mutex_unlock(&universe_mutex);
+			queue_add_text_to_speech(c, "We are not in standard orbit");
+			return;
+		}
+		toggle_standard_orbit(c, &go[i]); /* releases universe mutex */
+		return;
+	}
+	pthread_mutex_unlock(&universe_mutex);
+
+no_understand:
+	queue_add_text_to_speech(c, "Sorry, I am unfamiliar with the way you are using the word leave");
+}
+
+static void nl_leave_n(void *context, int argc, char *argv[], int pos[], union snis_nl_extra_data extra_data[])
+{
+	nl_leave_or_enter_n(context, argc, argv, pos, extra_data, 0);
+}
+
+static void nl_leave_an(void *context, int argc, char *argv[], int pos[], union snis_nl_extra_data extra_data[])
+{
+	nl_leave_or_enter_n(context, argc, argv, pos, extra_data, 0);
+}
+
+static void nl_enter_n(void *context, int argc, char *argv[], int pos[], union snis_nl_extra_data extra_data[])
+{
+	nl_leave_or_enter_n(context, argc, argv, pos, extra_data, 1);
+}
+
+static void nl_enter_an(void *context, int argc, char *argv[], int pos[], union snis_nl_extra_data extra_data[])
+{
+	nl_leave_or_enter_n(context, argc, argv, pos, extra_data, 1);
+}
+
+static void nl_red_alert(void *context,
+			__attribute__((unused)) int argc,
+			__attribute__((unused)) char *argv[], int pos[],
+			__attribute__((unused)) union snis_nl_extra_data extra_data[])
+{
+	struct game_client *c = context;
+	unsigned char new_alert_mode = 1;
+	set_red_alert_mode(c, new_alert_mode);
+}
+
+static void nl_red_alert_p(void *context, int argc, char *argv[], int pos[],
+			__attribute__((unused)) union snis_nl_extra_data extra_data[])
+{
+	struct game_client *c = context;
+	unsigned char new_alert_mode = 0;
+	char reply[100];
+	int prep;
+
+	prep = nl_find_next_word(argc, pos, POS_PREPOSITION, 0);
+	if (prep < 0)
+		goto no_understand; /* Should not get here, there really should be a preposition. */
+	if (strcasecmp(argv[prep], "on") == 0) {
+		new_alert_mode = 1;
+	} else {
+		if (strcasecmp(argv[prep], "off") == 0) {
+			new_alert_mode = 0;
+		} else {
+			sprintf(reply, "Sorry, I do not know what red alert %s means.", argv[prep]);
+			queue_add_text_to_speech(c, reply);
+			return;
+		}
+	}
+	set_red_alert_mode(c, new_alert_mode);
+
+no_understand:
+	sprintf(reply, "Did you want red alert on or off?  I seem to have missed the preposition.");
+	return;
+}
+
+static int string_to_displaymode(char *string)
+{
+	if (strcasecmp(string, "navigation") == 0)
+		return DISPLAYMODE_NAVIGATION;
+	else if (strcasecmp(string, "main view") == 0)
+		return DISPLAYMODE_MAINSCREEN;
+	else if (strcasecmp(string, "weapons") == 0)
+		return DISPLAYMODE_WEAPONS;
+	else if (strcasecmp(string, "engineering") == 0)
+		return DISPLAYMODE_ENGINEERING;
+	else if (strcasecmp(string, "science") == 0)
+		return DISPLAYMODE_SCIENCE;
+	else if (strcasecmp(string, "communications") == 0)
+		return DISPLAYMODE_COMMS;
+	return -1;
+}
+
+static void nl_onscreen_verb_n(void *context, int argc, char *argv[], int pos[],
+			__attribute__((unused)) union snis_nl_extra_data extra_data[])
+{
+	struct game_client *c = context;
+	int verb, noun;
+	int new_displaymode = 255;
+	char reply[100];
+
+	verb = nl_find_next_word(argc, pos, POS_VERB, 0);
+	if (verb < 0)
+		goto no_understand;
+	noun = nl_find_next_word(argc, pos, POS_NOUN, 0);
+	if (noun < 0)
+		goto no_understand;
+	new_displaymode = string_to_displaymode(argv[verb]);
+	if (new_displaymode < 0)
+		goto no_understand;
+
+	if (strcasecmp(argv[noun], "screen") != 0)
+		goto no_understand;
+
+	sprintf(reply, "Main screen displaying %s", argv[verb]);
+	queue_add_text_to_speech(c, reply);
+	send_packet_to_all_clients_on_a_bridge(c->shipid,
+			packed_buffer_new("bb", OPCODE_ROLE_ONSCREEN, new_displaymode),
+			ROLE_MAIN);
+	bridgelist[c->bridge].current_displaymode = new_displaymode;
+	return;
+
+no_understand:
+	queue_add_text_to_speech(c, "I do not understand your request.");
+	return;
+}
+
+static void nl_onscreen_verb_pn(void *context, int argc, char *argv[], int pos[],
+			__attribute__((unused)) union snis_nl_extra_data extra_data[])
+{
+	struct game_client *c = context;
+	int verb, prep, noun;
+	int new_displaymode = 255;
+	char reply[100];
+
+	verb = nl_find_next_word(argc, pos, POS_VERB, 0);
+	if (verb < 0)
+		goto no_understand;
+	prep = nl_find_next_word(argc, pos, POS_PREPOSITION, 0);
+	if (prep < 0)
+		goto no_understand;
+	noun = nl_find_next_word(argc, pos, POS_NOUN, 0);
+	if (noun < 0)
+		goto no_understand;
+	new_displaymode = string_to_displaymode(argv[verb]);
+	if (new_displaymode < 0)
+		goto no_understand;
+
+	if (strcasecmp(argv[prep], "on") != 0)
+		goto no_understand;
+
+	if (strcasecmp(argv[noun], "screen") != 0)
+		goto no_understand;
+
+	sprintf(reply, "Main screen displaying %s", argv[verb]);
+	queue_add_text_to_speech(c, reply);
+	send_packet_to_all_clients_on_a_bridge(c->shipid,
+			packed_buffer_new("bb", OPCODE_ROLE_ONSCREEN, new_displaymode),
+			ROLE_MAIN);
+	bridgelist[c->bridge].current_displaymode = new_displaymode;
+	return;
+
+no_understand:
+	queue_add_text_to_speech(c, "I do not understand your request.");
+	return;
+}
+
+static void nl_zoom_q(void *context, int argc, char *argv[], int pos[], union snis_nl_extra_data extra_data[])
+{
+	struct game_client *c = context;
+	int number;
+	float amount;
+
+	number = nl_find_next_word(argc, pos, POS_NUMBER, 0);
+	if (number < 0)
+		goto no_understand;
+	amount = extra_data[number].number.value;
+	if (amount > 1.0)
+		amount = amount / 100.0;
+	if (amount < 0.0 || amount > 1.0)
+		goto no_understand;
+	nl_set_zoom(c, "", amount);
+	return;
+no_understand:
+	queue_add_text_to_speech(c, "I do not understand your zoom request.");
+}
+
+static void nl_zoom_pq(void *context, int argc, char *argv[], int pos[], union snis_nl_extra_data extra_data[])
+{
+	struct game_client *c = context;
+	int prep, number;
+	float direction = 1.0;
+	float amount;
+	/* char *zoom_name; */
+
+	prep = nl_find_next_word(argc, pos, POS_PREPOSITION, 0);
+	if (prep < 0)
+		goto no_understand;
+	if (strcasecmp(argv[prep], "out") == 0)
+		direction = -1.0;
+	else
+		direction = 1.0;
+	number = nl_find_next_word(argc, pos, POS_NUMBER, prep);
+	if (number < 0)
+		goto no_understand;
+	amount = extra_data[number].number.value;
+	if (amount > 1.0)
+		amount = amount / 100.0;
+	if (amount < 0.0 || amount > 1.0)
+		goto no_understand;
+
+	if (direction < 0)
+		amount = 1.0 - amount;
+
+#if 1
+	nl_set_zoom(c, "", amount);
+#else
+	switch (bridgelist[c->bridge].current_displaymode) {
+	case DISPLAYMODE_MAINSCREEN:
+		zoom_name = "main screen zoom";
+		nl_set_mainzoom(c, zoom_name, amount);
+		break;
+	case DISPLAYMODE_NAVIGATION:
+		zoom_name = "navigation zoom";
+		nl_set_navzoom(c, zoom_name, amount);
+		break;
+	case DISPLAYMODE_WEAPONS:
+		zoom_name = "weapons zoom";
+		nl_set_weapzoom(c, zoom_name, amount);
+		break;
+	case DISPLAYMODE_SCIENCE:
+		zoom_name = "science zoom";
+		nl_set_scizoom(c, zoom_name, amount);
+		break;
+	default:
+		goto no_understand;
+	}
+#endif
+	return;
+
+no_understand:
+	queue_add_text_to_speech(c, "I do not understand your zoom request.");
+}
+
+static void nl_reverse_n(void *context, int argc, char *argv[], int pos[],
+			union snis_nl_extra_data extra_data[])
+{
+	struct game_client *c = context;
+	int i, noun;
+	struct snis_entity *o;
+
+	noun = nl_find_next_word(argc, pos, POS_NOUN, 0);
+	if (noun < 0)
+		goto no_understand;
+
+	if (strcasecmp(argv[noun], "polarity") == 0) {
+		queue_add_text_to_speech(c, "Very funny, Dave");
+		return;
+	}
+	if (strcasecmp(argv[noun], "thrusters") == 0 ||
+		strcasecmp(argv[noun], "impulse drive") == 0) {
+		goto full_reverse;
+	}
+	queue_add_text_to_speech(c, "I do not how to reverse that.");
+	return;
+
+full_reverse:
+	pthread_mutex_lock(&universe_mutex);
+	i = lookup_by_id(c->shipid);
+	if (i < 0) {
+		pthread_mutex_unlock(&universe_mutex);
+		queue_add_text_to_speech(c, "I lost my train of thought.");
+		return;
+	}
+	o = &go[i];
+	o->tsd.ship.reverse = 1;
+	pthread_mutex_unlock(&universe_mutex);
+	nl_set_impulse_drive(c, "impulse drive", 1.0);
+	return;
+
+no_understand:
+	queue_add_text_to_speech(c, "I do not understand your zoom request.");
+}
+
+static void nl_shortlong_range_scan(void *context, int argc, char *argv[], int pos[],
+			union snis_nl_extra_data extra_data[])
+{
+	struct game_client *c = context;
+	uint8_t mode;
+
+	int verb;
+
+	verb = nl_find_next_word(argc, pos, POS_VERB, 0);
+	if (verb < 0)
+		goto no_understand;
+
+	if (strcasecmp("long range scan", argv[verb]) == 0)
+		mode = SCI_DETAILS_MODE_THREED;
+	else if (strcasecmp("short range scan", argv[verb]) == 0)
+		mode = SCI_DETAILS_MODE_SCIPLANE;
+	else if (strcasecmp("details", argv[verb]) == 0)
+		mode = SCI_DETAILS_MODE_DETAILS;
+	else
+		goto no_understand;
+	send_packet_to_all_clients_on_a_bridge(c->shipid,
+			packed_buffer_new("bb", OPCODE_SCI_DETAILS, mode), ROLE_ALL | ROLE_SCIENCE);
+	return;
+
+no_understand:
+	queue_add_text_to_speech(c, "I do not understand your request.");
+}
+
+static void nl_target_n(void *context, int argc, char *argv[], int pos[], union snis_nl_extra_data extra_data[])
+{
+	struct game_client *c = context;
+	int i, noun;
+	char *name, *namecopy;
+	char reply[100];
+	uint32_t id;
+
+	noun = nl_find_next_word(argc, pos, POS_EXTERNAL_NOUN, 0);
+	pthread_mutex_lock(&universe_mutex);
+	if (noun < 0) {
+		i = nl_find_nearest_object(c, argc, argv, pos, extra_data, 0);
+		if (i < 0) {
+			pthread_mutex_unlock(&universe_mutex);
+			goto target_lost;
+		}
+		id = go[i].id;
+	} else {
+		id = extra_data[noun].external_noun.handle;
+		i = lookup_by_id(id);
+	}
+	if (i < 0) {
+		pthread_mutex_unlock(&universe_mutex);
+		goto target_lost;
+	}
+	name = nl_get_object_name(&go[i]);
+	if (name)
+		namecopy = strdup(name);
+	else
+		namecopy = NULL;
+	pthread_mutex_unlock(&universe_mutex);
+	if (!namecopy)
+		goto target_lost;
+	sprintf(reply, "Targeting sensors on %s", namecopy);
+	free(namecopy);
+	queue_add_text_to_speech(c, reply);
+	science_select_target(c, id);
+	return;
+
+target_lost:
+	queue_add_text_to_speech(c, "Unable to locate the specified target for scanning.");
+	return;
+}
+
+struct damage_report_entry {
+	char system[100];
+	int percent;
+};
+
+static int compare_damage_report_entries(const void *a, const void *b)
+{
+	const struct damage_report_entry * const dra = a;
+	const struct damage_report_entry * const drb = b;
+
+	return dra->percent > drb->percent;
+}
+
+static void nl_damage_report(void *context, int argc, char *argv[], int pos[],
+		__attribute__((unused)) union snis_nl_extra_data extra_data[])
+{
+	struct game_client *c = context;
+	struct damage_report_entry dr[8];
+	struct snis_entity *o;
+	int i;
+	char damage_report[250];
+	char next_bit[100];
+	int ok = 0;
+
+	pthread_mutex_lock(&universe_mutex);
+	i = lookup_by_id(c->shipid);
+	if (i < 0) {
+		pthread_mutex_unlock(&universe_mutex);
+		queue_add_text_to_speech(c,
+			"I seem to be unable to collect the necessary data to provide a damage report.");
+		return;
+	}
+	o = &go[i];
+
+	dr[0].percent = (int) (100.0 * (1.0 - (float) o->tsd.ship.damage.maneuvering_damage / 255.0));
+	sprintf(dr[0].system, "Maneuvering");
+	dr[1].percent = (int) (100.0 * (1.0 - (float) o->tsd.ship.damage.warp_damage / 255.0));
+	sprintf(dr[1].system, "Impulse drive");
+	dr[2].percent = (int) (100.0 * (1.0 - (float) o->tsd.ship.damage.impulse_damage / 255.0));
+	sprintf(dr[2].system, "Warp drive");
+	dr[3].percent = (int) (100.0 * (1.0 - (float) o->tsd.ship.damage.phaser_banks_damage / 255.0));
+	sprintf(dr[3].system, "Phasers");
+	dr[4].percent = (int) (100.0 * (1.0 - (float) o->tsd.ship.damage.comms_damage / 255.0));
+	sprintf(dr[4].system, "Communications");
+	dr[5].percent = (int) (100.0 * (1.0 - (float) o->tsd.ship.damage.sensors_damage / 255.0));
+	sprintf(dr[5].system, "Sensors");
+	dr[6].percent = (int) (100.0 * (1.0 - (float) o->tsd.ship.damage.shield_damage / 255.0));
+	sprintf(dr[6].system, "Shields");
+	dr[7].percent = (int) (100.0 * (1.0 - (float) o->tsd.ship.damage.tractor_damage / 255.0));
+	sprintf(dr[7].system, "Tractor beam");
+	pthread_mutex_unlock(&universe_mutex);
+
+	qsort(dr, 8, sizeof(dr[0]), compare_damage_report_entries);
+
+	sprintf(damage_report, "Damage Report. ");
+	for (i = 0; i < 8; i++) {
+		if (dr[i].percent > 80) {
+			ok++;
+			continue;
+		}
+		sprintf(next_bit, "%s %d%%. ", dr[i].system, dr[i].percent);
+		strcat(damage_report, next_bit);
+	}
+	if (ok == 8) {
+		strcat(damage_report, "All systems within normal operating range.");
+	} else {
+		if (ok > 0) {
+			strcat(damage_report, "Remaining systems are within normal operating range.");
+		}
+	}
+	if (dr[6].percent < 20) {
+		strcat(damage_report, " Suggest repairing sheilds immediately.");
+	}
+	queue_add_text_to_speech(c, damage_report);
+}
+
+static void nl_launch_n(void *context, int argc, char *argv[], int pos[],
+		__attribute__((unused)) union snis_nl_extra_data extra_data[])
+{
+	struct game_client *c = context;
+	struct snis_entity *ship;
+	uint32_t oid;
+	int i, noun;
+
+	noun = nl_find_next_word(argc, pos, POS_NOUN, 0);
+	if (noun < 0)
+		goto no_understand;
+	if (strcasecmp(argv[noun], "robot") == 0) {
+		pthread_mutex_lock(&universe_mutex);
+		oid = bridgelist[c->bridge].science_selection;
+		if (oid == 0xffffffff) {
+			pthread_mutex_unlock(&universe_mutex);
+			goto no_target;
+		}
+		i = lookup_by_id(c->shipid);
+		pthread_mutex_unlock(&universe_mutex);
+		if (i < 0) {
+			queue_add_text_to_speech(c, "I'm sorry, I seem to have lost my train of thought");
+			return;
+		}
+		ship = &go[i];
+		launch_mining_bot(c, ship, oid);
+		return;
+	}
+
+no_understand:
+	queue_add_text_to_speech(c, "I'm sorry, launch what?");
+	return;
+
+no_target:
+	queue_add_text_to_speech(c, "Sorry, no mining target selected.");
+	return;
+}
+
+static void nl_set_reverse(struct game_client *c, int reverse, float value)
+{
+	int i;
+	struct snis_entity *o;
+
+	pthread_mutex_lock(&universe_mutex);
+	i = lookup_by_id(c->shipid);
+	if (i < 0) {
+		pthread_mutex_unlock(&universe_mutex);
+		queue_add_text_to_speech(c, "I lost my train of thought.");
+		return;
+	}
+	o = &go[i];
+	o->tsd.ship.reverse = reverse;
+	pthread_mutex_unlock(&universe_mutex);
+	nl_set_impulse_drive(c, "impulse drive", value);
+}
+
+/* full stop, full throttle, full reverse... */
+static void nl_full_n(void *context, int argc, char *argv[], int pos[],
+		__attribute__((unused)) union snis_nl_extra_data extra_data[])
+{
+	struct game_client *c = context;
+	int noun, reverse = 0;
+	float value = 1.0;
+
+	noun = nl_find_next_word(argc, pos, POS_NOUN, 0);
+	if (noun < 0)
+		goto no_understand;
+	if (strcasecmp(argv[noun], "impulse drive") == 0)
+		goto full_throttle;
+	if (strcasecmp(argv[noun], "power") == 0)
+		goto full_throttle;
+	if (strcasecmp(argv[noun], "speed") == 0)
+		goto full_throttle;
+	if (strcasecmp(argv[noun], "reverse") == 0) {
+		reverse = 1;
+		goto full_throttle;
+	}
+	if (strcasecmp(argv[noun], "stop") == 0) {
+		value = 0.0;
+		goto full_throttle;
+	}
+
+full_throttle: /* or full reverse, or full stop */
+	nl_set_reverse(c, reverse, value);
+	return;
+
+no_understand:
+	queue_add_text_to_speech(c, "I'm sorry, full what?");
+}
+
+/* full speed ahead */
+static void nl_full_na(void *context, int argc, char *argv[], int pos[],
+		__attribute__((unused)) union snis_nl_extra_data extra_data[])
+{
+	struct game_client *c = context;
+	int adj, noun, reverse;
+
+	noun = nl_find_next_word(argc, pos, POS_NOUN, 0);
+	if (noun < 0)
+		goto no_understand;
+	adj = nl_find_next_word(argc, pos, POS_ADJECTIVE, 0);
+	if (adj < 0)
+		goto no_understand;
+	if (strcasecmp(argv[noun], "speed") == 0 ||
+		strcasecmp(argv[noun], "throttle") == 0 ||
+		strcasecmp(argv[noun], "impulse-drive") == 0) {
+		if (strcasecmp(argv[adj], "ahead") == 0 ||
+			strcasecmp(argv[adj], "impulse") == 0) {
+			reverse = 0;
+		} else if (strcasecmp(argv[adj], "reverse") == 0 ||
+				strcasecmp(argv[adj], "backwards") == 0 ||
+				strcasecmp(argv[adj], "back") == 0) {
+			reverse = 1;
+		} else  {
+			goto no_understand;
+		}
+		nl_set_reverse(c, reverse, 1.0);
+		return;
+	}
+
+no_understand:
+	queue_add_text_to_speech(c, "I am sorry, I did not understand that.");
+}
+
+static void sorry_dave(void *context, int argc, char *argv[], int pos[],
+		__attribute__((unused)) union snis_nl_extra_data extra_data[])
+{
+	struct game_client *c = context;
+	queue_add_text_to_speech(c, "I am sorry Dave, I am afraid I can't do that.");
+}
+
+static void natural_language_parse_failure(void *context)
+{
+	struct game_client *c = context;
+	queue_add_text_to_speech(c, "I am sorry, I did not understand that.");
+}
+
+static inline void nl_decode_spaces(char *text)
+{
+	char *x;
+
+	for (x = text; *x; x++)
+		if (*x == '_')
+			*x = ' ';
+}
+
+static inline void nl_encode_spaces(char *text, int len)
+{
+	int i;
+	char *x;
+
+	x = text;
+	for (i = 0; i < len && *x; i++) {
+		if (*x == ' ')
+			*x = '_';
+		x++;
+	}
+}
+
+static void natural_language_multiword_preprocessor(char *text, int coding_direction)
+{
+	char *hit;
+	int i;
+
+	if (coding_direction == SNIS_NL_DECODE) {
+		nl_decode_spaces(text);
+		return;
+	}
+	if (coding_direction != SNIS_NL_ENCODE) {
+		fprintf(stderr, "%s: Invalid coding direction\n", logprefix());
+		return;
+	}
+	pthread_mutex_lock(&universe_mutex);
+	for (i = 0; i <= snis_object_pool_highest_object(pool); i++) {
+		char *name = nl_get_object_name(&go[i]);
+		if (name[0] == '\0')
+			continue;
+		hit = strcasestr(text, name);
+		if (hit)
+			nl_encode_spaces(hit, strlen(name));
+	}
+	pthread_mutex_unlock(&universe_mutex);
+}
+
+static const struct nl_test_case_entry {
+	char *text;
+	int expected;
+} nl_test_case[] = {
+	{ "exit standard orbit", 0, },
+	{ "leave standard orbit", 0, },
+	{ "enter standard orbit", 0, },
+	{ "standard orbit", 0, },
+	{ "ramming speed", 0, },
+	{ "ramming velocity", 0, },
+	{ "shields up", 0, },
+	{ "shields down", 0, },
+	{ "set a course for the nearest planet", 0, },
+	{ "activate warp drive", 0, },
+	{ "engage warp drive", 0, },
+	{ "actuate warp drive", 0, },
+	{ "energize warp drive", 0, },
+	{ "disengage docking system", 0, },
+	{ "deactivate docking system", 0, },
+	{ "energize docking system", 0, },
+	{ "engage docking system", 0, },
+	{ "actuate docking system", 0, },
+	{ "increase power to impulse", 0, },
+	{ "maximum power to impulse", 0, },
+	{ "max coolant to tractor beam", 0, },
+	{ "increase power to warp", 0, },
+	{ "increase coolant to maneuvering", 0, },
+	{ "increase coolant to sensors", 0, },
+	{ "full stop", 0, },
+	{ "full reverse", 0, },
+	{ "full power", 0, },
+	{ "full impulse", 0, },
+	{ "full impulse drive", 0, },
+	{ "full power to impulse drive", 0, },
+	{ "full power to shields", 0, },
+	{ "full power to warp drive", 0, },
+	{ "full power to maneuvering", 0, },
+	{ "full power to impulse", 0, },
+	{ "full power to tractor beam", 0, },
+	{ "full power to sensors", 0, },
+	{ "full power to phasers", 0, },
+	{ "full speed", 0, },
+	{ "full speed ahead", 0, },
+	{ "full speed reverse", 0, },
+	{ "maximum speed ahead", 0, },
+	{ "maximum speed reverse", 0, },
+	{ "cut power to impulse drive", 0, },
+	{ "cut power to impulse drive", 0, },
+	{ "cut power to shields", 0, },
+	{ "cut power to warp drive", 0, },
+	{ "cut power to maneuvering", 0, },
+	{ "cut power to impulse", 0, },
+	{ "cut power to tractor beam", 0, },
+	{ "cut power to sensors", 0, },
+	{ "cut power to phasers", 0, },
+	{ "set a course for the nearest planet", 0, },
+	{ "plot a course for the nearest planet", 0, },
+	{ "lay in a course for the nearest planet", 0, },
+	{ "set a course for the nearest asteroid", 0, },
+	{ "plot a course for the nearest asteroid", 0, },
+	{ "lay in a course for the nearest asteroid", 0, },
+	{ "set a course for the nearest star base", 0, },
+	{ "plot a course for the nearest star base", 0, },
+	{ "lay in a course for the nearest star base", 0, },
+	{ "set a course for the nearest nebula", 0, },
+	{ "plot a course for the nearest nebula", 0, },
+	{ "lay in a course for the nearest nebula", 0, },
+	{ "set a course for the nearest warp gate", 0, },
+	{ "plot a course for the nearest warp gate", 0, },
+	{ "lay in a course for the nearest warp gate", 0, },
+	{ "set a course for the nearest worm hole", 0, },
+	{ "plot a course for the nearest worm hole", 0, },
+	{ "lay in a course for the nearest worm hole", 0, },
+	{ "navigation on screen", 0, },
+	{ "main view on screen", 0, },
+	{ "weapons on screen", 0, },
+	{ "communications on screen", 0, },
+	{ "comms on screen", 0, },
+	{ "engineering on screen", 0, },
+	{ "science on screen", 0, },
+	{ "navigation screen", 0, },
+	{ "main view screen", 0, },
+	{ "weapon screen", 0, },
+	{ "communications screen", 0, },
+	{ "comms screen", 0, },
+	{ "engineering screen", 0, },
+	{ "science screen", 0, },
+	{ "full throttle", 0, },
+	{ "set warp drive power to one quarter", 0, },
+	{ "set warp drive coolant to 0.75", 0, },
+	{ "set warp drive to 50", 0, },
+	{ "set impulse drive power to 50 percent", 0, },
+	{ "set impulse drive coolant to 50%", 0, },
+	{ "set impulse drive to fifty five", 0, },
+	{ "set throttle to forty two percent", 0, },
+	{ "set maneuvering power to one quarter", 0, },
+	{ "set maneuvering coolant to one hundred", 0, },
+	{ "set sensor power to five", 0, },
+	{ "set sensor coolant to maximum", 0, },
+	{ "set tractor beam power to max", 0, },
+	{ "set tractor beam coolant to 100", 0, },
+	{ "set communications power to 100", 0, },
+	{ "set communications coolant to 100", 0, },
+	{ "set comms power to 100", 0, },
+	{ "set comms coolant to 100", 0, },
+	{ "set phaser power to 100", 0, },
+	{ "set phaser coolant to 100", 0, },
+	{ "set shields power to 100", 0, },
+	{ "set shields coolant to 100", 0, },
+	{ "set shields to 100", 0, },
+	{ "raise shields", 0, },
+	{ "lower shields", 0, },
+	{ "calculate the distance to the nearest planet", 0, },
+	{ "compute the distance to the nearest planet", 0, },
+	{ "figure the distance to the nearest ship", 0, },
+	{ "turn left 30 degrees", 0, },
+	{ "turn right 30 degrees", 0, },
+	{ "roll 30 degrees left", 0, },
+	{ "roll 30 degrees right", 0, },
+	{ "turn clockwise 20 degrees", 0, },
+	{ "turn anti clockwise twenty degrees", 0, },
+	{ "turn ten degrees counter clockwise", 0, },
+	{ "turn up five degrees", 0, },
+	{ "turn 200 degrees down", 0, },
+	{ "pitch up twenty degrees", 0, },
+	{ "pitch forty degrees down", 0, },
+	{ "pitch forward 90 degrees", 0, },
+	{ "pitch back ninety two degrees", 0, },
+	{ "pitch backwards ninety two degrees", 0, },
+	{ "turn towards the nearest asteroid", 0, },
+	{ "damage report", 0, },
+	{ "status report", 0, },
+	{ "zoom one hundred", 0, },
+	{ "zoom maximum", 0, },
+	{ "maximum zoom", 0, },
+	{ "minimum zoom", 0, },
+	{ "zoom fifty", 0, },
+	{ "zoom thirty", 0, },
+	{ "zoom twenty", 0, },
+	{ "zoom ninety", 0, },
+	{ "zoom zero", 0, },
+	{ "red alert", 0, },
+	{ "cancel red alert", 0, },
+	{ "stop red alert", 0, },
+	{ "scan the nearest planet", 0, },
+	{ "scan the nearest asteroid", 0, },
+	{ "scan the nearest nebula", 0, },
+	{ "scan the nearest ship", 0, },
+	{ "scan the nearest derelict", 0, },
+	{ "select the nearest planet", 0, },
+	{ "select the nearest asteroid", 0, },
+	{ "select the nearest nebula", 0, },
+	{ "select the nearest ship", 0, },
+	{ "select the nearest derelict", 0, },
+	{ "scan the closest planet", 0, },
+	{ "scan the closest asteroid", 0, },
+	{ "scan the closest nebula", 0, },
+	{ "scan the closest ship", 0, },
+	{ "scan the closest derelict", 0, },
+	{ "select the closest planet", 0, },
+	{ "select the closest asteroid", 0, },
+	{ "select the closest nebula", 0, },
+	{ "select the closest ship", 0, },
+	{ "select the closest derelict", 0, },
+	{ "scan the nearby planet", 0, },
+	{ "scan the nearby asteroid", 0, },
+	{ "scan the nearby nebula", 0, },
+	{ "scan the nearby ship", 0, },
+	{ "scan the nearby derelict", 0, },
+	{ "select the nearby planet", 0, },
+	{ "select the nearby asteroid", 0, },
+	{ "select the nearby nebula", 0, },
+	{ "select the nearby ship", 0, },
+	{ "select the nearby derelict", 0, },
+	{ "scan the planet", 0, },
+	{ "scan the nearest asteroid", 0, },
+	{ "scan the nearest nebula", 0, },
+	{ "scan the nearest ship", 0, },
+	{ "scan the nearest derelict", 0, },
+	{ "select the nearest planet", 0, },
+	{ "select the nearest asteroid", 0, },
+	{ "select the closest nebula", 0, },
+	{ "select the nearby ship", 0, },
+	{ "select the closest derelict", 0, },
+	{ "launch the mining bot", 0, },
+	{ "deploy the mining bot", 0, },
+	{ "launch the mining robot", 0, },
+	{ "long range scan", 0, },
+	{ "long range scanner", 0, },
+	{ "long range", 0, },
+	{ "short range scan", 0, },
+	{ "short range scanner", 0, },
+	{ "short range", 0, },
+	{ "deploy the mining robot", 0, },
+	{ "eject the warp core", 0, },
+	{ "minimum warp drive", 0, },
+	{ "maximum warp drive", 0, },
+	{ "maximum warp", 0, },
+	{ "max coolant to warp drive", 0, },
+	{ "minimum warp drive power", 0, },
+	{ "increase warp drive to max", 0, },
+	{ "decrease warp drive to minimum", 0, },
+};
+
+static void nl_run_snis_test_cases(__attribute__((unused)) void *context,
+		__attribute__((unused)) int argc,
+		__attribute__((unused)) char *argv[], int pos[],
+		__attribute__((unused)) union snis_nl_extra_data extra_data[])
+{
+	int i, rc;
+	int passed = 0;
+	int failed = 0;
+
+	for (i = 0; i < ARRAYSIZE(nl_test_case); i++) {
+		rc = snis_nl_test_parse_natural_language_request(NULL, nl_test_case[i].text);
+		if (rc != nl_test_case[i].expected) {
+			fprintf(stderr, "FAILED NATURAL LANGUAGE TEST: '%s' expected %s got %s\n",
+				nl_test_case[i].text,
+				nl_test_case[i].expected ? "NOT PARSEABLE" : "PARSEABLE",
+				rc ? "NOT PARSEABLE" : "PARSEABLE");
+			failed++;
+		} else {
+			passed++;
+		}
+	}
+	fprintf(stderr, "NATURAL LANGUAGE TESTS FINISHED: PASSED = %d, FAILED = %d, TOTAL = %d\n",
+			passed, failed, passed + failed);
+	snis_nl_print_verbs_by_fn("Unimplemented verb: ", sorry_dave);
+}
+
+static void init_dictionary(void)
+{
+	snis_nl_add_dictionary_verb("run-snis-nl-test-cases", "run-snis-nl-test-casees", "", nl_run_snis_test_cases);
+	snis_nl_add_dictionary_verb("describe",		"describe",	"n", nl_describe_n);
+	snis_nl_add_dictionary_verb("describe",		"describe",	"an", nl_describe_an);
+	snis_nl_add_dictionary_verb("navigate",		"navigate",	"pn", sorry_dave);
+	snis_nl_add_dictionary_verb("set",		"set",		"npq", nl_set_npq);
+	snis_nl_add_dictionary_verb("set",		"set",		"npa", sorry_dave);
+	snis_nl_add_dictionary_verb("set",		"set",		"npn", nl_set_npn);
+	snis_nl_add_dictionary_verb("set",		"set",		"npan", nl_set_npn);
+	snis_nl_add_dictionary_verb("plot",		"plot",		"npn", nl_set_npn);
+	snis_nl_add_dictionary_verb("plot",		"plot",		"npan", nl_set_npn);
+	snis_nl_add_dictionary_verb("lay in",		"lay in",	"npn", nl_set_npn);
+	snis_nl_add_dictionary_verb("lay in",		"lay in",	"npan", nl_set_npn);
+	snis_nl_add_dictionary_verb("lower",		"lower",	"npq", nl_set_npq);
+	snis_nl_add_dictionary_verb("lower",		"lower",	"npn", nl_set_npn);
+	snis_nl_add_dictionary_verb("lower",		"lower",	"npa", nl_lower_npa); /* lower power to impulse */
+	snis_nl_add_dictionary_verb("lower",		"lower",	"n", nl_lower_n); /* decrease warp drive */
+	snis_nl_add_dictionary_verb("minimum",		"lower",	"n", nl_lower_n); /* minimum warp drive */
+	snis_nl_add_dictionary_verb("raise",		"raise",	"npq", nl_set_npq); /* raise warp drive to 100 */
+	snis_nl_add_dictionary_verb("raise",		"raise",	"npn", sorry_dave);
+	snis_nl_add_dictionary_verb("raise",		"raise",	"npa", nl_raise_npa); /* increase power to impulse, raise warp to max */
+	snis_nl_add_dictionary_verb("maximum",		"raise",	"npa", nl_raise_npa); /* max power to impulse, max coolant to warp */
+	snis_nl_add_dictionary_verb("raise",		"raise",	"n", nl_raise_n);	/* increase warp drive */
+	snis_nl_add_dictionary_verb("maximum",		"raise",	"n", nl_raise_n);	/* maximum warp drive */
+	snis_nl_add_dictionary_verb("shields",		"shields",	"p", nl_shields_p);	/* shields up/down */
+	snis_nl_add_dictionary_verb("maximum",		"raise",	"n", nl_raise_n);	/* max warp */
+	snis_nl_add_dictionary_verb("maximum",		"raise",	"npa", nl_raise_npa); /* max power to impulse */
+	snis_nl_add_dictionary_verb("engage",		"engage",	"n", nl_engage_n);
+	snis_nl_add_dictionary_verb("engage",		"engage",	"npn", nl_engage_npn);
+	snis_nl_add_dictionary_verb("leave",		"leave",	"n", nl_leave_n); /* leave orbit */
+	snis_nl_add_dictionary_verb("leave",		"leave",	"an", nl_leave_an); /* leave standard orbit */
+	snis_nl_add_dictionary_verb("standard",		"enter",	"n", nl_enter_n); /* enter orbit */
+	snis_nl_add_dictionary_verb("enter",		"enter",	"n", nl_enter_n); /* enter orbit */
+	snis_nl_add_dictionary_verb("enter",		"enter",	"an", nl_enter_an); /* enter standard orbit */
+	snis_nl_add_dictionary_verb("disengage",	"disengage",	"n", nl_disengage_n);
+	snis_nl_add_dictionary_verb("stop",		"disengage",	"n", nl_disengage_n);
+	snis_nl_add_dictionary_verb("turn",		"turn",		"pn", sorry_dave);
+	snis_nl_add_dictionary_verb("turn",		"turn",		"aqa", nl_turn_aqa);
+	snis_nl_add_dictionary_verb("rotate",		"rotate",	"aqa", nl_turn_aqa);
+	snis_nl_add_dictionary_verb("turn",		"turn",		"qaa", nl_turn_qaa);
+	snis_nl_add_dictionary_verb("rotate",		"rotate",	"qaa", nl_turn_qaa);
+	snis_nl_add_dictionary_verb("turn",		"turn",		"qa", nl_turn_qa);
+	snis_nl_add_dictionary_verb("rotate",		"rotate",	"qa", nl_turn_qa);
+	snis_nl_add_dictionary_verb("turn",		"turn",		"aq", nl_turn_aq);
+	snis_nl_add_dictionary_verb("rotate",		"rotate",	"aq", nl_turn_aq);
+	snis_nl_add_dictionary_verb("compute",		"compute",	"npn", nl_compute_npn);
+	snis_nl_add_dictionary_verb("damage report",	"damage report", "", nl_damage_report);
+	snis_nl_add_dictionary_verb("report damage",	"damage report", "", nl_damage_report);
+	snis_nl_add_dictionary_verb("status report",	"damage report", "", nl_damage_report);
+	snis_nl_add_dictionary_verb("report status",	"damage report", "", nl_damage_report);
+	snis_nl_add_dictionary_verb("yaw",		"yaw",		"aqa", nl_turn_aqa);
+	snis_nl_add_dictionary_verb("pitch",		"pitch",	"aqa", nl_turn_aqa);
+	snis_nl_add_dictionary_verb("roll",		"roll",		"aqa", nl_turn_aqa);
+	snis_nl_add_dictionary_verb("yaw",		"yaw",		"qaa", nl_turn_qaa);
+	snis_nl_add_dictionary_verb("pitch",		"pitch",	"qaa", nl_turn_qaa);
+	snis_nl_add_dictionary_verb("roll",		"roll",		"qaa", nl_turn_qaa);
+	snis_nl_add_dictionary_verb("zoom",		"zoom",		"q", nl_zoom_q);
+	snis_nl_add_dictionary_verb("zoom",		"zoom",		"p", sorry_dave);
+	snis_nl_add_dictionary_verb("zoom",		"zoom",		"pq", nl_zoom_pq);
+	snis_nl_add_dictionary_verb("shut",		"shut",		"an", sorry_dave);
+	snis_nl_add_dictionary_verb("shut",		"shut",		"na", sorry_dave);
+	snis_nl_add_dictionary_verb("launch",		"launch",	"n", nl_launch_n);
+	snis_nl_add_dictionary_verb("eject",		"eject",	"n", sorry_dave);
+	snis_nl_add_dictionary_verb("full",		"full",		"a", nl_full_n),    /* full impulse */
+	snis_nl_add_dictionary_verb("full",		"full",		"n", nl_full_n),    /* full impulse drive */
+	snis_nl_add_dictionary_verb("ramming",		"full",		"n", nl_full_n),    /* ramming speed */
+	snis_nl_add_dictionary_verb("full",		"full",		"npn", sorry_dave), /* full power to impulse drive */
+	snis_nl_add_dictionary_verb("full",		"full",		"npa", nl_raise_npa), /* full power to impulse */
+	snis_nl_add_dictionary_verb("full",		"full",		"na", nl_full_na), /* full speed ahead */
+	snis_nl_add_dictionary_verb("maximum",		"full",		"na", nl_full_na), /* maximum speed ahead */
+	snis_nl_add_dictionary_verb("red alert",	"red alert",	"", nl_red_alert);
+	snis_nl_add_dictionary_verb("red alert",	"red alert",	"p", nl_red_alert_p);
+	snis_nl_add_dictionary_verb("main view",	"main view",	"pn", nl_onscreen_verb_pn);
+	snis_nl_add_dictionary_verb("navigation",	"navigation",	"pn", nl_onscreen_verb_pn);
+	snis_nl_add_dictionary_verb("weapons",		"weapons",	"pn", nl_onscreen_verb_pn);
+	snis_nl_add_dictionary_verb("weapon",		"weapons",	"pn", nl_onscreen_verb_pn);
+	snis_nl_add_dictionary_verb("engineering",	"engineering",	"pn", nl_onscreen_verb_pn);
+	snis_nl_add_dictionary_verb("science",		"science",	"pn", nl_onscreen_verb_pn);
+	snis_nl_add_dictionary_verb("communications",	"communications", "pn", nl_onscreen_verb_pn);
+	snis_nl_add_dictionary_verb("main view",	"main view",	"n", nl_onscreen_verb_n);
+	snis_nl_add_dictionary_verb("navigation",	"navigation",	"n", nl_onscreen_verb_n);
+	snis_nl_add_dictionary_verb("weapons",		"weapons",	"n", nl_onscreen_verb_n);
+	snis_nl_add_dictionary_verb("weapon",		"weapons",	"n", nl_onscreen_verb_n);
+	snis_nl_add_dictionary_verb("engineering",	"engineering",	"n", nl_onscreen_verb_n);
+	snis_nl_add_dictionary_verb("science",		"science",	"n", nl_onscreen_verb_n);
+	snis_nl_add_dictionary_verb("communications",	"communications", "n", nl_onscreen_verb_n);
+	snis_nl_add_dictionary_verb("target",		"target",	"n", nl_target_n);
+	snis_nl_add_dictionary_verb("scan",		"target",	"n", nl_target_n);
+	snis_nl_add_dictionary_verb("select",		"target",	"n", nl_target_n);
+	snis_nl_add_dictionary_verb("reverse",		"reverse",	"n", nl_reverse_n);
+	snis_nl_add_dictionary_verb("long range scanner",	"long range scan",	"", nl_shortlong_range_scan);
+	snis_nl_add_dictionary_verb("long range scan",	"long range scan",	"", nl_shortlong_range_scan);
+	snis_nl_add_dictionary_verb("long range",	"long range scan",	"", nl_shortlong_range_scan);
+	snis_nl_add_dictionary_verb("short range scanner",	"short range scan",	"", nl_shortlong_range_scan);
+	snis_nl_add_dictionary_verb("short range scan",	"short range scan",	"", nl_shortlong_range_scan);
+	snis_nl_add_dictionary_verb("short range",	"short range scan",	"", nl_shortlong_range_scan);
+	snis_nl_add_dictionary_verb("details",		"details",		"", nl_shortlong_range_scan);
+	snis_nl_add_dictionary_verb("detail",		"details",		"", nl_shortlong_range_scan);
+
+	snis_nl_add_dictionary_word("drive",		"drive",	POS_NOUN);
+	snis_nl_add_dictionary_word("system",		"system",	POS_NOUN);
+	snis_nl_add_dictionary_word("starbase",		"starbase",	POS_NOUN);
+	snis_nl_add_dictionary_word("station",		"starbase",	POS_NOUN);
+	snis_nl_add_dictionary_word("base",		"starbase",	POS_NOUN);
+	snis_nl_add_dictionary_word("planet",		"planet",	POS_NOUN);
+	snis_nl_add_dictionary_word("ship",		"ship",		POS_NOUN);
+	snis_nl_add_dictionary_word("bot",		"robot",	POS_NOUN);
+	snis_nl_add_dictionary_word("shields",		"shields",	POS_NOUN);
+	snis_nl_add_dictionary_word("factor",		"factor",	POS_NOUN);
+	snis_nl_add_dictionary_word("level",		"level",	POS_NOUN);
+	snis_nl_add_dictionary_word("worm hole",	"worm hole",	POS_NOUN);
+
+	snis_nl_add_dictionary_word("maneuvering power", "maneuvering power",	POS_NOUN);
+	snis_nl_add_dictionary_word("warp drive power", "warp drive power",	POS_NOUN);
+	snis_nl_add_dictionary_word("impulse drive power", "impulse drive power",	POS_NOUN);
+	snis_nl_add_dictionary_word("sensor power", "sensor power",	POS_NOUN);
+	snis_nl_add_dictionary_word("sensors power", "sensor power",	POS_NOUN);
+	snis_nl_add_dictionary_word("communications power", "communications power",	POS_NOUN);
+	snis_nl_add_dictionary_word("phaser power", "phaser power",	POS_NOUN);
+	snis_nl_add_dictionary_word("shield power", "shield power",	POS_NOUN);
+	snis_nl_add_dictionary_word("shields power", "shield power",	POS_NOUN);
+	snis_nl_add_dictionary_word("tractor beam power", "tractor beam power",	POS_NOUN);
+
+	snis_nl_add_dictionary_word("maneuvering coolant", "maneuvering coolant",	POS_NOUN);
+	snis_nl_add_dictionary_word("warp drive coolant", "warp drive coolant",	POS_NOUN);
+	snis_nl_add_dictionary_word("impulse drive coolant", "impulse drive coolant",	POS_NOUN);
+	snis_nl_add_dictionary_word("sensor coolant", "sensor coolant",	POS_NOUN);
+	snis_nl_add_dictionary_word("sensors coolant", "sensor coolant",	POS_NOUN);
+	snis_nl_add_dictionary_word("communications coolant", "communications coolant",	POS_NOUN);
+	snis_nl_add_dictionary_word("phaser coolant", "phaser coolant",	POS_NOUN);
+	snis_nl_add_dictionary_word("shield coolant", "shield coolant",	POS_NOUN);
+	snis_nl_add_dictionary_word("shields coolant", "shield coolant",	POS_NOUN);
+	snis_nl_add_dictionary_word("tractor beam coolant", "tractor beam coolant",	POS_NOUN);
+	snis_nl_add_dictionary_word("zoom",		"zoom",		POS_NOUN);
+
+	snis_nl_add_dictionary_word("tractor beam", "tractor beam",	POS_NOUN);
+	snis_nl_add_dictionary_word("docking system", "docking system",	POS_NOUN);
+	snis_nl_add_dictionary_word("coolant",		"coolant",	POS_NOUN);
+	snis_nl_add_dictionary_word("power",		"power",	POS_NOUN);
+	snis_nl_add_dictionary_word("stop",		"stop",		POS_NOUN); /* as in:full stop */
+	snis_nl_add_dictionary_word("speed",		"speed",	POS_NOUN);
+	snis_nl_add_dictionary_word("reverse",		"reverse",	POS_NOUN);
+	snis_nl_add_dictionary_word("impulse drive",	"impulse drive",	POS_NOUN);
+	snis_nl_add_dictionary_word("warp drive",	"warp drive",	POS_NOUN);
+	snis_nl_add_dictionary_word("asteroid",		"asteroid",	POS_NOUN);
+	snis_nl_add_dictionary_word("nebula",		"nebula",	POS_NOUN);
+	snis_nl_add_dictionary_word("star",		"star",		POS_NOUN);
+	snis_nl_add_dictionary_word("range",		"range",	POS_NOUN);
+	snis_nl_add_dictionary_word("distance",		"range",	POS_NOUN);
+	snis_nl_add_dictionary_word("weapons",		"weapons",	POS_NOUN);
+	snis_nl_add_dictionary_word("screen",		"screen",	POS_NOUN);
+	snis_nl_add_dictionary_word("robot",		"robot",	POS_NOUN);
+	snis_nl_add_dictionary_word("torpedo",		"torpedo",	POS_NOUN);
+	snis_nl_add_dictionary_word("phasers",		"phasers",	POS_NOUN);
+	snis_nl_add_dictionary_word("maneuvering",	"maneuvering",	POS_NOUN);
+	snis_nl_add_dictionary_word("thruster",		"thrusters",	POS_NOUN);
+	snis_nl_add_dictionary_word("thrusters",	"thrusters",	POS_NOUN);
+	snis_nl_add_dictionary_word("polarity",		"polarity",	POS_NOUN);
+	snis_nl_add_dictionary_word("sensors",		"sensors",	POS_NOUN);
+	snis_nl_add_dictionary_word("sensor",		"sensors",	POS_NOUN);
+	snis_nl_add_dictionary_word("science",		"science",	POS_NOUN);
+	snis_nl_add_dictionary_word("communications",	"communications", POS_NOUN);
+	snis_nl_add_dictionary_word("enemy",		"enemy",	POS_NOUN);
+	snis_nl_add_dictionary_word("derelict",		"derelict",	POS_NOUN);
+	snis_nl_add_dictionary_word("computer",		"computer",	POS_NOUN);
+	snis_nl_add_dictionary_word("fuel",		"fuel",		POS_NOUN);
+	snis_nl_add_dictionary_word("radiation",	"radiation",	POS_NOUN);
+	snis_nl_add_dictionary_word("wavelength",	"wavelength",	POS_NOUN);
+	snis_nl_add_dictionary_word("charge",		"charge",	POS_NOUN);
+	snis_nl_add_dictionary_word("magnets",		"magnets",	POS_NOUN);
+	snis_nl_add_dictionary_word("gate",		"gate",		POS_NOUN);
+	snis_nl_add_dictionary_word("percent",		"percent",	POS_NOUN);
+	snis_nl_add_dictionary_word("sequence",		"sequence",	POS_NOUN);
+	snis_nl_add_dictionary_word("core",		"core",		POS_NOUN);
+	snis_nl_add_dictionary_word("code",		"code",		POS_NOUN);
+	snis_nl_add_dictionary_word("hull",		"hull",		POS_NOUN);
+	snis_nl_add_dictionary_word("scanner",		"scanner",	POS_NOUN);
+	snis_nl_add_dictionary_word("scanners",		"scanners",	POS_NOUN);
+	snis_nl_add_dictionary_word("detail",		"details",	POS_NOUN);
+	snis_nl_add_dictionary_word("report",		"report",	POS_NOUN);
+	snis_nl_add_dictionary_word("damage",		"damage",	POS_NOUN);
+	snis_nl_add_dictionary_word("course",		"course",	POS_NOUN);
+	snis_nl_add_dictionary_word("distance",		"distance",	POS_NOUN);
+	snis_nl_add_dictionary_word("red alert",	"red alert",	POS_NOUN);
+	snis_nl_add_dictionary_word("orbit",		"orbit",	POS_NOUN);
+
+
+	snis_nl_add_dictionary_word("a",		"a",		POS_ARTICLE);
+	snis_nl_add_dictionary_word("an",		"an",		POS_ARTICLE);
+	snis_nl_add_dictionary_word("the",		"the",		POS_ARTICLE);
+
+	snis_nl_add_dictionary_word("above",		"above",	POS_PREPOSITION);
+	snis_nl_add_dictionary_word("aboard",		"aboard",	POS_PREPOSITION);
+	snis_nl_add_dictionary_word("across",		"across",	POS_PREPOSITION);
+	snis_nl_add_dictionary_word("after",		"after",	POS_PREPOSITION);
+	snis_nl_add_dictionary_word("along",		"along",	POS_PREPOSITION);
+	snis_nl_add_dictionary_word("alongside",	"alongside",	POS_PREPOSITION);
+	snis_nl_add_dictionary_word("at",		"at",		POS_PREPOSITION);
+	snis_nl_add_dictionary_word("atop",		"atop",		POS_PREPOSITION);
+	snis_nl_add_dictionary_word("around",		"around",	POS_PREPOSITION);
+	snis_nl_add_dictionary_word("before",		"before",	POS_PREPOSITION);
+	snis_nl_add_dictionary_word("behind",		"behind",	POS_PREPOSITION);
+	snis_nl_add_dictionary_word("beneath",		"beneath",	POS_PREPOSITION);
+	snis_nl_add_dictionary_word("below",		"below",	POS_PREPOSITION);
+	snis_nl_add_dictionary_word("beside",		"beside",	POS_PREPOSITION);
+	snis_nl_add_dictionary_word("besides",		"besides",	POS_PREPOSITION);
+	snis_nl_add_dictionary_word("between",		"between",	POS_PREPOSITION);
+	snis_nl_add_dictionary_word("by",		"by",		POS_PREPOSITION);
+	snis_nl_add_dictionary_word("down",		"down",		POS_PREPOSITION);
+	snis_nl_add_dictionary_word("during",		"during",	POS_PREPOSITION);
+	snis_nl_add_dictionary_word("except",		"except",	POS_PREPOSITION);
+	snis_nl_add_dictionary_word("for",		"for",		POS_PREPOSITION);
+	snis_nl_add_dictionary_word("from",		"from",		POS_PREPOSITION);
+	snis_nl_add_dictionary_word("in",		"in",		POS_PREPOSITION);
+	snis_nl_add_dictionary_word("inside",		"inside",	POS_PREPOSITION);
+	snis_nl_add_dictionary_word("of",		"of",		POS_PREPOSITION);
+	snis_nl_add_dictionary_word("off",		"off",		POS_PREPOSITION);
+	snis_nl_add_dictionary_word("on",		"on",		POS_PREPOSITION);
+	snis_nl_add_dictionary_word("onto",		"onto",		POS_PREPOSITION);
+	snis_nl_add_dictionary_word("out",		"out",		POS_PREPOSITION);
+	snis_nl_add_dictionary_word("outside",		"outside",	POS_PREPOSITION);
+	snis_nl_add_dictionary_word("through",		"through",	POS_PREPOSITION);
+	snis_nl_add_dictionary_word("throughout",	"throughout",	POS_PREPOSITION);
+	snis_nl_add_dictionary_word("to",		"to",		POS_PREPOSITION);
+	snis_nl_add_dictionary_word("toward",		"toward",	POS_PREPOSITION);
+	snis_nl_add_dictionary_word("under",		"under",	POS_PREPOSITION);
+	snis_nl_add_dictionary_word("up",		"up",		POS_PREPOSITION);
+	snis_nl_add_dictionary_word("until",		"until",	POS_PREPOSITION);
+	snis_nl_add_dictionary_word("with",		"with",		POS_PREPOSITION);
+	snis_nl_add_dictionary_word("within",		"within",	POS_PREPOSITION);
+	snis_nl_add_dictionary_word("without",		"without",	POS_PREPOSITION);
+	/* bit of a hack for speech recognition to handle "two" vs. "to" */
+	snis_nl_add_dictionary_word("2",		"to",		POS_PREPOSITION);
+
+	snis_nl_add_dictionary_word("or",		"or",		POS_SEPARATOR);
+	snis_nl_add_dictionary_word("and",		"and",		POS_SEPARATOR);
+	snis_nl_add_dictionary_word("then",		"then",		POS_SEPARATOR);
+	snis_nl_add_dictionary_word(",",		",",		POS_SEPARATOR);
+	snis_nl_add_dictionary_word(".",		".",		POS_SEPARATOR);
+	snis_nl_add_dictionary_word(";",		";",		POS_SEPARATOR);
+	snis_nl_add_dictionary_word("!",		"!",		POS_SEPARATOR);
+	snis_nl_add_dictionary_word("?",		"?",		POS_SEPARATOR);
+
+	snis_nl_add_dictionary_word("damage",		"damage",	POS_ADJECTIVE);
+	snis_nl_add_dictionary_word("status",		"status",	POS_ADJECTIVE);
+	snis_nl_add_dictionary_word("warp",		"warp",		POS_ADJECTIVE);
+	snis_nl_add_dictionary_word("impulse",		"impulse",	POS_ADJECTIVE);
+	snis_nl_add_dictionary_word("docking",		"docking",	POS_ADJECTIVE);
+	snis_nl_add_dictionary_word("star",		"star",		POS_ADJECTIVE);
+	snis_nl_add_dictionary_word("space",		"space",	POS_ADJECTIVE);
+	snis_nl_add_dictionary_word("mining",		"mining",	POS_ADJECTIVE);
+	snis_nl_add_dictionary_word("energy",		"energy",	POS_ADJECTIVE);
+	snis_nl_add_dictionary_word("main",		"main",		POS_ADJECTIVE);
+	snis_nl_add_dictionary_word("navigation",	"navigation",	POS_ADJECTIVE);
+	snis_nl_add_dictionary_word("comms",		"comms",	POS_ADJECTIVE);
+	snis_nl_add_dictionary_word("engineering",	"engineering",	POS_ADJECTIVE);
+	snis_nl_add_dictionary_word("science",		"science",	POS_ADJECTIVE);
+	snis_nl_add_dictionary_word("enemy",		"enemy",	POS_ADJECTIVE);
+	snis_nl_add_dictionary_word("derelict",		"derelict",	POS_ADJECTIVE);
+	snis_nl_add_dictionary_word("solar",		"solar",	POS_ADJECTIVE);
+	snis_nl_add_dictionary_word("nearest",		"nearest",	POS_ADJECTIVE);
+	snis_nl_add_dictionary_word("closest",		"nearest",	POS_ADJECTIVE);
+	snis_nl_add_dictionary_word("nearby",		"nearest",	POS_ADJECTIVE);
+	snis_nl_add_dictionary_word("close",		"nearest",	POS_ADJECTIVE);
+	snis_nl_add_dictionary_word("up",		"up",		POS_ADJECTIVE);
+	snis_nl_add_dictionary_word("down",		"down",		POS_ADJECTIVE);
+	snis_nl_add_dictionary_word("port",		"port",		POS_ADJECTIVE);
+	snis_nl_add_dictionary_word("left",		"left",		POS_ADJECTIVE);
+	snis_nl_add_dictionary_word("starboard",	"starboard",	POS_ADJECTIVE);
+	snis_nl_add_dictionary_word("right",		"right",	POS_ADJECTIVE);
+	snis_nl_add_dictionary_word("clockwise",	"clockwise",	POS_ADJECTIVE);
+	snis_nl_add_dictionary_word("counterclockwise",	"counterclockwise",	POS_ADJECTIVE);
+	snis_nl_add_dictionary_word("degrees",		"degrees",	POS_ADJECTIVE);
+	snis_nl_add_dictionary_word("self",		"self",		POS_ADJECTIVE);
+	snis_nl_add_dictionary_word("destruct",		"destruct",	POS_ADJECTIVE);
+	snis_nl_add_dictionary_word("self-destruct",	"self-destruct",	POS_ADJECTIVE);
+	snis_nl_add_dictionary_word("short",		"short",	POS_ADJECTIVE);
+	snis_nl_add_dictionary_word("long",		"long",		POS_ADJECTIVE);
+	snis_nl_add_dictionary_word("range",		"range",	POS_ADJECTIVE);
+	snis_nl_add_dictionary_word("full",		"maximum",	POS_ADJECTIVE);
+	snis_nl_add_dictionary_word("maximum",		"maximum",	POS_ADJECTIVE);
+	snis_nl_add_dictionary_word("minimum",		"minimum",	POS_ADJECTIVE);
+	snis_nl_add_dictionary_word("planet",		"planet",	POS_ADJECTIVE);
+	snis_nl_add_dictionary_word("ahead",		"ahead",	POS_ADJECTIVE);
+	snis_nl_add_dictionary_word("reverse",		"reverse",	POS_ADJECTIVE);
+	snis_nl_add_dictionary_word("forward",		"forward",	POS_ADJECTIVE);
+	snis_nl_add_dictionary_word("backwards",	"backwards",	POS_ADJECTIVE);
+	snis_nl_add_dictionary_word("backward",		"backwards",	POS_ADJECTIVE);
+	snis_nl_add_dictionary_word("back",		"backwards",	POS_ADJECTIVE);
+	snis_nl_add_dictionary_word("standard",		"standard",	POS_ADJECTIVE);
+
+	snis_nl_add_dictionary_word("percent",		"percent",	POS_ADVERB);
+	snis_nl_add_dictionary_word("quickly",		"quickly",	POS_ADVERB);
+	snis_nl_add_dictionary_word("rapidly",		"quickly",	POS_ADVERB);
+	snis_nl_add_dictionary_word("swiftly",		"quickly",	POS_ADVERB);
+	snis_nl_add_dictionary_word("slowly",		"slowly",	POS_ADVERB);
+
+	snis_nl_add_dictionary_word("it",		"it",		POS_PRONOUN);
+	snis_nl_add_dictionary_word("me",		"me",		POS_PRONOUN);
+	snis_nl_add_dictionary_word("them",		"them",		POS_PRONOUN);
+	snis_nl_add_dictionary_word("all",		"all",		POS_PRONOUN);
+	snis_nl_add_dictionary_word("everything",	"everything",	POS_PRONOUN);
+
+}
+
+static void init_natural_language_system(void)
+{
+	init_synonyms();
+	init_dictionary();
+	snis_nl_add_error_function(natural_language_parse_failure);
+	snis_nl_add_external_lookup(natural_language_object_lookup);
+	snis_nl_add_multiword_preprocessor(natural_language_multiword_preprocessor);
+}
+
+/*****************************************************************************************
+ * Here ends the natural language parsing code.
+ *****************************************************************************************/
+
+static struct option long_options[] = {
+	{ "enable-enscript", no_argument, NULL, 'e' },
+	{ "help", no_argument, NULL, 'h' },
+	{ "lobbyhost", required_argument, NULL, 'l' },
+	{ "gameinstance", required_argument, NULL, 'g' },
+	{ "servernick", required_argument, NULL, 'n' },
+	{ "location", required_argument, NULL, 'L' },
+	{ "multiverse", required_argument, NULL, 'm' },
+	{ "solarsystem", required_argument, NULL, 's' },
+	{ "version", no_argument, NULL, 'v' },
+};
+
+static char *default_lobby_gameinstance = "-";
+static char *default_lobbyhost = "localhost";
+static char *default_lobby_servernick = "-";
+
+static char *lobby_gameinstance = NULL;
+static char *lobbyhost = NULL;
+static char *lobby_location = NULL;
+static char *lobby_servernick = NULL;
+
+static void process_options(int argc, char *argv[])
+{
+	int c;
+
+	lobby_gameinstance = default_lobby_gameinstance;
+	lobby_servernick = default_lobby_servernick;
+	lobbyhost = default_lobbyhost;
+
+	while (1) {
+		int option_index;
+		c = getopt_long(argc, argv, "eg:hL:l:m:n:s:v", long_options, &option_index);
+		if (c == -1)
+			break;
+		switch (c) {
+		case 'e':
+			lua_enscript_enabled = 1;
+			fprintf(stderr, "WARNING: lua enscript enabled!\n");
+			fprintf(stderr, "THIS PERMITS USERS TO CREATE FILES ON THE SERVER\n");
+			break;
+		case 'g':
+			lobby_gameinstance = optarg;
+			break;
+		case 'h':
+			usage();
+			break;
+		case 'l':
+			lobbyhost = optarg;
+			break;
+		case 'L':
+			lobby_location = optarg;
+			break;
+		case 'm':
+			if (!multiverse_server) {
+				multiverse_server = malloc(sizeof(*multiverse_server));
+				memset(multiverse_server, 0, sizeof(*multiverse_server));
+			}
+			strncpy(multiverse_server->location, optarg,
+					sizeof(multiverse_server->location) - 1);
+			multiverse_server->sock = -1;
+			pthread_mutex_init(&multiverse_server->queue_mutex, NULL);
+			break;
+		case 's':
+			solarsystem_name = optarg;
+			break;
+		case 'n':
+			lobby_servernick = optarg;
+			break;
+		case 'v':
+			printf("SPACE NERDS IN SPACE SERVER ");
+			printf("%s\n", BUILD_INFO_STRING1);
+			printf("%s\n", BUILD_INFO_STRING2);
+			exit(0);
+			break;
+		}
+	}
+	if (lobby_location == NULL)
+		usage();
+}
+
+static void wait_for_multiverse_bound_packets(struct multiverse_server_info *msi)
+{
+	int rc;
+
+	pthread_mutex_lock(&msi->event_mutex);
+	while (!msi->have_packets_to_xmit) {
+		rc = pthread_cond_wait(&msi->write_cond, &msi->event_mutex);
+		if (rc != 0)
+			printf("%s: pthread_cond_wait failed %s:%d.\n",
+				logprefix(), __FILE__, __LINE__);
+		if (msi->have_packets_to_xmit)
+			break;
+	}
+	pthread_mutex_unlock(&msi->event_mutex);
+}
+
+static void wakeup_multiverse_writer(struct multiverse_server_info *msi)
+{
+	int rc;
+
+	pthread_mutex_lock(&msi->event_mutex);
+	msi->have_packets_to_xmit = 1;
+	rc = pthread_cond_broadcast(&msi->write_cond);
+	if (rc)
+		printf("%s: huh... pthread_cond_broadcast failed.\n", logprefix());
+	pthread_mutex_unlock(&msi->event_mutex);
+}
+
+static void wakeup_multiverse_reader(struct multiverse_server_info *msi)
+{
+	/* TODO: fill this in */
+}
+
+static void write_queued_packets_to_mvserver(struct multiverse_server_info *msi)
+{
+	struct packed_buffer *buffer;
+	int rc;
+
+	pthread_mutex_lock(&msi->event_mutex);
+	buffer = packed_buffer_queue_combine(&msi->mverse_queue, &msi->queue_mutex);
+	if (buffer) {
+		rc = snis_writesocket(msi->sock, buffer->buffer, buffer->buffer_size);
+		packed_buffer_free(buffer);
+		if (rc) {
+			fprintf(stderr, "snis_server; failed to write to multiverse server\n");
+			goto badserver;
+		}
+	} else {
+		fprintf(stderr, "%s: multiverse_writer awakened, but nothing to write.\n",
+			logprefix());
+	}
+	if (msi->have_packets_to_xmit)
+		msi->have_packets_to_xmit = 0;
+	pthread_mutex_unlock(&msi->event_mutex);
+	return;
+
+badserver:
+	fprintf(stderr, "%s: multiverse server disappeared\n", logprefix());
+	pthread_mutex_unlock(&msi->event_mutex);
+	shutdown(msi->sock, SHUT_RDWR);
+	close(msi->sock);
+	msi->sock = -1;
+}
+
+static void *multiverse_writer(void *arg)
+{
+	struct multiverse_server_info *msi = arg;
+
+	assert(msi);
+	while (1) {
+		wait_for_multiverse_bound_packets(msi);
+		write_queued_packets_to_mvserver(msi);
+		pthread_mutex_lock(&msi->exit_mutex);
+		if (msi->writer_time_to_exit) {
+			msi->writer_time_to_exit = 0;
+			pthread_mutex_unlock(&msi->exit_mutex);
+			break;
+		}
+		pthread_mutex_unlock(&msi->exit_mutex);
+	}
+	fprintf(stderr, "%s: multiverse_writer thread exiting\n", logprefix());
+	return NULL;
+}
+
+
+static int process_update_bridge(struct multiverse_server_info *msi)
+{
+	unsigned char pwdhash[20];
+	int i, rc;
+	unsigned char buffer[250];
+	struct packed_buffer pb;
+	struct snis_entity *o;
+	double x, y, z;
+
+#define bytes_to_read (sizeof(struct update_ship_packet) - 9 + 25 + 5 + \
+			sizeof(struct power_model_data) + \
+			sizeof(struct power_model_data) - 1)
+
+	fprintf(stderr, "%s: process_update bridge 1\n", logprefix());
+	memset(buffer, 0, sizeof(buffer));
+	memset(pwdhash, 0, sizeof(pwdhash));
+	rc = snis_readsocket(msi->sock, buffer, 20);
+	if (rc != 0)
+		return rc;
+	memcpy(pwdhash, buffer, 20);
+	print_hash("snis_server: update bridge, read 20 bytes: ", pwdhash);
+	BUILD_ASSERT(sizeof(buffer) > bytes_to_read);
+	memset(buffer, 0, sizeof(buffer));
+	rc = snis_readsocket(msi->sock, buffer, bytes_to_read);
+	if (rc != 0)
+		return rc;
+	fprintf(stderr, "%s: update bridge 3\n", logprefix());
+	pthread_mutex_lock(&universe_mutex);
+	i = lookup_bridge_by_pwdhash(pwdhash);
+	if (i < 0) {
+		fprintf(stderr, "%s: Unknown bridge hash\n", logprefix());
+		pthread_mutex_unlock(&universe_mutex);
+		return i;
+	}
+	fprintf(stderr, "%s: update bridge 4\n", logprefix());
+	rc = lookup_by_id(bridgelist[i].shipid);
+	if (rc < 0) {
+		fprintf(stderr, "%s: Failed to lookup ship by id\n", logprefix());
+		pthread_mutex_unlock(&universe_mutex);
+		return rc;
+	}
+	o = &go[rc];
+
+	/* Save position */
+	x = o->x;
+	y = o->y;
+	z = o->z;
+	fprintf(stderr, "%s: Saving position to %lf,%lf,%lf\n", logprefix(), x, y, z);
+
+	if (!o->tsd.ship.damcon) {
+		o->tsd.ship.damcon = malloc(sizeof(*o->tsd.ship.damcon));
+		memset(o->tsd.ship.damcon, 0, sizeof(*o->tsd.ship.damcon));
+	}
+	packed_buffer_init(&pb, buffer, bytes_to_read);
+	unpack_bridge_update_packet(o, &pb);
+
+	/* Restore position... */
+	fprintf(stderr, "%s: update would set position to %lf,%lf,%lf\n",
+		logprefix(), o->x, o->y, o->z);
+	fprintf(stderr, "%s: restoring position to %lf,%lf,%lf\n",
+		logprefix(), x, y, z);
+	o->x = x;
+	o->y = y;
+	o->z = z;
+
+	pthread_mutex_unlock(&universe_mutex);
+	fprintf(stderr, "%s: update bridge 10\n", logprefix());
+	return 0;
+}
+
+static int process_multiverse_verification(struct multiverse_server_info *msi)
+{
+	int rc, b;
+	unsigned char buffer[22];
+	unsigned char *pass;
+	unsigned char *pwdhash;
+
+	rc = snis_readsocket(msi->sock, buffer, 21);
+	if (rc)
+		return rc;
+	pass = &buffer[0];
+	pwdhash = &buffer[1];
+	pthread_mutex_lock(&universe_mutex);
+	print_hash("Looking up hash:", pwdhash);
+	b = lookup_bridge_by_pwdhash(pwdhash);
+	if (b >= 0) {
+		switch (*pass) {
+		case SNISMV_VERIFICATION_RESPONSE_PASS:
+			bridgelist[b].verified = BRIDGE_VERIFIED;
+			break;
+		case SNISMV_VERIFICATION_RESPONSE_TOO_MANY_BRIDGES:
+			bridgelist[b].verified = BRIDGE_REFUSED;
+			break;
+		case SNISMV_VERIFICATION_RESPONSE_FAIL: /* deliberate fall through */
+		default:
+			bridgelist[b].verified = BRIDGE_FAILED_VERIFICATION;
+			break;
+		}
+	}
+	pthread_mutex_unlock(&universe_mutex);
+	if (b < 0) {
+		fprintf(stderr, "%s: received verification for unknown pwdhash.  Weird.\n", logprefix());
+		print_hash("unknown hash: ", pwdhash);
+		return 0;
+	}
+	return 0;
+}
+
+static void *multiverse_reader(void *arg)
+{
+	struct multiverse_server_info *msi = arg;
+	uint8_t previous_opcode, last_opcode, opcode;
+	int rc;
+
+	assert(msi);
+
+	last_opcode = 0x00;
+	opcode = 0x00;
+	while (1) {
+		previous_opcode = last_opcode;
+		last_opcode = opcode;
+		opcode = 0x00;
+		fprintf(stderr, "%s: reading from multiverse sock = %d...\n",
+			logprefix(), msi->sock);
+		rc = snis_readsocket(msi->sock, &opcode, sizeof(opcode));
+		fprintf(stderr, "%s: read from multiverse, rc = %d, sock = %d\n",
+			logprefix(), rc, msi->sock);
+		if (rc != 0) {
+			fprintf(stderr, "snis_server multiverse_reader(): snis_readsocket returns %d, errno  %s\n",
+				rc, strerror(errno));
+			goto protocol_error;
+		}
+		switch (opcode)	{
+		case SNISMV_OPCODE_NOOP:
+			break;
+		case SNISMV_OPCODE_LOOKUP_BRIDGE:
+			fprintf(stderr, "%s: unimplemented multiverse opcode %hhu\n",
+				logprefix(), opcode);
+			break;
+		case SNISMV_OPCODE_UPDATE_BRIDGE:
+			rc = process_update_bridge(msi);
+			if (rc)
+				goto protocol_error;
+			break;
+		case SNISMV_OPCODE_VERIFICATION_RESPONSE:
+			rc = process_multiverse_verification(msi);
+			if (rc)
+				goto protocol_error;
+			break;
+		default:
+			fprintf(stderr, "%s: unimplemented multiverse opcode %hhu\n",
+				logprefix(), opcode);
+			goto protocol_error;
+		}
+	}
+	return NULL;
+
+protocol_error:
+	fprintf(stderr, "%s: protocol error in data from multiverse_server\n", logprefix());
+	fprintf(stderr, "%s: opcodes: current = %hhu, last = %hhu, previous = %hhu\n",
+			logprefix(), opcode, last_opcode, previous_opcode);
+	snis_print_last_buffer(msi->sock);
+	shutdown(msi->sock, SHUT_RDWR);
+	close(msi->sock);
+	msi->sock = -1;
+	return NULL;
+}
+
+static void connect_to_multiverse(struct multiverse_server_info *msi, uint32_t ipaddr, uint16_t port)
+{
+	int rc;
+	int sock = -1;
+	struct addrinfo *mvserverinfo, *i;
+	struct addrinfo hints;
+	unsigned char *x = (unsigned char *) &ipaddr;
+	char response[100];
+
+	assert(msi);
+
+	fprintf(stderr, "%s: connecting to multiverse %s %hhu.%hhu.%hhu.%hhu/%hu\n",
+		logprefix(), multiverse_server->location, x[0], x[1], x[2], x[3], port);
+	char portstr[50];
+	char hoststr[50];
+	int flag = 1;
+
+	sprintf(portstr, "%d", port);
+	sprintf(hoststr, "%d.%d.%d.%d", x[0], x[1], x[2], x[3]);
+
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family = AF_INET;
+	hints.ai_socktype = SOCK_STREAM;
+	hints.ai_flags = AI_PASSIVE | AI_NUMERICSERV | AI_NUMERICHOST;
+	rc = getaddrinfo(hoststr, portstr, &hints, &mvserverinfo);
+	if (rc) {
+		fprintf(stderr, "%s: Failed looking up %s:%s: %s\n",
+			logprefix(), hoststr, portstr, gai_strerror(rc));
+		goto error;
+	}
+
+	for (i = mvserverinfo; i != NULL; i = i->ai_next)
+		if (i->ai_family == AF_INET)
+			break;
+	if (i == NULL)
+		goto error;
+
+	sock = socket(AF_INET, SOCK_STREAM, i->ai_protocol);
+	if (sock < 0)
+		goto error;
+
+	rc = connect(sock, i->ai_addr, i->ai_addrlen);
+	if (rc < 0)
+		goto error;
+
+	rc = setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (char *) &flag, sizeof(int));
+	if (rc)
+		fprintf(stderr, "setsockopt(TCP_NODELAY) failed.\n");
+	const int len = sizeof(SNIS_MULTIVERSE_VERSION) - 1;
+	fprintf(stderr, "%s: writing SNIS_MULTIVERSE_VERSION (len = %d)\n",
+			logprefix(), len);
+	rc = snis_writesocket(sock, SNIS_MULTIVERSE_VERSION, len);
+	fprintf(stderr, "%s: writesocket returned %d, sock = %d\n", logprefix(), rc, sock);
+	if (rc < 0) {
+		fprintf(stderr, "%s: snis_writesocket failed: %d (%d:%s)\n",
+				logprefix(), rc, errno, strerror(errno));
+		goto error;
+	}
+	memset(response, 0, sizeof(response));
+	fprintf(stderr, "%s: reading SNIS_MULTIVERSE_VERSION (len = %d, sock = %d)\n",
+			logprefix(), len, sock);
+	rc = snis_readsocket(sock, response, len);
+	fprintf(stderr, "%s: read socket returned %d (len = %d, sock = %d)\n",
+			logprefix(), rc, len, sock);
+	if (rc != 0) {
+		fprintf(stderr, "%s: snis_readsocket failed: %d (%d:%s)\n",
+				logprefix(), rc, errno, strerror(errno));
+		fprintf(stderr, "response = '%s'\n", response);
+		sock = -1;
+	}
+	response[len] = '\0';
+	fprintf(stderr, "%s: got SNIS_MULTIVERSE_VERSION:'%s'\n",
+			logprefix(), response);
+	if (strcmp(response, SNIS_MULTIVERSE_VERSION) != 0) {
+		fprintf(stderr, "%s: expected '%s' got '%s' from snis_multiverse\n",
+			logprefix(), SNIS_MULTIVERSE_VERSION, response);
+		goto error;
+	}
+
+	fprintf(stderr, "%s: connected to snis_multiverse (%hhu.%hhu.%hhu.%hhu/%hu on socket %d)\n",
+		logprefix(), x[0], x[1], x[2], x[3], port, sock);
+
+	msi->sock = sock;
+	msi->ipaddr = ipaddr;
+	msi->port = port;
+	msi->writer_time_to_exit = 0;
+	msi->reader_time_to_exit = 0;
+	msi->have_packets_to_xmit = 0;
+	packed_buffer_queue_init(&msi->mverse_queue);
+	pthread_mutex_init(&msi->queue_mutex, NULL);
+	pthread_mutex_init(&msi->event_mutex, NULL);
+	pthread_mutex_init(&msi->exit_mutex, NULL);
+	pthread_cond_init(&msi->write_cond, NULL);
+	pthread_attr_init(&msi->read_attr);
+	pthread_attr_init(&msi->write_attr);
+	pthread_attr_setdetachstate(&msi->read_attr, PTHREAD_CREATE_DETACHED);
+	pthread_attr_setdetachstate(&msi->write_attr, PTHREAD_CREATE_DETACHED);
+	fprintf(stderr, "%s: starting multiverse reader thread\n", logprefix());
+	rc = pthread_create(&msi->read_thread, &msi->read_attr, multiverse_reader, msi);
+	if (rc) {
+		fprintf(stderr, "%s: Failed to create multiverse reader thread: %d '%s', '%s'\n",
+			logprefix(), rc, strerror(rc), strerror(errno));
+	}
+	pthread_setname_np(msi->read_thread, "sniss-mvrdr");
+	fprintf(stderr, "%s: started multiverse reader thread\n", logprefix());
+	fprintf(stderr, "%s: starting multiverse writer thread\n", logprefix());
+	rc = pthread_create(&msi->write_thread, &msi->write_attr, multiverse_writer, msi);
+	if (rc) {
+		fprintf(stderr, "%s: Failed to create multiverse writer thread: %d '%s', '%s'\n",
+			logprefix(), rc, strerror(rc), strerror(errno));
+	}
+	pthread_setname_np(msi->write_thread, "sniss-mvwrtr");
+	fprintf(stderr, "%s: started multiverse writer thread\n", logprefix());
+	freeaddrinfo(mvserverinfo);
+	return;
+
+error:
+	if (sock >= 0) {
+		shutdown(sock, SHUT_RDWR);
+		close(sock);
+		sock = -1;
+	}
+	freeaddrinfo(mvserverinfo);
+	return;
+}
+
+static void disconnect_from_multiverse(struct multiverse_server_info *msi)
+{
+	unsigned char *x;
+
+	assert(multiverse_server);
+	x = (unsigned char *) &multiverse_server->ipaddr;
+	fprintf(stderr, "%s: disconnecting from multiverse %s %u.%u.%u.%u/%hu\n",
+		logprefix(), multiverse_server->location,
+		x[0], x[1], x[2], x[3], multiverse_server->port);
+
+	/* Tell multiverse reader and writer threads to exit */
+	pthread_mutex_lock(&msi->exit_mutex);
+	msi->reader_time_to_exit = 1;
+	msi->writer_time_to_exit = 1;
+	pthread_mutex_unlock(&msi->exit_mutex);
+	wakeup_multiverse_writer(msi);
+	wakeup_multiverse_reader(msi);
+}
+
+/* This is used to check if the multiverse server has changed */
+static void servers_changed_cb(void *cookie)
+{
+	struct ssgl_game_server *gameserver = NULL;
+	int i, nservers, same_as_before = 0;
+	uint32_t ipaddr = -1;
+	uint16_t port = -1;
+	int found_multiverse_server = 0;
+
+	fprintf(stderr, "%s: servers_changed_cb zzz\n", logprefix());
+	if (!multiverse_server) {
+		fprintf(stderr, "%s: multiverse_server not set zzz\n", logprefix());
+		return;
+	}
+
+	if (server_tracker_get_multiverse_list(server_tracker, &gameserver, &nservers) != 0) {
+		fprintf(stderr, "%s: Failed to get server list at %s:%d\n",
+			logprefix(), __FILE__, __LINE__);
+		return;
+	}
+
+	fprintf(stderr, "%s: servers_changed_cb taking queue lock\n", logprefix());
+	pthread_mutex_lock(&multiverse_server->queue_mutex);
+	fprintf(stderr, "%s: servers_changed_cb got queue lock (nservers = %d)\n",
+			logprefix(), nservers);
+	for (i = 0; i < nservers; i++) {
+		fprintf(stderr, "%s: servers_changed_cb i = %d\n", logprefix(), i);
+		if (strncmp(gameserver[i].location, multiverse_server->location, LOCATIONSIZE) != 0)
+			continue;
+		fprintf(stderr, "%s: servers_changed_cb i = %d, location = %s\n",
+					logprefix(), i, multiverse_server->location);
+		if (strncmp(gameserver[i].game_type, "SNIS-MVERSE",
+				sizeof(gameserver[i].game_type)) != 0)
+			continue;
+		fprintf(stderr, "%s: servers_changed_cb i = %d, game type = SNIS-MVERSE\n",
+			logprefix(), i);
+		if (gameserver[i].ipaddr == multiverse_server->ipaddr &&
+		    ntohs(gameserver[i].port) == multiverse_server->port) {
+			same_as_before = 1;
+			break;
+		}
+		fprintf(stderr, "%s: servers_changed_cb i = %d, new ip/port\n",
+			logprefix(), i);
+		ipaddr = gameserver[i].ipaddr;
+		port = ntohs(gameserver[i].port);
+		fprintf(stderr, "%s: connect_to_multiverse, ipaddr=%08x,port=%d\n",
+			logprefix(), ipaddr, port);
+		found_multiverse_server = 1;
+		break;
+	}
+
+	if (!found_multiverse_server || nservers <= 0) {
+		pthread_mutex_unlock(&multiverse_server->queue_mutex);
+		free(gameserver);
+		return;
+	}
+
+	if (same_as_before) {
+		fprintf(stderr, "%s: multiverse servers same as before zzz\n", logprefix());
+		pthread_mutex_unlock(&multiverse_server->queue_mutex);
+		free(gameserver);
+		return;
+	}
+
+	if (multiverse_server->sock != -1) {
+		fprintf(stderr, "%s: servers_changed_cb disconnecting from multiverse server\n",
+			logprefix());
+		disconnect_from_multiverse(multiverse_server);
+	}
+	fprintf(stderr, "%s: servers_changed_cb connecting to multiverse server\n",
+			logprefix());
+	connect_to_multiverse(multiverse_server, ipaddr, port);
+	fprintf(stderr, "%s: servers_changed_cb connected to multiverse server\n",
+		logprefix());
+	fprintf(stderr, "%s: servers_changed_cb releasing queue lock\n",
+		logprefix());
+	pthread_mutex_unlock(&multiverse_server->queue_mutex);
+	fprintf(stderr, "%s: servers_changed_cb released queue lock\n", logprefix());
+	if (gameserver)
+		free(gameserver);
+}
+
 int main(int argc, char *argv[])
 {
 	int port, rc, i;
 	struct timespec thirtieth_second;
 
 	take_your_locale_and_shove_it();
-	if (argc < 5) 
-		usage();
 
-	if (argc >= 6) {
-		if (strcmp(argv[5], "--enable-enscript") == 0) {
-			lua_enscript_enabled = 1;
-			fprintf(stderr, "WARNING: lua enscript enabled!\n");
-			fprintf(stderr, "THIS PERMITS USERS TO CREATE FILES ON THE SERVER\n");
-		}
-	}
+	process_options(argc, argv);
 
 	override_asset_dir();
 	set_random_seed();
+	init_natural_language_system();
 
 	char commodity_path[PATH_MAX];
 	sprintf(commodity_path, "%s/%s", asset_dir, "commodities.txt");
@@ -13063,6 +17787,12 @@ int main(int argc, char *argv[])
 	docking_port_info = read_docking_port_info(starbase_metadata, nstarbase_models,
 					STARBASE_SCALE_FACTOR);
 
+	solarsystem_assets = read_solarsystem_assets(solarsystem_name);
+	if (!solarsystem_assets) {
+		fprintf(stderr, "Failed reading solarsystem assets for '%s'\n", solarsystem_name);
+		return -1;
+	}
+
 	open_log_file();
 
 	setup_lua();
@@ -13082,10 +17812,22 @@ int main(int argc, char *argv[])
 
 	ignore_sigpipe();	
 	snis_collect_netstats(&netstats);
-	if (getenv("SNISSERVERNOLOBBY") == NULL)
-		register_with_game_lobby(argv[1], port, argv[2], argv[1], argv[3]);
-	else
-		printf("snis_server: Skipping lobby registration\n");
+	if (getenv("SNISSERVERNOLOBBY") == NULL) {
+		register_with_game_lobby(lobbyhost, port,
+			lobby_servernick, lobby_gameinstance, lobby_location);
+		server_tracker = server_tracker_start(lobbyhost, servers_changed_cb, NULL);
+	} else {
+		printf("%s: Skipping lobby registration\n", logprefix());
+		server_tracker = NULL;
+		if (multiverse_server != NULL) {
+			fprintf(stderr,
+				"SNISSERVERNOLOBBY and --multiverse option are mutually exclusive\n");
+			fprintf(stderr,
+				"ignoring --multiverse option\n");
+			free(multiverse_server);
+			multiverse_server = NULL;
+		}
+	}
 
 	const double maxTimeBehind = 0.5;
 	double delta = 1.0/10.0;

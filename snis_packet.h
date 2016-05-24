@@ -20,6 +20,7 @@
         along with Spacenerds in Space; if not, write to the Free Software
         Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 */
+#include <stdint.h>
 
 #include "snis_marshal.h"
 
@@ -147,8 +148,24 @@
 #define OPCODE_DOCKING_MAGNETS			223
 #define OPCODE_CYCLE_NAV_POINT_OF_VIEW		224
 #define OPCODE_REQUEST_MINING_BOT		225
+#define OPCODE_REQUEST_STANDARD_ORBIT		226
+#define OPCODE_SWITCH_SERVER			227
+#define OPCODE_UPDATE_WARPGATE			228
+#define OPCODE_ADD_PLAYER_ERROR			229
+#define OPCODE_NATURAL_LANGUAGE_REQUEST		230
+#define   OPCODE_NL_SUBCOMMAND_TEXT_REQUEST	1
+#define   OPCODE_NL_SUBCOMMAND_TEXT_TO_SPEECH	2
+#define OPCODE_SET_SOLARSYSTEM			231
+#define OPCODE_REQUEST_ROBOT_CMD		232
+#define   OPCODE_ROBOT_SUBCMD_STG		1	/* set short term goal */
+#define   OPCODE_ROBOT_SUBCMD_LTG		2	/* set long term goal */
 
 #define OPCODE_NOOP		0xff
+
+#define   ADD_PLAYER_ERROR_SHIP_ALREADY_EXISTS	0x01
+#define   ADD_PLAYER_ERROR_SHIP_DOES_NOT_EXIST	0x02
+#define   ADD_PLAYER_ERROR_TOO_MANY_BRIDGES	0x03
+#define   ADD_PLAYER_ERROR_FAILED_VERIFICATION	0x04
 
 #define UPDATE_UNIVERSE_TIMESTAMP_COUNT 5
 #define UPDATE_UNIVERSE_TIMESTAMP_START_SAMPLE 1
@@ -372,10 +389,17 @@ struct request_thrust_packet {
 #define ROLE_DEMON		(1 << DISPLAYMODE_DEMON)
 #define ROLE_DAMCON		(1 << DISPLAYMODE_DAMCON)
 #define ROLE_SOUNDSERVER	(1 << DISPLAYMODE_FONTTEST)
-#define ROLE_ALL		(0xffffffff)
+#define ROLE_TEXT_TO_SPEECH	(1 << 10)
+#define ROLE_ALL		((uint32_t) 0x0ffffffffff)
+
+#define SCI_DETAILS_MODE_THREED 1
+#define SCI_DETAILS_MODE_DETAILS 2
+#define SCI_DETAILS_MODE_SCIPLANE 3
 
 struct add_player_packet {
 	uint8_t opcode;
+	uint8_t new_ship;
+	uint8_t warpgate_number;
 	uint32_t role;
 	unsigned char shipname[20];
 	unsigned char password[20];
@@ -502,6 +526,7 @@ struct damcon_obj_update_packet {
 	uint32_t type;
 	uint32_t x, y, velocity, heading;
 	uint8_t autonomous_mode;
+	uint32_t stgx, stgy, ltgx, ltgy;
 };
 
 struct damcon_socket_update_packet {
@@ -533,7 +558,7 @@ struct request_robot_gripper_packet {
 struct demon_move_object_packet {
 	uint8_t opcode;
 	uint32_t id;
-	uint32_t x, y;
+	uint32_t x, y, z;
 };
 
 struct request_mainscreen_view_change {

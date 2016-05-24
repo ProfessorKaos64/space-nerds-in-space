@@ -26,6 +26,7 @@
 #include "docking_port.h"
 #include "space-part.h"
 
+#define DEFAULT_SOLAR_SYSTEM "default"
 #define SNIS_PROTOCOL_VERSION "SNIS001"
 #define COMMON_MTWIST_SEED 97872
 /* dimensions of the "known" universe */
@@ -63,8 +64,9 @@
 #define NEBULA_RADIUS 5000
 #define MIN_NEBULA_RADIUS 200
 #define NDERELICTS 20
+#define NWARPGATES 10
 
-#define NPLANETS 10
+#define NPLANETS 6
 #define MIN_PLANET_SEPARATION (UNIVERSE_DIM / 10.0)
 #define NBASES (NPLANETS + 10)
 #define COMMODITIES_PER_BASE 10
@@ -91,6 +93,7 @@
 #define OBJTYPE_WARP_EFFECT 18
 #define OBJTYPE_SHIELD_EFFECT 19
 #define OBJTYPE_DOCKING_PORT 20
+#define OBJTYPE_WARPGATE 21
 
 #define SHIELD_EFFECT_LIFETIME 30
 
@@ -108,6 +111,7 @@ struct power_model_device {
 	uint8_t r1, r2, r3, i;
 };
 
+/* This thing must contain only endian clean data -- single byte values only */
 struct power_model_data {
 	struct power_model_device maneuvering;
 	struct power_model_device warp;
@@ -135,7 +139,10 @@ struct command_data {
 	uint8_t command;
 	double x, z;
 	uint8_t nids1, nids2;
-	uint32_t id[256];
+	__extension__ union {
+		uint32_t id[256];
+		char text[256];
+	};
 };
 
 struct damcon_data;
@@ -280,6 +287,7 @@ struct ship_data {
 	uint32_t shields;
 	char shipname[100];
 	double velocity;
+#define STANDARD_ORBIT_RADIUS_FACTOR (1.1)
 #define MIN_PLAYER_VELOCITY (0.1)
 #define MAX_PLAYER_VELOCITY (30.0)
 #define PLAYER_VELOCITY_DAMPING (0.97)
@@ -288,6 +296,7 @@ struct ship_data {
 	double desired_velocity;
 #define PLAYER_ORIENTATION_DAMPING (0.85)
 #define DAMPING_SUPPRESSION_DECAY (0.98)
+#define COMPUTER_STEERING_TIME 120.0f
 #define MAX_YAW_VELOCITY (5 * PI / 180.0)
 #define YAW_INCREMENT (1 * PI / 180.0)
 #define YAW_INCREMENT_FINE (0.2 * PI / 180.0)
@@ -379,7 +388,7 @@ struct ship_data {
 #define MAX_CARGO_BAYS_PER_SHIP 8
 	/* struct cargo_container_contents cargo[MAX_CARGO_BAYS_PER_SHIP]; */
 	struct cargo_bay_info cargo[MAX_CARGO_BAYS_PER_SHIP];
-	int ncargo_bays;
+	int32_t ncargo_bays;
 #define INITIAL_WALLET_MONEY (2500.0f)
 	float wallet;
 #define THREAT_LEVEL_FLEE_THRESHOLD 50.0 /* arrived at empirically */
@@ -394,8 +403,11 @@ struct ship_data {
 	uint8_t docking_magnets;
 	uint8_t passenger_berths;
 	uint8_t mining_bots;
+	uint32_t orbiting_object_id;
 	char mining_bot_name[20];
 	float nav_damping_suppression;
+	union quat computer_desired_orientation;
+	uint32_t computer_steering_time_left;
 };
 
 #define MIN_COMBAT_ATTACK_DIST 200
@@ -550,12 +562,23 @@ struct planet_data {
 #define PLAYER_PLANET_DIST_TOO_CLOSE (200)
 #define PLAYER_PLANET_DIST_WARN (400)
 	float radius;
+	uint8_t planet_type;
+#define PLANET_TYPE_ROCKY 0
+#define PLANET_TYPE_EARTHLIKE 1
+#define PLANET_TYPE_GASGIANT 2
+	uint8_t has_atmosphere;
+	uint8_t ring_selector;
+	uint8_t solarsystem_planet_type;
 	uint8_t ring;
 	uint8_t atmosphere_r, atmosphere_g, atmosphere_b;
 	double atmosphere_scale;
 	uint16_t contraband;
 	struct entity *atmosphere;
 	struct material atm_material;
+};
+
+struct warpgate_data {
+	uint32_t warpgate_number;
 };
 
 union type_specific_data {
@@ -575,6 +598,7 @@ union type_specific_data {
 	struct planet_data planet;
 	struct warp_effect_data warp_effect;
 	struct docking_port_data docking_port;
+	struct warpgate_data warpgate;
 };
 
 struct snis_entity;
@@ -635,6 +659,9 @@ typedef void (*damcon_draw_function)(void *drawable, struct snis_damcon_entity *
 #define DAMCON_TYPE_SOCKET 9
 #define DAMCON_TYPE_PART 10 
 #define DAMCON_TYPE_ROBOT 11 
+#define DAMCON_TYPE_WAYPOINT 12
+/* Threshold beyond which repair requires using the repair station */
+#define DAMCON_EASY_REPAIR_THRESHOLD 200
 
 struct damcon_robot_type_specific_data {
 	uint32_t cargo_id; /* what the robot is carrying */
@@ -642,6 +669,20 @@ struct damcon_robot_type_specific_data {
 	double yaw_velocity;
 	double desired_velocity, desired_heading;
 	uint8_t autonomous_mode;
+#define DAMCON_ROBOT_MANUAL_MODE 0
+#define DAMCON_ROBOT_FULLY_AUTONOMOUS 1
+#define DAMCON_ROBOT_SEMI_AUTONOMOUS 2
+	double short_term_goal_x, short_term_goal_y;
+	double long_term_goal_x, long_term_goal_y;
+	uint8_t robot_state;
+#define DAMCON_ROBOT_DECIDE_LTG 3
+#define DAMCON_ROBOT_CRUISE 4
+#define DAMCON_ROBOT_PICKUP 5
+#define DAMCON_ROBOT_REPAIR 6
+#define DAMCON_ROBOT_REPLACE 7
+#define DAMCON_ROBOT_REPAIR_WAIT 8
+	uint32_t damaged_part_id;
+	uint32_t repair_socket_id;
 };
 
 struct damcon_label_specific_data {
@@ -663,12 +704,18 @@ struct damcon_socket_specific_data {
 #define DAMCON_SOCKET_EMPTY 0xffffffff
 };
 
+struct damcon_waypoint_specific_data {
+	int n;
+	struct snis_damcon_entity *neighbor[10];
+};
+
 union damcon_type_specific_data {
 	struct damcon_robot_type_specific_data robot;
 	struct damcon_label_specific_data label;
 	struct damcon_system_specific_data system;
 	struct damcon_part_specific_data part;
 	struct damcon_socket_specific_data socket;
+	struct damcon_waypoint_specific_data waypoint;
 };
 
 struct snis_damcon_entity {

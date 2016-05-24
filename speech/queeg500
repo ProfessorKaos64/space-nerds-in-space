@@ -1,0 +1,39 @@
+#!/bin/sh
+#
+# this script is to allow pocketsphinx speech recognition to send input to
+# Space Nerds In Space snis_client to be forwarded to snis_server to be interpreted
+# as natural language commands to the fictional computer aboard the ship in the game.
+#
+# The idea is it runs the recognizer continuously, but filters out lines
+# that are not recognized speech (extraneous output of pocketsphinx) and
+# admits only that text which appears after the word "computer", thus approximating
+# the behavior of having "computer" be a key-word
+#
+# However, the error rate is quite high, and it really doesn't work very well.
+# This is really just a kind of proof of concept (or maybe a disproof of concept).
+#
+# All the "stdbuf -o 0"'s are in there to prevent buffered io from
+# stopping up the pipeline.
+#
+
+language_model="$1"
+
+if [ "$language_model" = "" ]
+then
+	echo "usage: queeg500 language-model" 1>&2
+	echo "where language-model is the base name of the files produced by QuickLM from snis_vocab.txt" 1>&2
+	echo "See the README" 1>&2
+	exit 1
+fi
+
+# stdbuf -o 0 pocketsphinx_continuous -inmic yes -lm "$language_model".lm -dict "$language_model".dic -keyphrase computer -kws_threshold 1e-20
+# exit 0
+
+stdbuf -o 0 pocketsphinx_continuous -inmic yes -lm "$language_model".lm -dict "$language_model".dic 2>/dev/null |\
+	stdbuf -o 0 egrep -v 'READY...|Listening...|Stopped listening' |\
+	stdbuf -o 0 sed -e 's/^[0-9][0-9]*[:] //' |\
+	stdbuf -o 0 grep COMPUTER |\
+	stdbuf -o 0 sed -e 's/^.*COMPUTER //' |\
+	stdbuf -o 0 tee recog.txt | \
+	stdbuf -o 0 cat > /tmp/snis-natural-language-fifo
+

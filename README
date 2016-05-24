@@ -27,12 +27,17 @@ Step 0: Build the game from source. (or alternately, see instructions
 	apt-get install libglew1.5-dev
 	apt-get install libsdl2-2.0-0 # version may differ for your distro
 	apt-get install libsdl2-dev # version may differ for your distro
+	apt-get install libssl-dev
+	apt-get install libttspico-utils # for text to speech
 
      0.2: Download the game source and build it.
 	git clone https://github.com/smcameron/space-nerds-in-space.git
 	cd space-nerds-in-space
 	make
 	(wait for it to compile... Openscad might take its sweet time.)
+
+Optional: There are additional art assets here:
+https://github.com/smcameron/space-nerds-in-space-assets
 
 Step 1: run "./quickstart" or "./nolobby-quickstart".
 
@@ -68,6 +73,8 @@ Step 5.  Press F3 and Fire the weapons.
 Press F3 to go to the weapons screen.  The arrow keys or the mouse control where
 the guns point.  Left and right mouse buttons fire phasers and torpedoes.  Do not
 anger the local law enforcement.
+
+Step 5. For Speech Recognition, see speech/README
 -----------------------------------------
 
 Longer more technical instructions for multi-computer setup follow:
@@ -158,9 +165,18 @@ on 127.0.0.1.  So if you're running the server on the same host as the client, y
 to set SERVERHOST to the real IP address of the host (e.g. examine output of "ifconfig -a")
 
 ------
+
+The instructions below are from Iván Sánchez Ortega. I have not tried them myself.
+Note also the dependencies listed in debian/control are likely to be a little
+out of date.  If you find that to be tghe case, feel free to send me a patch
+to update that.
+
+-- steve
+
+------
+
 INSTRUCTIONS FOR BUILDING DEBIAN PACKAGE
 
-(These instructions are from Iván Sánchez Ortega. I have not tried them myself. -- steve):
 
 	How to build the Debian package by yourself, short version:
 
