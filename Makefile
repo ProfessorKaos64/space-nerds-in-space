@@ -651,6 +651,10 @@ ssgl/ssgl_server:
 bin/snis_client:	snis_client
 	@mkdir -p bin
 	@cp snis_client bin
+	
+bin/snis_multiverse:	snis_multiverse
+	@mkdir -p bin
+	@cp snis_multiverse bin
 
 bin/snis_server:	snis_server
 	@mkdir -p bin
