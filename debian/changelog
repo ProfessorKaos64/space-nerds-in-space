@@ -1,3 +1,11 @@
+snis (20160528+git+bsos-1) brewmaster; urgency=low
+
+  * Update release to latest commits, as of 20160525
+  * Fix error in Makefile for snis_multiverse
+  * Fix missing build depedency in debian/control
+
+ -- Michael DeGuzis <mdeguzis@gmail.com>  Wed, 25 Feb 2016 11:24:13 -0400
+
 snis (20160220+git+bsos1) brewmaster; urgency=low
 
   * Update release to latest commits, as of 20160220
