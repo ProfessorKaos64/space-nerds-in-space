@@ -1266,6 +1266,8 @@ static void graph_dev_raster_texture(struct graph_dev_gl_textured_shader *shader
 
 	if (do_cullface)
 		glEnable(GL_CULL_FACE);
+	else
+		glDisable(GL_CULL_FACE);
 	if (draw_polygon_as_lines)
 		glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
 
@@ -2706,10 +2708,10 @@ void graph_dev_draw_rectangle(int filled, float x, float y, float width, float h
 		add_vertex_2d(x2, y2, sgc.hue, 255, GL_TRIANGLES);
 		add_vertex_2d(x2, y, sgc.hue, 255, GL_TRIANGLES);
 
-		/* triangle 2 = 0, 3, 2 */
+		/* triangle 2 = 0, 2, 3 */
 		add_vertex_2d(x, y, sgc.hue, 255, GL_TRIANGLES);
-		add_vertex_2d(x2, y2, sgc.hue, 255, GL_TRIANGLES);
 		add_vertex_2d(x, y2, sgc.hue, 255, GL_TRIANGLES);
+		add_vertex_2d(x2, y2, sgc.hue, 255, GL_TRIANGLES);
 	} else {
 		/* not filled */
 		make_room_in_vertex_buffer_2d(5);

@@ -91,7 +91,10 @@
 #define OPCODE_DEMON_FIRE_PHASER	165
 #define OPCODE_DEMON_POSSESS		166
 #define OPCODE_DEMON_DISPOSSESS		167
-#define OPCODE_DEMON_YAW		168
+#define OPCODE_DEMON_ROT		168
+#define   OPCODE_DEMON_ROT_YAW		0
+#define   OPCODE_DEMON_ROT_PITCH	1
+#define   OPCODE_DEMON_ROT_ROLL		2
 #define OPCODE_DEMON_THRUST		169
 #define OPCODE_DEMON_MOVE_OBJECT	170
 #define OPCODE_INITIATE_WARP		171
@@ -159,6 +162,11 @@
 #define OPCODE_REQUEST_ROBOT_CMD		232
 #define   OPCODE_ROBOT_SUBCMD_STG		1	/* set short term goal */
 #define   OPCODE_ROBOT_SUBCMD_LTG		2	/* set long term goal */
+#define OPCODE_TEXTSCREEN_OP			233
+#define   OPCODE_TEXTSCREEN_CLEAR		0
+#define   OPCODE_TEXTSCREEN_TIMEDTEXT		1
+#define   OPCODE_TEXTSCREEN_MENU		2
+#define   OPCODE_TEXTSCREEN_MENU_CHOICE		3
 
 #define OPCODE_NOOP		0xff
 
@@ -559,6 +567,7 @@ struct demon_move_object_packet {
 	uint8_t opcode;
 	uint32_t id;
 	uint32_t x, y, z;
+	union quat q;
 };
 
 struct request_mainscreen_view_change {

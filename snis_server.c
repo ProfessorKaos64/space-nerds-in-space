@@ -92,7 +92,11 @@
 #include "snis_hash.h"
 #include "snis_bridge_update_packet.h"
 #include "solarsystem_config.h"
+#include "key_value_parser.h"
 #include "a_star.h"
+#include "nonuniform_random_sampler.h"
+
+#include "snis_entity_key_value_specification.h"
 
 #define CLIENT_UPDATE_PERIOD_NSECS 500000000
 #define MAXCLIENTS 100
@@ -100,6 +104,7 @@
 static uint32_t mtwist_seed = COMMON_MTWIST_SEED;
 
 static int lua_enscript_enabled = 0;
+static char *initial_lua_script = "initialize.lua";
 
 struct network_stats netstats;
 static int faction_population[5];
@@ -134,6 +139,11 @@ static struct multiverse_server_info {
 
 static char *solarsystem_name = DEFAULT_SOLAR_SYSTEM;
 static struct solarsystem_asset_spec *solarsystem_assets = NULL;
+
+/* This is used by l_show_menu and process_textscreen_op for user
+ * definable menus from lua.
+ */
+static char *current_user_menu_callback = NULL;
 
 #define GATHER_OPCODE_STATS 0
 
@@ -348,6 +358,29 @@ static int ncommodities;
 static int ncontraband;
 static struct commodity *commodity;
 
+int nframes = 0;
+int timer = 0;
+struct timeval start_time, end_time;
+
+static struct snis_object_pool *pool;
+static struct snis_entity go[MAXGAMEOBJS];
+#define go_index(snis_entity_ptr) ((snis_entity_ptr) - &go[0])
+static struct space_partition *space_partition = NULL;
+
+static int lookup_by_id(uint32_t id);
+
+static uint32_t get_new_object_id(void)
+{
+	static uint32_t current_id = 0;
+	static uint32_t answer;
+	static pthread_mutex_t object_id_lock = PTHREAD_MUTEX_INITIALIZER;
+
+	pthread_mutex_lock(&object_id_lock);
+	answer = current_id++;
+	pthread_mutex_unlock(&object_id_lock);
+	return answer;
+}
+
 static inline void client_lock()
 {
         (void) pthread_mutex_lock(&client_mutex);
@@ -426,7 +459,7 @@ struct lua_command_queue_entry {
 	char lua_command[PATH_MAX];
 } *lua_command_queue_head = NULL,  *lua_command_queue_tail = NULL;
 
-static void enqueue_lua_command(char *cmd)
+static void enqueue_lua_command(const char *cmd)
 {
 	/* should obtain universe_mutex before touching this queue. */
 	struct lua_command_queue_entry *q;
@@ -564,6 +597,128 @@ static void fire_lua_timers(void)
 
 }
 
+struct lua_proximity_check {
+	char *callback;
+	uint32_t oid1, oid2;
+	double distance2;
+	struct lua_proximity_check *next;
+} *lua_proximity_check = NULL;
+
+static struct lua_proximity_check *init_lua_proximity_check(const char *callback,
+			const uint32_t oid1, const uint32_t oid2, const double distance,
+			struct lua_proximity_check *next)
+{
+	struct lua_proximity_check *newone = calloc(sizeof(*newone), 1);
+
+	newone->callback = strdup(callback);
+	newone->oid1 = oid1;
+	newone->oid2 = oid2;
+	newone->distance2 = distance * distance;
+	newone->next = next;
+	return newone;
+}
+
+/* insert new lua_proximity check into list */
+static double register_lua_proximity_callback(const char *callback,
+		const uint32_t oid1, const uint32_t oid2, const double distance)
+{
+	struct lua_proximity_check *i, *last, *newone;
+
+	last = NULL;
+	for (i = lua_proximity_check; i != NULL; i = i->next) {
+		/* Replace values if callback already exists */
+		if (oid1 == i->oid1 && oid2 == i->oid2) {
+			if (i->callback)
+				free(i->callback);
+			i->callback = strdup(callback);
+			i->distance2 = distance * distance;
+			return 0.0;
+		}
+		last = i;
+	}
+	newone = init_lua_proximity_check(callback, oid1, oid2, distance, i);
+	if (!last)
+		lua_proximity_check = newone;
+	else
+		last->next = newone;
+	return 0.0;
+}
+
+static void free_lua_proximity_check(struct lua_proximity_check **e)
+{
+	free((*e)->callback);
+	free(*e);
+	*e = NULL;
+}
+
+static void free_lua_proximity_checks(struct lua_proximity_check **e)
+{
+	struct lua_proximity_check *i, *next;
+
+	for (i = *e; i != NULL; i = next) {
+		next = i->next;
+		free_lua_proximity_check(&i);
+	}
+	*e = NULL;
+}
+
+static void fire_lua_proximity_checks(void)
+{
+	struct lua_proximity_check *i, *last, *next;
+	struct lua_proximity_check *temp_list = NULL;
+	struct snis_entity *o1, *o2;
+	double dx, dy, dz, dist2;
+	int a, b;
+
+	last = NULL;
+	pthread_mutex_lock(&universe_mutex);
+	for (i = lua_proximity_check; i != NULL;) {
+		next = i->next;
+
+		a = lookup_by_id(i->oid1);
+		b = lookup_by_id(i->oid2);
+		if (a < 0 || b < 0) {
+			/* remove this check */
+			if (last)
+				last->next = next;
+			else
+				lua_proximity_check = next;
+			continue;
+		}
+
+		o1 = &go[a];
+		o2 = &go[b];
+		dx = o1->x - o2->x;
+		dy = o1->y - o2->y;
+		dz = o1->z - o2->z;
+		dist2 = dx * dx + dy * dy + dz * dz;
+
+
+		if (dist2 <= i->distance2) { /* add the proximity check to temp list */
+			/* Remove the proximity check */
+			if (last)
+				last->next = next;
+			else
+				lua_proximity_check = next;
+			/* Add the check to a temporary list */
+			i->next = temp_list;
+			temp_list = i;
+		}
+		i = next;
+	}
+	pthread_mutex_unlock(&universe_mutex);
+
+	/* Call all the lua proximity check callback functions in the temporary list  */
+	for (i = temp_list; i != NULL; i = next) {
+		next = i->next;
+		lua_getglobal(lua_state, i->callback);
+		lua_pushnumber(lua_state, (double) i->oid1);
+		lua_pushnumber(lua_state, (double) i->oid2);
+		lua_pushnumber(lua_state, (double) sqrt(dist2));
+		lua_pcall(lua_state, 3, 0, 0);
+		free_lua_proximity_check(&i);
+	}
+}
 
 void lua_object_id_event(char *event, uint32_t object_id)
 {
@@ -589,6 +744,7 @@ void fire_lua_callbacks(struct callback_schedule_entry **sched)
 		next = next_scheduled_callback(i);
 		callback = callback_name(i);
 		lua_getglobal(lua_state, callback);
+		free(callback);
 		lua_pushnumber(lua_state, callback_schedule_entry_param(i, 0));
 		lua_pushnumber(lua_state, callback_schedule_entry_param(i, 1));
 		lua_pushnumber(lua_state, callback_schedule_entry_param(i, 2));
@@ -605,27 +761,6 @@ void lua_player_respawn_event(uint32_t object_id)
 void lua_player_death_event(uint32_t object_id)
 {
 	lua_object_id_event("player-death-event", object_id);
-}
-
-int nframes = 0;
-int timer = 0;
-struct timeval start_time, end_time;
-
-static struct snis_object_pool *pool;
-static struct snis_entity go[MAXGAMEOBJS];
-#define go_index(snis_entity_ptr) ((snis_entity_ptr) - &go[0])
-static struct space_partition *space_partition = NULL;
-
-static uint32_t get_new_object_id(void)
-{
-	static uint32_t current_id = 0;
-	static uint32_t answer;
-	static pthread_mutex_t object_id_lock = PTHREAD_MUTEX_INITIALIZER;
-
-	pthread_mutex_lock(&object_id_lock);
-	answer = current_id++;
-	pthread_mutex_unlock(&object_id_lock);	
-	return answer;
 }
 
 static void set_object_location(struct snis_entity *o, double x, double y, double z);
@@ -662,7 +797,7 @@ static void set_object_location(struct snis_entity *o, double x, double y, doubl
 static void get_peer_name(int connection, char *buffer)
 {
 	struct sockaddr_in *peer;
-	struct sockaddr p;
+	struct sockaddr p = { 0 };
 	socklen_t addrlen = sizeof(p);
 	int rc;
 
@@ -699,6 +834,7 @@ static void log_client_info(int level, int connection, char *info)
 	if (level < snis_log_level)
 		return;
 
+	memset(client_ip, 0, sizeof(client_ip));
 	get_peer_name(connection, client_ip);
 	snis_log(level, "%s: %s: %s", logprefix(), client_ip, info);
 }
@@ -774,7 +910,9 @@ static void generic_move(__attribute__((unused)) struct snis_entity *o)
 
 static void asteroid_move(struct snis_entity *o)
 {
-	set_object_location(o, o->x + o->vx, o->y + o->vy, o->z + o->vz);
+	set_object_location(o, o->x + o->vx * o->tsd.asteroid.v,
+				o->y + o->vy * o->tsd.asteroid.v,
+				o->z + o->vz * o->tsd.asteroid.v);
 	o->timestamp = universe_timestamp;
 
 	if (((o->timestamp + o->id) & 0x07) == 0) { /* throttle this calculation */
@@ -1145,10 +1283,10 @@ static void delete_from_clients_and_server_helper(struct snis_entity *o, int tak
 		break;
 	case OBJTYPE_STARBASE:
 		delete_starbase_docking_ports(o);
-		break;
+		/* deliberate fallthrough */
 	default:
 		schedule_callback(event_callback, &callback_schedule,
-				"object-death-callback", o->id);
+				"object-death-event", o->id);
 		break;
 	}
 
@@ -1541,7 +1679,6 @@ static void send_ship_damage_packet(struct snis_entity *o);
 static void send_detonate_packet(struct snis_entity *o, double x, double y, double z,
 				uint32_t time, double fractional_time);
 static void send_silent_ship_damage_packet(struct snis_entity *o);
-static int lookup_by_id(uint32_t id);
 
 static struct snis_entity *lookup_entity_by_id(uint32_t id)
 {
@@ -1821,16 +1958,31 @@ static int add_cargo_container(double x, double y, double z, double vx, double v
 				int item, float qty);
 static int make_derelict(struct snis_entity *o)
 {
-	int rc;
+	int i, rc;
 	rc = add_derelict(o->sdata.name, o->x, o->y, o->z,
 				o->vx + snis_random_float() * 2.0,
 				o->vy + snis_random_float() * 2.0,
 				o->vz + snis_random_float() * 2.0,
 				o->tsd.ship.shiptype, o->sdata.faction, 0);
-	(void) add_cargo_container(o->x, o->y, o->z,
+	if (o->type == OBJTYPE_SHIP1 || o->type == OBJTYPE_SHIP2) {
+		for (i = 0; i < o->tsd.ship.ncargo_bays; i++) {
+			int item;
+			float qty;
+
+			item = o->tsd.ship.cargo[i].contents.item;
+			qty = o->tsd.ship.cargo[i].contents.qty;
+			if (qty > 0.0 && item >= 0)
+				(void) add_cargo_container(o->x, o->y, o->z,
+					o->vx + snis_random_float() * 2.0,
+					o->vy + snis_random_float() * 2.0,
+					o->vz + snis_random_float(), item, qty);
+		}
+	} else {
+		(void) add_cargo_container(o->x, o->y, o->z,
 				o->vx + snis_random_float() * 2.0,
 				o->vy + snis_random_float() * 2.0,
 				o->vz + snis_random_float(), -1, 0.0);
+	}
 	return rc;
 }
 
@@ -2241,7 +2393,9 @@ static void torpedo_collision_detection(void *context, void *entity)
 	}
 
 	if (t->type == OBJTYPE_SHIP1 || t->type == OBJTYPE_SHIP2) {
-		do_collision_impulse(t, o);
+		if (t->type != OBJTYPE_SHIP1 ||
+			t->tsd.ship.damage.maneuvering_damage > 150)
+			do_collision_impulse(t, o);
 		calculate_torpedo_damage(t);
 		send_ship_damage_packet(t);
 		send_detonate_packet(t, ix, iy, iz, impact_time, impact_fractional_time);
@@ -4275,11 +4429,10 @@ static void damcon_robot_think(struct snis_damcon_entity *o, struct damcon_data 
 			d->robot->tsd.robot.robot_state = DAMCON_ROBOT_DECIDE_LTG;
 			return;
 		}
+		socket = NULL;
 		if (d->robot->tsd.robot.repair_socket_id != ROBOT_CARGO_EMPTY) {
 			i = lookup_by_damcon_id(d, d->robot->tsd.robot.repair_socket_id);
-			if (i < 0)
-				socket = NULL;
-			else
+			if (i >= 0)
 				socket = &d->o[i];
 		}
 		if (!socket) {
@@ -5630,15 +5783,23 @@ static void player_move(struct snis_entity *o)
 
 static void demon_ship_move(struct snis_entity *o)
 {
-	o->vx = o->tsd.ship.velocity * cos(o->heading);
-	o->vz = o->tsd.ship.velocity * -sin(o->heading);
+	union vec3 right = { { 1.0, 0.0, 0.0 } };
+
+	quat_rot_vec_self(&right, &o->orientation);
+	o->vx = o->tsd.ship.velocity * right.v.x;
+	o->vy = o->tsd.ship.velocity * right.v.y;
+	o->vz = o->tsd.ship.velocity * right.v.z;
 	set_object_location(o, o->x + o->vx, o->y + o->vy, o->z + o->vz);
-	o->heading += o->tsd.ship.yaw_velocity;
-	normalize_angle(&o->heading);
-	quat_init_axis(&o->orientation, 0, 1, 0, o->heading);
+	quat_apply_relative_yaw_pitch_roll(&o->orientation,
+			o->tsd.ship.yaw_velocity,
+			o->tsd.ship.pitch_velocity,
+			o->tsd.ship.roll_velocity);
+
 	o->timestamp = universe_timestamp;
 
 	damp_yaw_velocity(&o->tsd.ship.yaw_velocity, YAW_DAMPING);
+	damp_yaw_velocity(&o->tsd.ship.pitch_velocity, YAW_DAMPING);
+	damp_yaw_velocity(&o->tsd.ship.roll_velocity, YAW_DAMPING);
 	damp_yaw_velocity(&o->tsd.ship.gun_yaw_velocity, GUN_YAW_DAMPING);
 	damp_yaw_velocity(&o->tsd.ship.sci_yaw_velocity, SCI_YAW_DAMPING);
 
@@ -6405,9 +6566,10 @@ static uint32_t choose_ship_home_planet(void)
 	return (uint32_t) -1;
 }
 
+static int commodity_sample(void);
 static int add_ship(int faction, int auto_respawn)
 {
-	int i;
+	int i, cb;
 	double x, y, z, heading;
 	int st;
 	static struct mtwist_state *mt = NULL;
@@ -6448,7 +6610,15 @@ static int add_ship(int faction, int auto_respawn)
 	go[i].tsd.ship.steering_adjustment.v.x = 0.0;
 	go[i].tsd.ship.steering_adjustment.v.y = 0.0;
 	go[i].tsd.ship.steering_adjustment.v.z = 0.0;
-	go[i].tsd.ship.ncargo_bays = 0;
+	go[i].tsd.ship.ncargo_bays = ship_type[st].ncargo_bays;
+	for (cb = 0; cb < go[i].tsd.ship.ncargo_bays; cb++) {
+		int item = commodity_sample();
+		float qty = (float) snis_randn(100);
+		go[i].tsd.ship.cargo[cb].contents.item = item;
+		go[i].tsd.ship.cargo[cb].contents.qty = qty;
+		if (snis_randn(10000) < 2000)
+			break;
+	}
 	go[i].tsd.ship.home_planet = choose_ship_home_planet();
 	go[i].tsd.ship.auto_respawn = (uint8_t) auto_respawn;
 	quat_init_axis(&go[i].tsd.ship.computer_desired_orientation, 0, 1, 0, 0);
@@ -6533,7 +6703,7 @@ static int l_add_ship(lua_State *l)
 	return 1;
 }
 
-static int add_asteroid(double x, double y, double z, double vx, double vz, double heading);
+static int add_asteroid(double x, double y, double z, double vx, double vz, double heading, double v);
 static int l_add_asteroid(lua_State *l)
 {
 	double x, y, z;
@@ -6544,9 +6714,31 @@ static int l_add_asteroid(lua_State *l)
 	z = lua_tonumber(lua_state, 3);
 
 	pthread_mutex_lock(&universe_mutex);
-	i = add_asteroid(x, y, z, 0.0, 0.0, 0.0);
+	i = add_asteroid(x, y, z, 0.0, 0.0, 0.0, 1.0);
 	lua_pushnumber(lua_state, i < 0 ? -1.0 : (double) go[i].id);
 	pthread_mutex_unlock(&universe_mutex);
+	return 1;
+}
+
+static int l_set_asteroid_speed(lua_State *l)
+{
+	const double id = luaL_checknumber(lua_state, 1);
+	const double v = luaL_checknumber(lua_state, 2);
+	pthread_mutex_lock(&universe_mutex);
+	int i = lookup_by_id((uint32_t) id);
+	if (i < 0)
+		goto error;
+	if (go[i].type != OBJTYPE_ASTEROID)
+		goto error;
+	if (v < 0.0 || v > 1.0)
+		goto error;
+	go[i].tsd.asteroid.v = (float) v;
+	pthread_mutex_unlock(&universe_mutex);
+	lua_pushnumber(lua_state, 0.0);
+	return 1;
+error:
+	pthread_mutex_unlock(&universe_mutex);
+	lua_pushnil(lua_state);
 	return 1;
 }
 
@@ -6721,7 +6913,7 @@ static int add_cargo_container(double x, double y, double z, double vx, double v
 	go[i].alive = CARGO_CONTAINER_LIFETIME;
 	if (item < 0) {
 		/* TODO: something better for container contents */
-		item = snis_randn(ncommodities);
+		item = commodity_sample();
 		qty = (float) snis_randn(100);
 	}
 	go[i].tsd.cargo_container.contents.item = item;
@@ -6735,7 +6927,43 @@ static void normalize_percentage(uint8_t *v, int total)
 	*v = (uint8_t) (fraction * 255.0);
 }
 
-static int add_asteroid(double x, double y, double z, double vx, double vz, double heading)
+static int set_asteroid_minerals(uint32_t id, float carbon, float silicates, float nickeliron, float preciousmetals)
+{
+	float total;
+	int i;
+	struct snis_entity *o;
+
+	i = lookup_by_id(id);
+	if (i < 0)
+		return -1;
+	o = &go[i];
+	if (o->type != OBJTYPE_ASTEROID)
+		return -1;
+
+	carbon = fabsf(carbon);
+	silicates = fabsf(silicates);
+	nickeliron = fabsf(nickeliron);
+	preciousmetals = fabsf(preciousmetals);
+	total = carbon + silicates + nickeliron + preciousmetals;
+
+	if (total < 0.0001) {
+		total += 1.0;
+		carbon += 1.0;
+	}
+
+	o->tsd.asteroid.carbon = (uint8_t) (255.0 * carbon);
+	o->tsd.asteroid.silicates = (uint8_t) (255.0 * silicates);
+	o->tsd.asteroid.nickeliron = (uint8_t) (255.0 * nickeliron);
+	o->tsd.asteroid.preciousmetals = (uint8_t) (255.0 * preciousmetals);
+
+	normalize_percentage(&go[i].tsd.asteroid.carbon, total);
+	normalize_percentage(&go[i].tsd.asteroid.silicates, total);
+	normalize_percentage(&go[i].tsd.asteroid.nickeliron, total);
+	normalize_percentage(&go[i].tsd.asteroid.preciousmetals, total);
+	return 0;
+}
+
+static int add_asteroid(double x, double y, double z, double vx, double vz, double heading, double velocity)
 {
 	int i, n, v;
 	int total;
@@ -6750,6 +6978,7 @@ static int add_asteroid(double x, double y, double z, double vx, double vz, doub
 	go[i].move = asteroid_move;
 	go[i].vx = snis_random_float() * ASTEROID_SPEED * 2.0 - ASTEROID_SPEED;
 	go[i].vz = snis_random_float() * ASTEROID_SPEED * 2.0 - ASTEROID_SPEED;
+	go[i].tsd.asteroid.v = velocity;
 	go[i].alive = snis_randn(10) + 5;
 	go[i].orientation = random_spin[go[i].id % NRANDOM_ORIENTATIONS];
 	go[i].tsd.asteroid.rotational_velocity = random_spin[go[i].id % NRANDOM_SPINS];
@@ -6781,6 +7010,20 @@ static int mkt_item_already_present(struct marketplace_data *mkt, int nitems, in
 		if (mkt[i].item == item)
 			return 1;
 	return 0;
+}
+
+static int commodity_sample(void)
+{
+	static struct nonuniform_sample_distribution *d = NULL;
+	int i;
+
+	if (d)
+		return nonuniform_sample(d);
+
+	d = nonuniform_sample_distribution_init(ncommodities, 77277);
+	for (i = 0; i < ncommodities; i++)
+		nonuniform_sample_add_item(d, i, commodity[i].odds);
+	return nonuniform_sample(d);
 }
 
 static float calculate_commodity_price(struct snis_entity *planet, int item)
@@ -6856,7 +7099,7 @@ static void init_starbase_market(struct snis_entity *o)
 	for (i = 0; i < COMMODITIES_PER_BASE; i++) {
 		int item;
 		do {
-			item = snis_randn(ncommodities);
+			item = commodity_sample();
 		} while (mkt_item_already_present(mkt, i, item)); 
 		mkt[i].item = item;
 		mkt[i].qty = snis_randn(100); /* TODO: something better */
@@ -7507,7 +7750,7 @@ static void add_asteroids(void)
 			x = cx + r * sin(a);
 			z = cz + r * cos(a);
 			y = cy + r * cos(a2);
-			add_asteroid(x, y, z, 0.0, 0.0, 0.0);
+			add_asteroid(x, y, z, 0.0, 0.0, 0.0, 1.0);
 		}
 	}
 }
@@ -7896,6 +8139,10 @@ static uint32_t nth_starbase(int n)
 					return go[i].id;
 			}
 		}
+		if (nstarbases == 0)
+			return (uint32_t) -1;
+
+		/* If n > number of starbase, we will make n = n modulo nstarbases and try again. */
 		n = n % nstarbases;
 		nstarbases = 0;
 	} while (1);
@@ -7918,6 +8165,8 @@ static int compute_fare(uint32_t src, uint32_t dest)
 	if (i < 0)
 		return default_fare + fare_noise;
 	d = &go[i];
+	if (d == s)
+		return min_fare + fare_noise;
 	travel.v.x = d->x - s->x;
 	travel.v.y = d->y - s->y;
 	travel.v.z = d->z - s->z;
@@ -7933,7 +8182,7 @@ static void update_passenger(int i, int nstarbases)
 	passenger[i].location = nth_starbase(snis_randn(nstarbases));
 	do {
 		passenger[i].destination = nth_starbase(snis_randn(nstarbases));
-	} while (passenger[i].destination == passenger[i].location);
+	} while (passenger[i].destination == passenger[i].location && nstarbases > 1);
 	passenger[i].fare = compute_fare(passenger[i].location, passenger[i].destination);
 }
 
@@ -8371,16 +8620,16 @@ static void do_robot_thrust(struct game_client *c, int thrust)
 
 typedef void (*do_yaw_function)(struct game_client *c, int yaw);
 
-static void do_generic_yaw(double *yawvel, int yaw, double max_yaw, double yaw_inc,
-				double yaw_inc_fine)
+static void do_generic_axis_rot(double *axisvel, int amount, double max_amount,
+				double amount_inc, double amount_inc_fine)
 {
-	double delta_yaw = abs(yaw) > 1 ? yaw_inc_fine : yaw_inc;
-	if (yaw > 0) {
-		if (*yawvel < max_yaw)
-			*yawvel += delta_yaw;
+	double delta_amount = abs(amount) > 1 ? amount_inc_fine : amount_inc;
+	if (amount > 0) {
+		if (*axisvel < max_amount)
+			*axisvel += delta_amount;
 	} else {
-		if (*yawvel > -max_yaw)
-			*yawvel -= delta_yaw;
+		if (*axisvel > -max_amount)
+			*axisvel -= delta_amount;
 	}
 }
 
@@ -8391,7 +8640,7 @@ static void do_yaw(struct game_client *c, int yaw)
 		(MAX_YAW_VELOCITY * ship->tsd.ship.power_data.maneuvering.i) / 255;
 
 	ship->tsd.ship.computer_steering_time_left = 0; /* cancel any computer steering in progress */
-	do_generic_yaw(&ship->tsd.ship.yaw_velocity, yaw, max_yaw_velocity,
+	do_generic_axis_rot(&ship->tsd.ship.yaw_velocity, yaw, max_yaw_velocity,
 			YAW_INCREMENT, YAW_INCREMENT_FINE);
 }
 
@@ -8402,7 +8651,7 @@ static void do_pitch(struct game_client *c, int pitch)
 		(MAX_PITCH_VELOCITY * ship->tsd.ship.power_data.maneuvering.i) / 255;
 
 	ship->tsd.ship.computer_steering_time_left = 0; /* cancel any computer steering in progress */
-	do_generic_yaw(&ship->tsd.ship.pitch_velocity, pitch, max_pitch_velocity,
+	do_generic_axis_rot(&ship->tsd.ship.pitch_velocity, pitch, max_pitch_velocity,
 			PITCH_INCREMENT, PITCH_INCREMENT_FINE);
 }
 
@@ -8413,7 +8662,7 @@ static void do_roll(struct game_client *c, int roll)
 		(MAX_ROLL_VELOCITY * ship->tsd.ship.power_data.maneuvering.i) / 255;
 
 	ship->tsd.ship.computer_steering_time_left = 0; /* cancel any computer steering in progress */
-	do_generic_yaw(&ship->tsd.ship.roll_velocity, roll, max_roll_velocity,
+	do_generic_axis_rot(&ship->tsd.ship.roll_velocity, roll, max_roll_velocity,
 			ROLL_INCREMENT, ROLL_INCREMENT_FINE);
 }
 
@@ -8422,7 +8671,7 @@ static void do_sciball_yaw(struct game_client *c, int yaw)
 	struct snis_entity *ship = &go[c->ship_index];
 	const double max_yaw_velocity = MAX_YAW_VELOCITY;
 
-	do_generic_yaw(&ship->tsd.ship.sciball_yawvel, yaw, max_yaw_velocity,
+	do_generic_axis_rot(&ship->tsd.ship.sciball_yawvel, yaw, max_yaw_velocity,
 			YAW_INCREMENT, YAW_INCREMENT_FINE);
 }
 
@@ -8431,7 +8680,7 @@ static void do_sciball_pitch(struct game_client *c, int pitch)
 	struct snis_entity *ship = &go[c->ship_index];
 	double max_pitch_velocity = MAX_PITCH_VELOCITY;
 
-	do_generic_yaw(&ship->tsd.ship.sciball_pitchvel, pitch, max_pitch_velocity,
+	do_generic_axis_rot(&ship->tsd.ship.sciball_pitchvel, pitch, max_pitch_velocity,
 			PITCH_INCREMENT, PITCH_INCREMENT_FINE);
 }
 
@@ -8440,7 +8689,7 @@ static void do_sciball_roll(struct game_client *c, int roll)
 	struct snis_entity *ship = &go[c->ship_index];
 	double max_roll_velocity = MAX_ROLL_VELOCITY;
 
-	do_generic_yaw(&ship->tsd.ship.sciball_rollvel, roll, max_roll_velocity,
+	do_generic_axis_rot(&ship->tsd.ship.sciball_rollvel, roll, max_roll_velocity,
 			ROLL_INCREMENT, ROLL_INCREMENT_FINE);
 }
 
@@ -8449,7 +8698,7 @@ static void do_manual_gunyaw(struct game_client *c, int yaw)
 	struct snis_entity *ship = &go[c->ship_index];
 	double max_yaw_velocity = MAX_YAW_VELOCITY;
 
-	do_generic_yaw(&ship->tsd.ship.weap_yawvel, yaw, max_yaw_velocity,
+	do_generic_axis_rot(&ship->tsd.ship.weap_yawvel, yaw, max_yaw_velocity,
 			YAW_INCREMENT, YAW_INCREMENT_FINE);
 }
 
@@ -8458,7 +8707,7 @@ static void do_manual_gunpitch(struct game_client *c, int pitch)
 	struct snis_entity *ship = &go[c->ship_index];
 	double max_pitch_velocity = MAX_PITCH_VELOCITY;
 
-	do_generic_yaw(&ship->tsd.ship.weap_pitchvel, pitch, max_pitch_velocity,
+	do_generic_axis_rot(&ship->tsd.ship.weap_pitchvel, pitch, max_pitch_velocity,
 			PITCH_INCREMENT, PITCH_INCREMENT_FINE);
 }
 
@@ -8466,8 +8715,24 @@ static void do_demon_yaw(struct snis_entity *o, int yaw)
 {
 	double max_yaw_velocity = MAX_YAW_VELOCITY;
 
-	do_generic_yaw(&o->tsd.ship.yaw_velocity, yaw, max_yaw_velocity,
+	do_generic_axis_rot(&o->tsd.ship.yaw_velocity, yaw, max_yaw_velocity,
 			YAW_INCREMENT, YAW_INCREMENT_FINE);
+}
+
+static void do_demon_pitch(struct snis_entity *o, int pitch)
+{
+	double max_pitch_velocity = MAX_PITCH_VELOCITY;
+
+	do_generic_axis_rot(&o->tsd.ship.pitch_velocity, pitch, max_pitch_velocity,
+			PITCH_INCREMENT, PITCH_INCREMENT_FINE);
+}
+
+static void do_demon_roll(struct snis_entity *o, int roll)
+{
+	double max_roll_velocity = MAX_ROLL_VELOCITY;
+
+	do_generic_axis_rot(&o->tsd.ship.roll_velocity, roll, max_roll_velocity,
+			ROLL_INCREMENT, ROLL_INCREMENT_FINE);
 }
 
 static void do_gun_yaw(struct game_client *c, int yaw)
@@ -8475,7 +8740,7 @@ static void do_gun_yaw(struct game_client *c, int yaw)
 	/* FIXME combine this with do_yaw somehow */
 	struct snis_entity *ship = &go[c->ship_index];
 
-	do_generic_yaw(&ship->tsd.ship.gun_yaw_velocity, yaw,
+	do_generic_axis_rot(&ship->tsd.ship.gun_yaw_velocity, yaw,
 				MAX_GUN_YAW_VELOCITY, GUN_YAW_INCREMENT,
 				GUN_YAW_INCREMENT_FINE);
 }
@@ -8484,7 +8749,7 @@ static void do_sci_yaw(struct game_client *c, int yaw)
 {
 	struct snis_entity *ship = &go[c->ship_index];
 
-	do_generic_yaw(&ship->tsd.ship.sci_yaw_velocity, yaw,
+	do_generic_axis_rot(&ship->tsd.ship.sci_yaw_velocity, yaw,
 				MAX_SCI_YAW_VELOCITY, SCI_YAW_INCREMENT,
 				SCI_YAW_INCREMENT_FINE);
 }
@@ -8494,7 +8759,7 @@ static void do_robot_yaw(struct game_client *c, int yaw)
 	struct damcon_data *d = &bridgelist[c->bridge].damcon;
 	struct snis_damcon_entity *r = d->robot;
 
-	do_generic_yaw(&r->tsd.robot.yaw_velocity, yaw,
+	do_generic_axis_rot(&r->tsd.robot.yaw_velocity, yaw,
 			2.0 * MAX_SCI_YAW_VELOCITY, SCI_YAW_INCREMENT,
 				SCI_YAW_INCREMENT_FINE);
 }
@@ -8503,7 +8768,7 @@ static void do_sci_bw_yaw(struct game_client *c, int yaw)
 {
 	struct snis_entity *ship = &go[c->ship_index];
 
-	do_generic_yaw(&ship->tsd.ship.sci_beam_width, yaw,
+	do_generic_axis_rot(&ship->tsd.ship.sci_beam_width, yaw,
 			MAX_SCI_BW_YAW_VELOCITY, SCI_BW_YAW_INCREMENT,
 			SCI_BW_YAW_INCREMENT_FINE);
 	ship->tsd.ship.sci_beam_width = fabs(ship->tsd.ship.sci_beam_width);
@@ -8599,11 +8864,13 @@ static int process_demon_move_object(struct game_client *c)
 	uint32_t oid;
 	double dx, dy, dz;
 	int i, rc;
+	union quat orientation;
 
-	rc = read_and_unpack_buffer(c, buffer, "wSSS", &oid,
+	rc = read_and_unpack_buffer(c, buffer, "wSSSQ", &oid,
 			&dx, (int32_t) UNIVERSE_DIM,
 			&dy, (int32_t) UNIVERSE_DIM,
-			&dz, (int32_t) UNIVERSE_DIM);
+			&dz, (int32_t) UNIVERSE_DIM,
+			&orientation);
 	if (rc)
 		return rc;
 	if (!(c->role & ROLE_DEMON))
@@ -8616,6 +8883,7 @@ static int process_demon_move_object(struct game_client *c)
 	if (o->type == OBJTYPE_SHIP2 || o->type == OBJTYPE_SHIP1)
 		add_warp_effect(o->id, o->x, o->y, o->z, o->x + dx, o->y, o->z + dz);
 	set_object_location(o, o->x + dx, o->y + dy, o->z + dz);
+	o->orientation = orientation;
 	o->timestamp = universe_timestamp;
 out:
 	pthread_mutex_unlock(&universe_mutex);
@@ -9084,7 +9352,7 @@ static void meta_comms_inventory(char *name, struct game_client *c, char *txt)
 			format_due_date(due_date, sizeof(due_date), (double)
 				ship->tsd.ship.cargo[i].due_date);
 			snprintf(msg, sizeof(msg),
-				"    CARGO BAY %d: %4.0f %s %s - PAID $%.2f ORIG %10s DEST %10s DUE %s",
+				"    CARGO BAY %d: %4.2f %s %s - PAID $%.2f ORIG %10s DEST %10s DUE %s",
 					i, qty, unit, itemname, ship->tsd.ship.cargo[i].paid,
 					origin, dest, due_date);
 			send_comms_packet(name, ch, msg);
@@ -10090,7 +10358,7 @@ static void starbase_cargo_buyingselling_npc_bot(struct snis_entity *o, int brid
 			return;
 		}
 		if (strncasecmp("sell ", msg, 5) == 0)  {
-			int q;
+			float qf;
 			char x;
 
 			/* check transporter range */
@@ -10100,26 +10368,35 @@ static void starbase_cargo_buyingselling_npc_bot(struct snis_entity *o, int brid
 				return;
 			}
 
-			rc = sscanf(msg + 5, "%d %c", &q, &x);
+			rc = sscanf(msg + 5, "%f %c", &qf, &x);
 			if (rc != 2) {
-				send_comms_packet(n, channel, " INVALID SELL ORDER");
-				return;
+				rc = sscanf(msg + 5, "%c", &x);
+				if (rc == 1 && strlen(msg) == 6) {
+					if (toupper(x) - 'A' < 0 || toupper(x) - 'A' >= ship->tsd.ship.ncargo_bays) {
+						send_comms_packet(n, channel, " INVALID SELL ORDER, BAD CARGO BAY");
+						return;
+					}
+					qf = ship->tsd.ship.cargo[(int) toupper(x) - 'A'].contents.qty;
+				} else {
+					send_comms_packet(n, channel, " INVALID SELL ORDER, PARSE ERROR");
+					return;
+				}
 			}
 			x = toupper(x) - 'A';
 			if (x < 0 || x >= ship->tsd.ship.ncargo_bays) {
-				send_comms_packet(n, channel, " INVALID SELL ORDER");
+				send_comms_packet(n, channel, " INVALID SELL ORDER, BAD CARGO BAY");
 				return;
 			}
-			if (q > ship->tsd.ship.cargo[(int) x].contents.qty) {
-				send_comms_packet(n, channel, " INVALID SELL ORDER");
+			if (qf > ship->tsd.ship.cargo[(int) x].contents.qty) {
+				send_comms_packet(n, channel, " INVALID SELL ORDER, INSUFFICIENT QUANTITY");
 				return;
 			}
-			ship->tsd.ship.cargo[(int) x].contents.qty -= q;
+			ship->tsd.ship.cargo[(int) x].contents.qty -= qf;
 			ship->tsd.ship.wallet +=
-				q * o->tsd.starbase.bid_price[ship->tsd.ship.cargo[(int) x].contents.item];
-			profitloss = q * o->tsd.starbase.bid_price[ship->tsd.ship.cargo[(int) x].contents.item]
-					- q * ship->tsd.ship.cargo[(int) x].paid;
-			if (ship->tsd.ship.cargo[(int) x].contents.qty < 0.1) {
+				qf * o->tsd.starbase.bid_price[ship->tsd.ship.cargo[(int) x].contents.item];
+			profitloss = qf * o->tsd.starbase.bid_price[ship->tsd.ship.cargo[(int) x].contents.item]
+					- qf * ship->tsd.ship.cargo[(int) x].paid;
+			if (ship->tsd.ship.cargo[(int) x].contents.qty < 0.001) {
 				ship->tsd.ship.cargo[(int) x].contents.item = -1;
 				ship->tsd.ship.cargo[(int) x].contents.qty = 0.0f;
 				ship->tsd.ship.cargo[(int) x].paid = 0.0f;
@@ -10127,7 +10404,7 @@ static void starbase_cargo_buyingselling_npc_bot(struct snis_entity *o, int brid
 				ship->tsd.ship.cargo[(int) x].dest = -1;
 				ship->tsd.ship.cargo[(int) x].due_date = -1;
 			}
-			snprintf(m, sizeof(m), " EXECUTING SELL ORDER %d %c", q, x);
+			snprintf(m, sizeof(m), " EXECUTING SELL ORDER %.2f %c", qf, x);
 			send_comms_packet(n, channel, m);
 			snis_queue_add_sound(TRANSPORTER_SOUND,
 					ROLE_SOUNDSERVER, ship->id);
@@ -10152,7 +10429,7 @@ static void starbase_cargo_buyingselling_npc_bot(struct snis_entity *o, int brid
 				bid = mkt[i].bid;
 				ask = mkt[i].ask;
 				qty = mkt[i].qty;
-				snprintf(m, sizeof(m), " %c: %04.0f %s %s -- $%4.2f  $%4.2f\n",
+				snprintf(m, sizeof(m), " %c: %4.2f %s %s -- $%4.2f  $%4.2f\n",
 					i + 'A', qty, unit, itemname, bid, ask);
 				send_comms_packet(n, channel, m);
 			}
@@ -10171,7 +10448,7 @@ static void starbase_cargo_buyingselling_npc_bot(struct snis_entity *o, int brid
 				unit = commodity[item].unit;
 				qty = ship->tsd.ship.cargo[i].contents.qty;
 				bid = o->tsd.starbase.bid_price[item];
-				snprintf(m, sizeof(m), " %c: %04.0f %s %s -- $%4.2f (PAID $%.2f)",
+				snprintf(m, sizeof(m), " %c: %4.2f %s %s -- $%4.2f (PAID $%.2f)",
 					i + 'A', qty, unit, itemname, bid,
 					ship->tsd.ship.cargo[i].paid);
 				send_comms_packet(n, channel, m);
@@ -10181,6 +10458,12 @@ static void starbase_cargo_buyingselling_npc_bot(struct snis_entity *o, int brid
 				send_comms_packet(n, channel, "   ** CARGO HOLD IS EMPTY **");
 		}
 		send_comms_packet(n, channel, " 0: PREVIOUS MENU");
+		send_comms_packet(n, channel, "----------------------------");
+		if (buy)
+			send_comms_packet(n, channel, "  (TYPE 'BUY 3 A' TO BUY 3 of item A)");
+		else
+			send_comms_packet(n, channel,
+				"  (TYPE 'SELL 3 A' TO SELL 3 of item A or 'SELL A' to sell all A)");
 		send_comms_packet(n, channel, "----------------------------");
 	}
 	if (selection == 0) {
@@ -10574,6 +10857,27 @@ static int process_natural_language_request(struct game_client *c)
 	return 0;
 }
 
+static int process_textscreen_op(struct game_client *c)
+{
+	int rc;
+	uint8_t subcommand, selection;
+	unsigned char buffer[10];
+
+	rc = read_and_unpack_buffer(c, buffer, "bb", &subcommand, &selection);
+	if (rc)
+		return rc;
+	if (!current_user_menu_callback)
+		return 0;
+	switch (subcommand) {
+	case OPCODE_TEXTSCREEN_MENU_CHOICE:
+		schedule_one_callback(&callback_schedule, current_user_menu_callback,
+			(double) c->shipid, (double) selection, 0.0);
+		break;
+	default:
+		return -1;
+	}
+	return 0;
+}
 
 static void enscript_prologue(FILE *f)
 {
@@ -10607,6 +10911,8 @@ static void enscript_asteroid(FILE *f, struct snis_entity *o, int asteroid)
 		fprintf(f, "asteroid = {};\n");
 	fprintf(f, "asteroid[%d] = add_asteroid(%lf, %lf, %lf);\n",
 				asteroid, o->x, o->y, o->z);
+	fprintf(f, "asteroid_set_velocity(asteroid[%d], %f);\n",
+				asteroid, o->tsd.asteroid.v);
 }
 
 static void enscript_starbase(FILE *f, struct snis_entity *o, int starbase)
@@ -10936,6 +11242,29 @@ static int l_register_callback(lua_State *l)
 
 	pthread_mutex_lock(&universe_mutex);
 	rc = register_lua_callback(event, callback);
+	pthread_mutex_unlock(&universe_mutex);
+	lua_pushnumber(l, rc);
+	return 1;
+}
+
+static int l_register_proximity_callback(lua_State *l)
+{
+	const char *callback = luaL_checkstring(l, 1);
+	const double lua_oid1 = luaL_checknumber(l, 2);
+	const double lua_oid2 = luaL_checknumber(l, 3);
+	const double distance = luaL_checknumber(l, 4);
+	double rc;
+	uint32_t oid1, oid2;
+
+	if (lua_oid1 < lua_oid2) {
+		oid1 = (uint32_t) lua_oid1;
+		oid2 = (uint32_t) lua_oid2;
+	} else {
+		oid1 = (uint32_t) lua_oid2;
+		oid2 = (uint32_t) lua_oid1;
+	}
+	pthread_mutex_lock(&universe_mutex);
+	rc = register_lua_proximity_callback(callback, oid1, oid2, distance);
 	pthread_mutex_unlock(&universe_mutex);
 	lua_pushnumber(l, rc);
 	return 1;
@@ -11458,6 +11787,7 @@ static void process_demon_clear_all(void)
 	pthread_mutex_lock(&universe_mutex);
 	free_event_callbacks(&event_callback);
 	free_timer_events(&lua_timer);
+	free_lua_proximity_checks(&lua_proximity_check);
 	free_callback_schedule(&callback_schedule);
 	for (i = 0; i <= snis_object_pool_highest_object(pool); i++) {
 		struct snis_entity *o = &go[i];
@@ -11516,6 +11846,403 @@ static int l_clear_all(__attribute__((unused)) lua_State *l)
 	return 0;
 }
 
+static void send_timed_text(int id, uint16_t timevalue, uint16_t length, char *text)
+{
+	struct packed_buffer *pb;
+
+	assert(strlen(text) + 1 == length);
+	pb = packed_buffer_allocate(2 + 2 + 2 + length);
+	packed_buffer_append(pb, "bbhh", OPCODE_TEXTSCREEN_OP, OPCODE_TEXTSCREEN_TIMEDTEXT,
+				length, timevalue);
+	packed_buffer_append_raw(pb, text, length);
+	if (id == -1)
+		send_packet_to_all_clients(pb, ROLE_ALL);
+	else
+		send_packet_to_all_clients_on_a_bridge(id, pb, ROLE_ALL);
+}
+
+static void send_menu(int id, uint16_t length, char *text)
+{
+	struct packed_buffer *pb;
+
+	assert(strlen(text) + 1 == length);
+	pb = packed_buffer_allocate(2 + 2 + length);
+	packed_buffer_append(pb, "bbh", OPCODE_TEXTSCREEN_OP, OPCODE_TEXTSCREEN_MENU, length);
+	packed_buffer_append_raw(pb, text, length);
+	if (id == -1)
+		send_packet_to_all_clients(pb, ROLE_ALL);
+	else
+		send_packet_to_all_clients_on_a_bridge(id, pb, ROLE_ALL);
+}
+
+static int l_show_menu(lua_State *l)
+{
+	const double id = luaL_checknumber(l, 1);
+	const char *luatext = luaL_checkstring(l, 2);
+	const char *luacallback = luaL_checkstring(l, 3);
+	if (current_user_menu_callback) {
+		/* FIXME, this races with process_textscreen_op() */
+		free(current_user_menu_callback);
+	}
+	current_user_menu_callback = strdup(luacallback);
+	char *text = NULL;
+	uint32_t oid = (uint32_t) id;
+	int i;
+	struct snis_entity *o;
+	int length;
+
+	if (!luatext)
+		goto error;
+	text = strdup(luatext);
+
+	length = strlen(text) + 1;
+	if (length > 1024) { /* truncate excessively long strings */
+		text[1024] = '\0';
+		length = 1024;
+	}
+
+	if (oid != (uint32_t) -1) { /* User has specified a ship id. */
+		pthread_mutex_lock(&universe_mutex);
+		i = lookup_by_id(oid);
+		if (i < 0) {
+			pthread_mutex_unlock(&universe_mutex);
+			goto error;
+		}
+		o = &go[i];
+		if (o->type != OBJTYPE_SHIP1) {
+			pthread_mutex_unlock(&universe_mutex);
+			goto error;
+		}
+		pthread_mutex_unlock(&universe_mutex);
+		send_menu(o->id, length, text);
+	} else {
+		/* User has specified -1 as ship id == all ships. */
+		send_menu(-1, length, text);
+	}
+	if (text)
+		free(text);
+	lua_pushnumber(l, 0.0);
+	return 1;
+error:
+	if (text)
+		free(text);
+	lua_pushnil(l);
+	return 1;
+}
+
+static int l_show_timed_text(lua_State *l)
+{
+	const double id = luaL_checknumber(l, 1);
+	const double seconds = luaL_checknumber(l, 2);
+	const char *luatext = luaL_checkstring(l, 3);
+	char *text = NULL;
+	uint32_t oid = (uint32_t) id;
+	int i;
+	struct snis_entity *o;
+	int length;
+	uint16_t timevalue = (uint16_t) seconds;
+
+	if (!luatext)
+		goto error;
+	text = strdup(luatext);
+	if (seconds > 120.0)
+		goto error;
+
+	length = strlen(text) + 1;
+	if (length > 1024) { /* truncate excessively long strings */
+		text[1024] = '\0';
+		length = 1024;
+	}
+
+	if (oid != (uint32_t) -1) { /* User has specified a ship id. */
+		pthread_mutex_lock(&universe_mutex);
+		i = lookup_by_id(oid);
+		if (i < 0) {
+			pthread_mutex_unlock(&universe_mutex);
+			goto error;
+		}
+		o = &go[i];
+		if (o->type != OBJTYPE_SHIP1) {
+			pthread_mutex_unlock(&universe_mutex);
+			goto error;
+		}
+		pthread_mutex_unlock(&universe_mutex);
+		send_timed_text(o->id, timevalue, length, text);
+	} else {
+		/* User has specified -1 as ship id == all ships. */
+		send_timed_text(-1, timevalue, length, text);
+	}
+	if (text)
+		free(text);
+	lua_pushnumber(l, 0.0);
+	return 1;
+error:
+	if (text)
+		free(text);
+	lua_pushnil(l);
+	return 1;
+}
+
+static int l_enqueue_lua_script(lua_State *l)
+{
+	const char *lua_scriptname = luaL_checkstring(l, 1);
+	char scriptname[PATH_MAX];
+	char *upper_scriptname = NULL;
+	if (!lua_scriptname)
+		goto error;
+
+	upper_scriptname = strdup(lua_scriptname);
+	if (!upper_scriptname)
+		goto error;
+
+	uppercase(upper_scriptname);
+	snprintf(scriptname, sizeof(scriptname) - 1, "%s/%s", LUASCRIPTDIR, upper_scriptname);
+	pthread_mutex_lock(&universe_mutex);
+	enqueue_lua_command(scriptname); /* queue up for execution by main thread. */
+	pthread_mutex_unlock(&universe_mutex);
+	lua_pushnumber(l, 0.0);
+	if (upper_scriptname)
+		free(upper_scriptname);
+	return 1;
+error:
+	if (upper_scriptname)
+		free(upper_scriptname);
+	lua_pushnil(l);
+	return 1;
+}
+
+static int l_set_asteroid_minerals(lua_State *l)
+{
+	const double lua_oid = luaL_checknumber(l, 1);
+	const double lua_carbon = luaL_checknumber(l, 2);
+	const double lua_silicates = luaL_checknumber(l, 3);
+	const double lua_nickeliron = luaL_checknumber(l, 4);
+	const double lua_preciousmetals = luaL_checknumber(l, 5);
+	uint32_t oid = (uint32_t) lua_oid;
+	int rc;
+
+	pthread_mutex_lock(&universe_mutex);
+	rc = set_asteroid_minerals(oid, (float) lua_carbon, (float) lua_silicates,
+					(float) lua_nickeliron, (float) lua_preciousmetals);
+	pthread_mutex_unlock(&universe_mutex);
+	if (rc) {
+		lua_pushnil(lua_state);
+		return 1;
+	}
+	lua_pushnumber(lua_state, 0.0);
+	return 1;
+}
+
+static int l_get_ship_attribute(lua_State *l)
+{
+	struct key_value_specification *kvs;
+	const double lua_oid = luaL_checknumber(l, 1);
+	const char *attribute;
+	struct snis_entity *o;
+	uint64_t ui64;
+	uint32_t ui32;
+	uint16_t ui16;
+	uint8_t ui8;
+	int64_t i64;
+	int32_t i32;
+	int16_t i16;
+	int8_t i8;
+	double dbl;
+	float flt;
+	char *str;
+	uint32_t oid;
+	int i;
+	void *base_address[1];
+
+	oid = (uint32_t) lua_oid;
+	attribute = lua_tostring(lua_state, 2);
+	pthread_mutex_lock(&universe_mutex);
+	i = lookup_by_id(oid);
+	if (i < 0)
+		goto error;
+	o = &go[i];
+	if (o->type != OBJTYPE_SHIP1 && o->type != OBJTYPE_SHIP2)
+		goto error;
+	base_address[0] = o;
+	kvs = lookup_key_entry(snis_entity_kvs, attribute);
+	if (!kvs)
+		goto error;
+	switch (kvs->type) {
+	case KVS_STRING:
+		str = (char *) o + kvs->address_offset;
+		lua_pushstring(l, str);
+		break;
+	case KVS_UINT64:
+		if (key_value_get_value(kvs, attribute, base_address, &ui64, sizeof(ui64)) != sizeof(ui64))
+			goto error;
+		lua_pushnumber(l, (double) ui64);
+		break;
+	case KVS_UINT32:
+		if (key_value_get_value(kvs, attribute, base_address, &ui32, sizeof(ui32)) != sizeof(ui32))
+			goto error;
+		lua_pushnumber(l, (double) ui32);
+		break;
+	case KVS_UINT16:
+		if (key_value_get_value(kvs, attribute, base_address, &ui16, sizeof(ui16)) != sizeof(ui16))
+			goto error;
+		lua_pushnumber(l, (double) ui16);
+		break;
+	case KVS_UINT8:
+		if (key_value_get_value(kvs, attribute, base_address, &ui8, sizeof(ui16)) != sizeof(ui8))
+			goto error;
+		lua_pushnumber(l, (double) ui8);
+		break;
+	case KVS_INT64:
+		if (key_value_get_value(kvs, attribute, base_address, &i64, sizeof(i64)) != sizeof(i64))
+			goto error;
+		lua_pushnumber(l, (double) i64);
+		break;
+	case KVS_INT32:
+		if (key_value_get_value(kvs, attribute, base_address, &i32, sizeof(i32)) != sizeof(i32))
+			goto error;
+		lua_pushnumber(l, (double) i32);
+		break;
+	case KVS_INT16:
+		if (key_value_get_value(kvs, attribute, base_address, &i16, sizeof(i16)) != sizeof(i16))
+			goto error;
+		lua_pushnumber(l, (double) i16);
+		break;
+	case KVS_INT8:
+		if (key_value_get_value(kvs, attribute, base_address, &i8, sizeof(i8)) != sizeof(i8))
+			goto error;
+		lua_pushnumber(l, (double) i8);
+		break;
+	case KVS_DOUBLE:
+		if (key_value_get_value(kvs, attribute, base_address, &dbl, sizeof(dbl)) != sizeof(dbl))
+			goto error;
+		lua_pushnumber(l, dbl);
+		break;
+	case KVS_FLOAT:
+		if (key_value_get_value(kvs, attribute, base_address, &flt, sizeof(flt)) != sizeof(flt))
+			goto error;
+		lua_pushnumber(l, (double) flt);
+		break;
+	default:
+		goto error;
+	}
+	pthread_mutex_unlock(&universe_mutex);
+	return 1;
+error:
+	pthread_mutex_unlock(&universe_mutex);
+	lua_pushnil(lua_state);
+	return 1;
+}
+
+static int l_get_commodity_name(lua_State *l)
+{
+	const double lua_commodity_index = luaL_checknumber(l, 1);
+	int index = (int) lua_commodity_index;
+
+	if (index < 0 || index >= ncommodities) {
+		lua_pushnil(lua_state);
+		return 1;
+	}
+	lua_pushstring(l, commodity[index].name);
+	return 1;
+}
+
+static int l_get_commodity_units(lua_State *l)
+{
+	const double lua_commodity_index = luaL_checknumber(l, 1);
+	int index = (int) lua_commodity_index;
+
+	if (index < 0 || index >= ncommodities) {
+		lua_pushnil(lua_state);
+		return 1;
+	}
+	lua_pushstring(l, commodity[index].unit);
+	return 1;
+}
+
+static int l_lookup_commodity(lua_State *l)
+{
+	const char *lua_commodity_name = luaL_checkstring(l, 1);
+	int i;
+
+	for (i = 0; i < ncommodities; i++) {
+		if (strcasecmp(lua_commodity_name, commodity[i].name) == 0) {
+			lua_pushnumber(l, (float) i);
+			return 1;
+		}
+	}
+	lua_pushnil(l);
+	return 1;
+}
+
+static int l_set_commodity_contents(lua_State *l)
+{
+	const double lua_oid = luaL_checknumber(l, 1);
+	const double lua_commodity_index = luaL_checknumber(l, 2);
+	const double lua_quantity = luaL_checknumber(l, 3);
+	struct snis_entity *o;
+	uint32_t oid = (uint32_t) lua_oid;
+	int index = (int) lua_commodity_index;
+	int i;
+
+	pthread_mutex_lock(&universe_mutex);
+	i = lookup_by_id(oid);
+	if (i < 0)
+		goto out;
+	if (i >= snis_object_pool_highest_object(pool))
+		goto out;
+	o = &go[i];
+	if (o->type != OBJTYPE_SHIP1 && o->type != OBJTYPE_CARGO_CONTAINER)
+		goto out;
+	if (index < -1 || index >= ncommodities)
+		goto out;
+	if (o->type == OBJTYPE_SHIP1) {
+		const double lua_cargo_bay = luaL_checknumber(l, 4);
+		int cargo_bay = (int) lua_cargo_bay;
+		if (cargo_bay < 0 || cargo_bay >= o->tsd.ship.ncargo_bays)
+			goto out;
+		o->tsd.ship.cargo[cargo_bay].contents.item = index;
+		o->tsd.ship.cargo[cargo_bay].contents.qty = lua_quantity;
+		o->tsd.ship.cargo[cargo_bay].paid = 0.0;
+		o->tsd.ship.cargo[cargo_bay].origin = -1;
+		o->tsd.ship.cargo[cargo_bay].dest = -1;
+	} else if (o->type == OBJTYPE_CARGO_CONTAINER) {
+		o->tsd.cargo_container.contents.item = index;
+		o->tsd.cargo_container.contents.qty = lua_quantity;
+	}
+	pthread_mutex_unlock(&universe_mutex);
+	lua_pushnumber(l, 0.0);
+	return 1;
+out:
+	pthread_mutex_unlock(&universe_mutex);
+	lua_pushnil(l);
+	return 1;
+}
+
+static int l_reset_player_ship(lua_State *l)
+{
+	const double lua_oid = luaL_checknumber(l, 1);
+	struct snis_entity *o;
+	uint32_t oid = (uint32_t) lua_oid;
+	int i;
+
+	pthread_mutex_lock(&universe_mutex);
+	i = lookup_by_id(oid);
+	if (i < 0)
+		goto out;
+	o = &go[i];
+	if (o->type != OBJTYPE_SHIP1)
+		goto out;
+	init_player(o, 1, NULL);
+	o->timestamp = universe_timestamp;
+	pthread_mutex_unlock(&universe_mutex);
+	lua_pushnumber(l, 0.0);
+	return 1;
+out:
+	pthread_mutex_unlock(&universe_mutex);
+	lua_pushnil(l);
+	return 1;
+}
+
 static int process_create_item(struct game_client *c)
 {
 	unsigned char buffer[14];
@@ -11544,7 +12271,7 @@ static int process_create_item(struct game_client *c)
 		i = add_planet(x, y, z, r, 0);
 		break;
 	case OBJTYPE_ASTEROID:
-		i = add_asteroid(x, y, z, 0.0, 0.0, 0.0);
+		i = add_asteroid(x, y, z, 0.0, 0.0, 0.0, 1.0);
 		break;
 	case OBJTYPE_NEBULA:
 		r = (double) snis_randn(NEBULA_RADIUS) +
@@ -12023,15 +12750,15 @@ static int process_request_yaw(struct game_client *c, do_yaw_function yaw_func)
 	return 0;
 }
 
-static int process_demon_yaw(struct game_client *c)
+static int process_demon_rot(struct game_client *c)
 {
 	unsigned char buffer[10];
 	struct snis_entity *o;
 	uint32_t oid;
-	uint8_t yaw;
+	uint8_t subcmd, amount;
 	int i, rc;
 
-	rc = read_and_unpack_buffer(c, buffer, "wb", &oid, &yaw);
+	rc = read_and_unpack_buffer(c, buffer, "bwb", &subcmd, &oid, &amount);
 	if (rc)
 		return rc;
 	if (!(c->role & ROLE_DEMON))
@@ -12042,19 +12769,64 @@ static int process_demon_yaw(struct game_client *c)
 		goto out;
 	o = &go[i];
 
-	switch (yaw) {
-	case YAW_LEFT:
-		do_demon_yaw(o, 1);
+	switch (subcmd) {
+	case OPCODE_DEMON_ROT_YAW: {
+		switch (amount) {
+		case YAW_LEFT:
+			do_demon_yaw(o, 1);
+			break;
+		case YAW_RIGHT:
+			do_demon_yaw(o, -1);
+			break;
+		case YAW_LEFT_FINE:
+			do_demon_yaw(o, 2);
+			break;
+		case YAW_RIGHT_FINE:
+			do_demon_yaw(o, -2);
+			break;
+		default:
+			break;
+		}
 		break;
-	case YAW_RIGHT:
-		do_demon_yaw(o, -1);
+	}
+	case OPCODE_DEMON_ROT_PITCH: {
+		switch (amount) {
+		case PITCH_FORWARD:
+			do_demon_pitch(o, 1);
+			break;
+		case PITCH_BACK:
+			do_demon_pitch(o, -1);
+			break;
+		case PITCH_FORWARD_FINE:
+			do_demon_pitch(o, 2);
+			break;
+		case PITCH_BACK_FINE:
+			do_demon_pitch(o, -2);
+			break;
+		default:
+			break;
+		}
 		break;
-	case YAW_LEFT_FINE:
-		do_demon_yaw(o, 2);
+	}
+	case OPCODE_DEMON_ROT_ROLL: {
+		switch (amount) {
+		case ROLL_LEFT:
+			do_demon_roll(o, 1);
+			break;
+		case ROLL_RIGHT:
+			do_demon_roll(o, -1);
+			break;
+		case ROLL_LEFT_FINE:
+			do_demon_roll(o, 2);
+			break;
+		case ROLL_RIGHT_FINE:
+			do_demon_roll(o, -2);
+			break;
+		default:
+			break;
+		}
 		break;
-	case YAW_RIGHT_FINE:
-		do_demon_yaw(o, -2);
-		break;
+	}
 	default:
 		break;
 	}
@@ -12117,9 +12889,9 @@ static int process_demon_fire_torpedo(struct game_client *c)
 {
 	struct snis_entity *o;
 	unsigned char buffer[10];
-	double vx, vz;
 	uint32_t oid;
 	int i, rc;
+	union vec3 tv = { { 1.0, 0.0, 0.0 } };
 
 	rc = read_and_unpack_buffer(c, buffer, "w", &oid);
 	if (rc)
@@ -12134,9 +12906,12 @@ static int process_demon_fire_torpedo(struct game_client *c)
 	if (o->type != OBJTYPE_SHIP2)
 		goto out;
 
-	vx = TORPEDO_VELOCITY * cos(o->heading);
-	vz = TORPEDO_VELOCITY * -sin(o->heading);
-	add_torpedo(o->x, o->y, o->z, vx, 0.0, vz, o->id); /* vy is wrong here... */
+	quat_rot_vec_self(&tv, &o->orientation);
+	vec3_mul_self(&tv, TORPEDO_VELOCITY);
+	tv.v.x += o->vx;
+	tv.v.y += o->vy;
+	tv.v.z += o->vz;
+	add_torpedo(o->x, o->y, o->z, tv.v.x, tv.v.y, tv.v.z, o->id);
 out:
 	pthread_mutex_unlock(&universe_mutex);
 
@@ -12365,7 +13140,7 @@ static void launch_mining_bot(struct game_client *c, struct snis_entity *ship, u
 		goto miningbotfail;
 	if (ship->tsd.ship.mining_bots <= 0) /* no bots left */
 		goto miningbotfail;
-	if (go[oid].type != OBJTYPE_ASTEROID)
+	if (go[i].type != OBJTYPE_ASTEROID)
 		goto miningbotfail;
 
 	i = add_mining_bot(ship, oid);
@@ -12502,8 +13277,8 @@ static void process_instructions_from_client(struct game_client *c)
 			if (rc)
 				goto protocol_error;
 			break;
-		case OPCODE_DEMON_YAW:
-			rc = process_demon_yaw(c);
+		case OPCODE_DEMON_ROT:
+			rc = process_demon_rot(c);
 			if (rc)
 				goto protocol_error;
 			break;
@@ -12836,6 +13611,11 @@ static void process_instructions_from_client(struct game_client *c)
 			break;
 		case OPCODE_NATURAL_LANGUAGE_REQUEST:
 			rc = process_natural_language_request(c);
+			if (rc)
+				goto protocol_error;
+			break;
+		case OPCODE_TEXTSCREEN_OP:
+			rc = process_textscreen_op(c);
 			if (rc)
 				goto protocol_error;
 			break;
@@ -13360,7 +14140,7 @@ static void send_econ_update_ship_packet(struct game_client *c,
 {
 	int n;
 	int32_t victim_id;
-	uint8_t ai[MAX_AI_STACK_ENTRIES];
+	uint8_t ai[MAX_AI_STACK_ENTRIES] = { 0 };
 	int i;
 	uint8_t opcode = OPCODE_ECON_UPDATE_SHIP;
 
@@ -14450,6 +15230,7 @@ static void move_objects(double absolute_time, int discontinuity)
 	pthread_mutex_unlock(&universe_mutex);
 	fire_lua_timers();
 	fire_lua_callbacks(&callback_schedule);
+	fire_lua_proximity_checks();
 }
 
 static void register_with_game_lobby(char *lobbyhost, int port,
@@ -14523,6 +15304,7 @@ static void setup_lua(void)
 	add_lua_callable_fn(l_add_random_ship, "add_random_ship");
 	add_lua_callable_fn(l_add_ship, "add_ship");
 	add_lua_callable_fn(l_add_asteroid, "add_asteroid");
+	add_lua_callable_fn(l_set_asteroid_speed, "set_asteroid_speed");
 	add_lua_callable_fn(l_add_starbase, "add_starbase");
 	add_lua_callable_fn(l_add_planet, "add_planet");
 	add_lua_callable_fn(l_add_nebula, "add_nebula");
@@ -14546,6 +15328,17 @@ static void setup_lua(void)
 	add_lua_callable_fn(l_add_cargo_container, "add_cargo_container");
 	add_lua_callable_fn(l_set_faction, "set_faction");
 	add_lua_callable_fn(l_text_to_speech, "text_to_speech");
+	add_lua_callable_fn(l_show_timed_text, "show_timed_text");
+	add_lua_callable_fn(l_enqueue_lua_script, "enqueue_lua_script");
+	add_lua_callable_fn(l_register_proximity_callback, "register_proximity_callback");
+	add_lua_callable_fn(l_set_asteroid_minerals, "set_asteroid_minerals");
+	add_lua_callable_fn(l_get_ship_attribute, "get_ship_attribute");
+	add_lua_callable_fn(l_get_commodity_name, "get_commodity_name");
+	add_lua_callable_fn(l_get_commodity_units, "get_commodity_units");
+	add_lua_callable_fn(l_lookup_commodity, "lookup_commodity");
+	add_lua_callable_fn(l_set_commodity_contents, "set_commodity_contents");
+	add_lua_callable_fn(l_reset_player_ship, "reset_player_ship");
+	add_lua_callable_fn(l_show_menu, "show_menu");
 }
 
 static int run_initial_lua_scripts(void)
@@ -14555,11 +15348,14 @@ static int run_initial_lua_scripts(void)
 	char scriptname[PATH_MAX];
 
 	snprintf(scriptname, sizeof(scriptname) - 1,
-			"%s/%s", LUASCRIPTDIR, "initialize.lua");
+			"%s/%s", LUASCRIPTDIR, initial_lua_script);
 	rc = stat(scriptname, &statbuf);
 	if (rc != 0)
 		return rc;
 	rc = luaL_dofile(lua_state, scriptname);
+	if (rc)
+		fprintf(stderr, "Error executing lua script: %s\n",
+			lua_tostring(lua_state, -1));
 	return rc;
 }
 
@@ -14576,10 +15372,9 @@ static void process_lua_commands(void)
 
 		pthread_mutex_unlock(&universe_mutex);
 		rc = luaL_dofile(lua_state, lua_command);
-		if (rc) {
-			/* TODO: something? */
-			printf("lua script %s failed to execute.\n", lua_command);
-		}
+		if (rc)
+			fprintf(stderr, "Error executing lua script: %s\n",
+				lua_tostring(lua_state, -1));
 		pthread_mutex_lock(&universe_mutex);
 	}
 	pthread_mutex_unlock(&universe_mutex);
@@ -14850,6 +15645,8 @@ static void nl_describe_game_object(struct game_client *c, uint32_t id)
 	char extradescription[40];
 	static struct mtwist_state *mt = NULL;
 	int planet;
+	char *planet_type_str;
+	int ss_planet_type;
 
 	pthread_mutex_lock(&universe_mutex);
 	i = lookup_by_id(id);
@@ -14862,7 +15659,9 @@ static void nl_describe_game_object(struct game_client *c, uint32_t id)
 	case OBJTYPE_PLANET:
 		pthread_mutex_unlock(&universe_mutex);
 		mt = mtwist_init(go[i].tsd.planet.description_seed);
-		planet_description(mt, description, 250, 254);
+		ss_planet_type = go[i].tsd.planet.solarsystem_planet_type;
+		planet_type_str = solarsystem_assets->planet_type[ss_planet_type];
+		planet_description(mt, description, 250, 254, planet_type_from_string(planet_type_str));
 		mtwist_free(mt);
 		queue_add_text_to_speech(c, description);
 		return;
@@ -15667,6 +16466,7 @@ static void nl_set_npn(void *context, int argc, char *argv[], int pos[],
 	if (i < 0) {
 		pthread_mutex_unlock(&universe_mutex);
 		queue_add_text_to_speech(c, "Sorry, I am not quite sure where we are.");
+		free(namecopy);
 		return;
 	}
 	ship = &go[i];
@@ -17190,6 +17990,7 @@ static void init_natural_language_system(void)
 
 static struct option long_options[] = {
 	{ "enable-enscript", no_argument, NULL, 'e' },
+	{ "initscript", required_argument, NULL, 'i' },
 	{ "help", no_argument, NULL, 'h' },
 	{ "lobbyhost", required_argument, NULL, 'l' },
 	{ "gameinstance", required_argument, NULL, 'g' },
@@ -17219,7 +18020,7 @@ static void process_options(int argc, char *argv[])
 
 	while (1) {
 		int option_index;
-		c = getopt_long(argc, argv, "eg:hL:l:m:n:s:v", long_options, &option_index);
+		c = getopt_long(argc, argv, "eg:hi:L:l:m:n:s:v", long_options, &option_index);
 		if (c == -1)
 			break;
 		switch (c) {
@@ -17227,6 +18028,9 @@ static void process_options(int argc, char *argv[])
 			lua_enscript_enabled = 1;
 			fprintf(stderr, "WARNING: lua enscript enabled!\n");
 			fprintf(stderr, "THIS PERMITS USERS TO CREATE FILES ON THE SERVER\n");
+			break;
+		case 'i':
+			initial_lua_script = optarg;
 			break;
 		case 'g':
 			lobby_gameinstance = optarg;

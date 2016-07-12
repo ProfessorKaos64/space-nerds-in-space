@@ -51,6 +51,7 @@
 #include <assert.h>
 #include <netinet/tcp.h>
 #include <netinet/in.h>
+#include <getopt.h>
 
 #include "arraysize.h"
 #include "build_bug_on.h"
@@ -200,6 +201,12 @@ int fullscreen = 0;
 int in_the_process_of_quitting = 0;
 int current_quit_selection = 0;
 int final_quit_selection = 0;
+
+static int textscreen_timer = 0;
+static int user_defined_menu_active = 0;
+static char textscreen[1024] = { 0 };
+#define NUM_USER_MENU_BUTTONS 10
+static struct button *user_menu_button[NUM_USER_MENU_BUTTONS];
 
 struct ship_type_entry *ship_type;
 int nshiptypes = 0;
@@ -1566,18 +1573,20 @@ static int update_planet(uint32_t id, uint32_t timestamp, double x, double y, do
 	int i, m;
 	struct entity *e, *atm, *ring;
 	union quat orientation;
+	union quat rotational_velocity;
 
 	i = lookup_object_by_id(id);
 	if (i < 0) {
 		/* Orientation should be consistent across clients because planets don't move */
 		orientation = random_orientation[id % NRANDOM_ORIENTATIONS];
+		quat_init_axis(&rotational_velocity, 0.0, 0.0, 1.0, 0.03 * M_PI / 180.0);
 
 		/* each planet texture has other versions with a variation of the ring materials */
 		m = solarsystem_planet_type;
 		fprintf(stderr, "zzz %s solarsystem_planet_type = %d\n", solarsystem_name, m);
 		if (!hasring) {
 			const int ring_materials = (NPLANET_MATERIALS / 2);
-			m = ring_materials + m * (ring_selector % (ring_materials / 6));
+			m = m + ring_materials + 6 * (ring_selector % (ring_materials / 6));
 		}
 		fprintf(stderr, "zzz m = %d, has_atmosphere = %hhu, has ring = %d\n", m, has_atmosphere, hasring);
 
@@ -1606,6 +1615,7 @@ static int update_planet(uint32_t id, uint32_t timestamp, double x, double y, do
 					&orientation, OBJTYPE_PLANET, 1, e);
 		if (i < 0)
 			return i;
+		go[i].tsd.planet.rotational_velocity = rotational_velocity;
 		if (has_atmosphere) {
 			atm = add_entity(ecx, sphere_mesh, 0.0f, 0.0f, 0.0f, WHITE);
 			go[i].tsd.planet.atmosphere = atm;
@@ -1642,6 +1652,7 @@ static int update_planet(uint32_t id, uint32_t timestamp, double x, double y, do
 	go[i].tsd.planet.has_atmosphere = has_atmosphere;
 	go[i].tsd.planet.solarsystem_planet_type = solarsystem_planet_type;
 	go[i].tsd.planet.ring_selector = ring_selector;
+	go[i].tsd.planet.ring = hasring;
 	return 0;
 }
 
@@ -1863,6 +1874,11 @@ static inline void spin_cargo_container(double timestamp, struct snis_entity *o)
 static inline void spin_derelict(double timestamp, struct snis_entity *o)
 {
 	arbitrary_spin(timestamp, o, &o->tsd.derelict.rotational_velocity);
+}
+
+static inline void spin_planet(double timestamp, struct snis_entity *o)
+{
+	arbitrary_spin(timestamp, o, &o->tsd.planet.rotational_velocity);
 }
 
 typedef void(*interpolate_update_func)(double timestamp, struct snis_entity *o, int visible,
@@ -2152,6 +2168,7 @@ static void move_objects(void)
 			break;
 		case OBJTYPE_PLANET:
 			move_object(timestamp, o, &interpolate_orientated_object);
+			spin_planet(timestamp, o);
 			break;
 		default:
 			break;
@@ -2431,9 +2448,9 @@ static void navigation_dirkey(int h, int v, int r)
 	}
 }
 
-static void request_demon_yaw_packet(uint32_t oid, uint8_t yaw)
+static void request_demon_rot_packet(uint32_t oid, uint8_t kind, uint8_t amount)
 {
-	queue_to_server(packed_buffer_new("bwb", OPCODE_DEMON_YAW, oid, yaw));
+	queue_to_server(packed_buffer_new("bbwb", OPCODE_DEMON_ROT, kind, oid, amount));
 }
 
 static void request_demon_thrust_packet(uint32_t oid, uint8_t thrust)
@@ -2495,6 +2512,7 @@ static struct demon_ui {
 	union quat desired_camera_orientation;
 	float exaggerated_scale;
 	float desired_exaggerated_scale;
+	int exaggerated_scale_active;
 } demon_ui;
 
 static void home_demon_camera(void)
@@ -2512,9 +2530,9 @@ static void home_demon_camera(void)
 	quat_from_u2v(&demon_ui.desired_camera_orientation, &right, &camera_lookat, &up);
 }
 
-static void demon_dirkey(int h, int v)
+static void demon_dirkey(int h, int v, int r, int t)
 {
-	uint8_t yaw, thrust;
+	uint8_t yaw, pitch, roll, thrust;
 	static int last_time = 0;
 	uint32_t oid;
 	int fine;
@@ -2528,15 +2546,23 @@ static void demon_dirkey(int h, int v)
 	fine = 2 * (timer - last_time > 5);
 	last_time = timer;
 
-	if (!h && !v)
+	if (!h && !v && !r && !t)
 		return;
 
 	if (h) {
 		yaw = h < 0 ? YAW_LEFT + fine : YAW_RIGHT + fine;
-		request_demon_yaw_packet(oid, yaw);
+		request_demon_rot_packet(oid, OPCODE_DEMON_ROT_YAW, yaw);
 	}
 	if (v) {
-		thrust = v < 0 ? THRUST_BACKWARDS : THRUST_FORWARDS;
+		pitch = v < 0 ? PITCH_BACK + fine : PITCH_FORWARD + fine;
+		request_demon_rot_packet(oid, OPCODE_DEMON_ROT_PITCH, pitch);
+	}
+	if (r) {
+		roll = r < 0 ? ROLL_LEFT + fine : ROLL_RIGHT + fine;
+		request_demon_rot_packet(oid, OPCODE_DEMON_ROT_ROLL, roll);
+	}
+	if (t) {
+		thrust = THRUST_FORWARDS;
 		request_demon_thrust_packet(oid, thrust);
 	}
 }
@@ -2723,7 +2749,7 @@ static void do_view_mode_change()
 
 static void comms_dirkey(int h, int v);
 
-static void do_dirkey(int h, int v, int r)
+static void do_dirkey(int h, int v, int r, int t)
 {
 	v = v * vertical_controls_inverted;
 
@@ -2750,7 +2776,7 @@ static void do_dirkey(int h, int v, int r)
 			damcon_dirkey(h, v);
 			break;
 		case DISPLAYMODE_DEMON:
-			demon_dirkey(h, v);
+			demon_dirkey(h, v, r, t);
 			break;
 		case DISPLAYMODE_COMMS:
 			comms_dirkey(h, v);
@@ -3045,7 +3071,7 @@ static void do_pagedown(void);
 
 static void deal_with_keyboard()
 {
-	int h, v, z, r;
+	int h, v, z, r, t;
 	int sbh, sbv, sbr; /* sciball keys */
 
 	static const int keyboard_throttle = (int) ((FRAME_RATE_HZ / 15.0) + 0.5);
@@ -3056,6 +3082,7 @@ static void deal_with_keyboard()
 	v = 0;
 	r = 0;
 	z = 0;
+	t = 0;
 	sbh = 0;
 	sbv = 0;
 	sbr = 0;
@@ -3072,8 +3099,10 @@ static void deal_with_keyboard()
 		r = 1;
 	if (kbstate.pressed[keyrollright])
 		r = -1;
+	if (kbstate.pressed[keythrust])
+		t = 1;
 	if (h || v || r)
-		do_dirkey(h, v, r);
+		do_dirkey(h, v, r, t);
 	if (kbstate.pressed[key_page_up])
 		do_pageup();
 	if (kbstate.pressed[key_page_down])
@@ -3393,6 +3422,20 @@ static int lobby_lookup_server_by_location(char *location)
 	return -1;
 }
 
+static void ui_hide_widget(void *widget);
+static void ui_unhide_widget(void *widget);
+static void ui_set_widget_displaymode(void *widget, int displaymode)
+{
+	struct ui_element *uie;
+
+	uie = widget_to_ui_element(uiobjs, widget);
+	if (!uie)
+		return;
+	ui_element_set_displaymode(uie, displaymode);
+}
+
+static void show_common_screen(GtkWidget *w, char *title);
+
 static void show_lobbyscreen(GtkWidget *w)
 {
 	char msg[100];
@@ -3400,6 +3443,7 @@ static void show_lobbyscreen(GtkWidget *w)
 #define STARTLINE 100
 #define LINEHEIGHT 30
 
+	show_common_screen(w, "");
 	sng_set_foreground(UI_COLOR(lobby_connecting));
 	if (lobby_socket == -1 && switched_server2 == -1) {
 		sng_abs_xy_draw_string("Space Nerds", BIG_FONT, txx(80), txy(200));
@@ -3443,10 +3487,31 @@ static void show_lobbyscreen(GtkWidget *w)
 		}
 
 		lobby_selected_server = -1;
+#if 0
 		sprintf(msg, "Connected to lobby on socket %d\n", lobby_socket);
 		sng_abs_xy_draw_string(msg, TINY_FONT, txx(30), LINEHEIGHT);
 		sprintf(msg, "Total game servers: %d\n", ngameservers);
 		sng_abs_xy_draw_string(msg, TINY_FONT, txx(30), LINEHEIGHT + txy(20));
+#endif
+		sng_center_xy_draw_string("SPACE NERDS IN SPACE LOBBY", TINY_FONT, txx(400), LINEHEIGHT);
+		sng_center_xy_draw_string("SELECT A SERVER", NANO_FONT, txx(400), LINEHEIGHT * 2);
+
+		/* Draw column headings */
+		i = -1;
+		sng_set_foreground(DARKGREEN);
+		sprintf(msg, "IP ADDRESS/PORT");
+		sng_abs_xy_draw_string(msg, NANO_FONT, txx(30), txy(100) + i * LINEHEIGHT);
+		sprintf(msg, "GAME INSTANCE");
+		sng_abs_xy_draw_string(msg, NANO_FONT, txx(150), txy(100) + i * LINEHEIGHT);
+		sprintf(msg, "SERVER_NICKNAME");
+		sng_abs_xy_draw_string(msg, NANO_FONT, txx(300), txy(100) + i * LINEHEIGHT);
+		sprintf(msg, "LOCATION");
+		sng_abs_xy_draw_string(msg, NANO_FONT, txx(450), txy(100) + i * LINEHEIGHT);
+		sprintf(msg, "CONNECTIONS");
+		sng_abs_xy_draw_string(msg, NANO_FONT, txx(550), txy(100) + i * LINEHEIGHT);
+
+		/* Draw server info */
+		sng_set_foreground(UI_COLOR(lobby_connecting));
 		for (i = 0; i < ngameservers; i++) {
 			unsigned char *x = (unsigned char *) 
 				&lobby_game_server[i].ipaddr;
@@ -3456,7 +3521,10 @@ static void show_lobbyscreen(GtkWidget *w)
 				lobby_selected_server = i;
 				sng_set_foreground(UI_COLOR(lobby_selected_server));
 				snis_draw_rectangle(0, txx(25), txy(100) + (-0.5 + i) * LINEHEIGHT,
-					txx(725), LINEHEIGHT);
+					txx(600), LINEHEIGHT);
+				snis_button_set_position(lobby_ui.lobby_connect_to_server_button,
+					txx(650), (int) (txy(100) + (-0.5 + i) * LINEHEIGHT));
+				ui_unhide_widget(lobby_ui.lobby_connect_to_server_button);
 			} else
 				sng_set_foreground(UI_COLOR(lobby_connecting));
 
@@ -3465,20 +3533,20 @@ static void show_lobbyscreen(GtkWidget *w)
 			}
 			 
 			sprintf(msg, "%hu.%hu.%hu.%hu/%hu", x[0], x[1], x[2], x[3], lobby_game_server[i].port);
-			sng_abs_xy_draw_string(msg, TINY_FONT, txx(30), txy(100) + i * LINEHEIGHT);
+			sng_abs_xy_draw_string(msg, NANO_FONT, txx(30), txy(100) + i * LINEHEIGHT);
 			sprintf(msg, "%s", lobby_game_server[i].game_instance);
-			sng_abs_xy_draw_string(msg, TINY_FONT, txx(350), txy(100) + i * LINEHEIGHT);
+			sng_abs_xy_draw_string(msg, NANO_FONT, txx(150), txy(100) + i * LINEHEIGHT);
 			sprintf(msg, "%s", lobby_game_server[i].server_nickname);
-			sng_abs_xy_draw_string(msg, TINY_FONT, txx(450), txy(100) + i * LINEHEIGHT);
+			sng_abs_xy_draw_string(msg, NANO_FONT, txx(300), txy(100) + i * LINEHEIGHT);
 			sprintf(msg, "%s", lobby_game_server[i].location);
-			sng_abs_xy_draw_string(msg, TINY_FONT, txx(650), txy(100) + i * LINEHEIGHT);
+			sng_abs_xy_draw_string(msg, NANO_FONT, txx(450), txy(100) + i * LINEHEIGHT);
 			sprintf(msg, "%d", lobby_game_server[i].nconnections);
-			sng_abs_xy_draw_string(msg, TINY_FONT, txx(700), txy(100) + i * LINEHEIGHT);
+			sng_abs_xy_draw_string(msg, NANO_FONT, txx(550), txy(100) + i * LINEHEIGHT);
 		}
 		if (lobby_selected_server != -1)
 			snis_button_set_color(lobby_ui.lobby_connect_to_server_button, UI_COLOR(lobby_connect_ok));
 		else
-			snis_button_set_color(lobby_ui.lobby_connect_to_server_button, UI_COLOR(lobby_connect_not_ok));
+			ui_hide_widget(lobby_ui.lobby_connect_to_server_button);
 	}
 }
 
@@ -4262,6 +4330,9 @@ static void delete_object(uint32_t id)
 	if (i < 0)
 		return;
 	go[i].alive = 0;
+	/* if demon screen was captain of this thing, it isn't now. */
+	if (i == demon_ui.captain_of)
+		demon_ui.captain_of = -1;
 	remove_entity(ecx, go[i].entity);
 	go[i].entity = NULL;
 	free_spacemonster_data(&go[i]);
@@ -4400,9 +4471,6 @@ static struct science_ui {
 	struct button *align_to_ship_button;
 	struct button *launch_mining_bot_button;
 } sci_ui;
-
-static void ui_hide_widget(void *widget);
-static void ui_unhide_widget(void *widget);
 
 static int process_sci_details(void)
 {
@@ -4574,6 +4642,55 @@ static int process_comm_transmission(void)
 	return 0;
 }
 
+static int process_textscreen_op(void)
+{
+	unsigned char buffer[sizeof(textscreen) + 20];
+	uint8_t subcode;
+	uint16_t length, timevalue;
+	int rc;
+
+	rc = read_and_unpack_buffer(buffer, "b", &subcode);
+	if (rc != 0)
+		return -1;
+	switch (subcode) {
+	case OPCODE_TEXTSCREEN_CLEAR:
+		textscreen_timer = 0;
+		memset(textscreen, 0, sizeof(textscreen));
+		break;
+	case OPCODE_TEXTSCREEN_TIMEDTEXT:
+		rc = read_and_unpack_buffer(buffer, "hh", &length, &timevalue);
+		if (rc != 0)
+			return rc;
+		if (length > 1023)
+			return -1;
+		if (timevalue > 120)
+			return -1;
+		memset(buffer, 0, sizeof(buffer));
+		rc = snis_readsocket(gameserver_sock, buffer, length);
+		if (rc != 0)
+			return rc;
+		memcpy(textscreen, buffer, sizeof(textscreen));
+		textscreen_timer = timevalue * 30;
+		break;
+	case OPCODE_TEXTSCREEN_MENU:
+		rc = read_and_unpack_buffer(buffer, "h", &length);
+		if (rc != 0)
+			return rc;
+		if (length > 1023)
+			return -1;
+		memset(buffer, 0, sizeof(buffer));
+		rc = snis_readsocket(gameserver_sock, buffer, length);
+		if (rc != 0)
+			return rc;
+		memcpy(textscreen, buffer, sizeof(textscreen));
+		user_defined_menu_active = 1;
+		break;
+	default:
+		return -1;
+	}
+	return 0;
+}
+
 static void text_to_speech(char *text)
 {
 	char command[PATH_MAX];
@@ -4604,7 +4721,11 @@ static void text_to_speech(char *text)
 	}
 	remove_single_quotes(text);
 	sprintf(command, "%s/text_to_speech.sh '%s'", bindir, text);
-	system(command);
+	rc = system(command);
+	if (rc != 0 && errno != ECHILD)  { /* we have ignored SIGCHLD, so we get ECHILD here */
+		fprintf(stderr, "Shell command '%s' returned %d, errno = %d (%s)\n",
+			command, rc, errno, strerror(errno));
+	}
 }
 
 static int process_natural_language_request(void)
@@ -5237,6 +5358,11 @@ static void *gameserver_reader(__attribute__((unused)) void *arg)
 			connected_to_gameserver = 0;
 			// pthread_mutex_unlock(&to_server_queue_event_mutex);
 			return NULL;
+		case OPCODE_TEXTSCREEN_OP:
+			rc = process_textscreen_op();
+			if (rc)
+				goto protocol_error;
+			break;
 		default:
 			goto protocol_error;
 		}
@@ -5680,6 +5806,128 @@ static void draw_credits_screen(int lines, char *crawl[])
 	}
 }
 
+static void textscreen_dismiss_button_pressed(void *button_ptr_ptr)
+{
+	struct button **button = button_ptr_ptr;
+	textscreen_timer = 0;
+	if (*button)
+		ui_hide_widget(*button);
+}
+
+static void textscreen_menu_button_pressed(void *button_ptr_ptr)
+{
+	struct button **button = button_ptr_ptr;
+	int i, selection;
+	uint8_t byte_selection;
+
+	if (*button) {
+		ui_hide_widget(*button);
+		selection = button - &user_menu_button[0];
+		byte_selection = (uint8_t) selection;
+		for (i = 0; i < NUM_USER_MENU_BUTTONS; i++)
+			ui_hide_widget(user_menu_button[i]);
+		user_defined_menu_active = 0;
+		if (selection >= 0 && selection < NUM_USER_MENU_BUTTONS)
+			queue_to_server(packed_buffer_new("bbb", OPCODE_TEXTSCREEN_OP,
+					OPCODE_TEXTSCREEN_MENU_CHOICE, byte_selection));
+	}
+}
+
+static void ui_add_button(struct button *b, int active_displaymode);
+static void show_textscreen(GtkWidget *w)
+{
+	int i;
+	static struct button *dismiss_button = NULL;
+	int menucount = 0;
+
+	if (displaymode != DISPLAYMODE_MAINSCREEN)
+		return;
+
+	if (!dismiss_button) {
+		dismiss_button = snis_button_init(txx(650), txy(520), -1, -1,
+			"DISMISS", RED, NANO_FONT, textscreen_dismiss_button_pressed, &dismiss_button);
+		ui_add_button(dismiss_button, DISPLAYMODE_INTROSCREEN); /* so it doesn't show up anywhere */
+		for (i = 0; i < NUM_USER_MENU_BUTTONS; i++) {
+			user_menu_button[i] = snis_button_init(txx(60), txy(135) + i * txy(20), txx(650), -1,
+				"M", WHITE, NANO_FONT, textscreen_menu_button_pressed, &user_menu_button[i]);
+			ui_add_button(user_menu_button[i], DISPLAYMODE_INTROSCREEN);
+		}
+	}
+	if (user_defined_menu_active)
+		ui_hide_widget(dismiss_button);
+	else
+		ui_unhide_widget(dismiss_button);
+	/* make it show on the current screen, whatever it is */
+	ui_set_widget_displaymode(dismiss_button, displaymode);
+
+	if (user_defined_menu_active) {
+		menucount = strchrcount(textscreen, '\n') - 1;
+		if (menucount > NUM_USER_MENU_BUTTONS)
+			menucount = NUM_USER_MENU_BUTTONS;
+		for (i = 0; i < NUM_USER_MENU_BUTTONS; i++) {
+			if (i < menucount)
+				ui_unhide_widget(user_menu_button[i]);
+			else
+				ui_hide_widget(user_menu_button[i]);
+			ui_set_widget_displaymode(user_menu_button[i], displaymode);
+		}
+	}
+
+	char tmp_textscreen[sizeof(textscreen)];
+
+	switch (displaymode) {
+	case DISPLAYMODE_MAINSCREEN:
+	case DISPLAYMODE_NAVIGATION:
+	case DISPLAYMODE_WEAPONS:
+	case DISPLAYMODE_ENGINEERING:
+	case DISPLAYMODE_SCIENCE:
+	case DISPLAYMODE_COMMS:
+	case DISPLAYMODE_DEMON:
+	case DISPLAYMODE_DAMCON:
+		break;
+	default:
+		return;
+	}
+	if (textscreen_timer <= 0 && !user_defined_menu_active)
+		return;
+	strcpy(tmp_textscreen, textscreen);
+	if (textscreen_timer > 0)
+		textscreen_timer--;
+	if (textscreen_timer == 0 && !user_defined_menu_active)
+		ui_hide_widget(dismiss_button);
+	char *line;
+	int y = 100;
+
+	sng_set_foreground(BLACK);
+	snis_draw_rectangle(1, txx(50), txy(50),
+			SCREEN_WIDTH - txx(100), SCREEN_HEIGHT - txy(100));
+	sng_set_foreground(RED);
+	snis_draw_rectangle(FALSE, txx(50), txy(50),
+			SCREEN_WIDTH - txx(100), SCREEN_HEIGHT - txy(100));
+	sng_set_foreground(WHITE);
+
+	line = strtok(tmp_textscreen, "\n");
+	if (!line) {
+		textscreen_timer = 0;
+		return;
+	}
+	sng_center_xy_draw_string(line, BIG_FONT, SCREEN_WIDTH / 2, txy(y)); y += txy(35);
+
+	i = 0;
+	while ((line = strtok(NULL, "\n"))) {
+		if (!user_defined_menu_active) {
+			sng_abs_xy_draw_string(line, SMALL_FONT, txx(60), txy(y));
+			y += txy(20);
+		} else {
+			if (i < menucount) {
+				ui_unhide_widget(user_menu_button[i]);
+				snis_button_set_label(user_menu_button[i], line);
+			}
+			i++;
+		}
+	}
+}
+
 static void show_common_screen(GtkWidget *w, char *title)
 {
 	int title_color;
@@ -5734,6 +5982,8 @@ static void show_common_screen(GtkWidget *w, char *title)
 			done_with_lobby = 0;
 		}
 	}
+	if (textscreen_timer > 0 || user_defined_menu_active)
+		show_textscreen(w);
 }
 
 #define ANGLE_OF_VIEW (45)
@@ -5855,6 +6105,8 @@ static void add_ship_thrust_entities(struct entity *thrust_entity[],
 
 	if (!ap)
 		return;
+
+	assert((thrust_entity && nthrust_ports) || (!thrust_entity && !nthrust_ports));
 
 	/* 180 is about max current with preset and 5x is about right for max size */
 	float thrust_size = clampf(impulse / 36.0, 0.1, 5.0);
@@ -10157,21 +10409,21 @@ static void draw_science_details(GtkWidget *w, GdkGC *gc)
 		static char planet_desc[500];
 		char tmpbuf[60];
 		int i, len, j;
+		char *planet_type_str;
 
 		struct planet_data *p = &curr_science_guy->tsd.planet;
 
 		if (p->description_seed != last) {
 			mt = mtwist_init(p->description_seed);
-			planet_description(mt, planet_desc, 500, 40);
+			planet_type_str = solarsystem_assets->planet_type[p->solarsystem_planet_type];
+			planet_description(mt, planet_desc, 500, 40, planet_type_from_string(planet_type_str));
 			last = p->description_seed;
 			mtwist_free(mt);
 			for (i = 0; planet_desc[i] != '\0'; i++)
 				planet_desc[i] = toupper(planet_desc[i]);
 		}
-		sprintf(buf, "TYPE: %s (%s, %s)",
-			solarsystem_assets->planet_type[p->solarsystem_planet_type],
-			solarsystem_assets->planet_texture[p->solarsystem_planet_type],
-			solarsystem_assets->planet_normalmap[p->solarsystem_planet_type]);
+		sprintf(buf, "TYPE: %s%s", p->ring ? "RINGED " : "",
+				solarsystem_assets->planet_type[p->solarsystem_planet_type]);
 		uppercase(buf);
 		sng_abs_xy_draw_string(buf, TINY_FONT, 10, y);
 		y += yinc;
@@ -10444,6 +10696,8 @@ static int demon_id_selected(uint32_t id)
 
 static void demon_select(uint32_t id)
 {
+	int old_captain = -1;
+
 	if (demon_ui.nselected >= MAX_DEMON_SELECTABLE)
 		return;
 	demon_ui.selected_id[demon_ui.nselected] = id;
@@ -10454,13 +10708,22 @@ static void demon_select(uint32_t id)
 		if (demon_ui.captain_of != -1) {
 			queue_to_server(packed_buffer_new("bw", OPCODE_DEMON_DISPOSSESS,
 				go[demon_ui.captain_of].id));
+				old_captain = demon_ui.captain_of;
+				demon_ui.captain_of = -1;
 				demon_ui.captain_of = -1;
 		}
 		if (index >= 0 && (go[index].type == OBJTYPE_SHIP2 ||
 			go[index].type == OBJTYPE_STARBASE)) {
-			demon_ui.captain_of = lookup_object_by_id(id);
-			queue_to_server(packed_buffer_new("bw", OPCODE_DEMON_POSSESS,
-				go[demon_ui.captain_of].id));
+			int new_captain;
+
+			new_captain = lookup_object_by_id(id);
+			if (new_captain != old_captain) {
+				demon_ui.captain_of = lookup_object_by_id(id);
+				demon_ui.exaggerated_scale_active = 0;
+				demon_ui.desired_exaggerated_scale = 0.0;
+				queue_to_server(packed_buffer_new("bw", OPCODE_DEMON_POSSESS,
+					go[demon_ui.captain_of].id));
+			}
 		}
 	}
 }
@@ -10470,10 +10733,15 @@ static void demon_deselect(uint32_t id)
 	int i;
 	for (i = 0; i < demon_ui.nselected; i++) {
 		if (demon_ui.selected_id[i] == id) {
-			if (demon_ui.captain_of == id && id != -1) {
-				queue_to_server(packed_buffer_new("bw", OPCODE_DEMON_DISPOSSESS,
-					go[demon_ui.captain_of].id));
-				demon_ui.captain_of = -1;
+			int index;
+
+			if (demon_ui.captain_of != -1) {
+				index = lookup_object_by_id(id);
+				if (demon_ui.captain_of == index) {
+					queue_to_server(packed_buffer_new("bw", OPCODE_DEMON_DISPOSSESS,
+						go[demon_ui.captain_of].id));
+					demon_ui.captain_of = -1;
+				}
 			}
 			if (i == demon_ui.nselected - 1) {
 				demon_ui.nselected--;
@@ -10677,12 +10945,14 @@ static void demon_button2_release(int button, gdouble x, gdouble y)
 	
 	pthread_mutex_lock(&universe_mutex);
 	for (i = 0; i < demon_ui.nselected; i++) {
-		queue_to_server(packed_buffer_new("bwSSS",
+		int index = lookup_object_by_id(demon_ui.selected_id[i]);
+		queue_to_server(packed_buffer_new("bwSSSQ",
 				OPCODE_DEMON_MOVE_OBJECT,
 				demon_ui.selected_id[i],
 				dx, (int32_t) UNIVERSE_DIM,
 				dy, (int32_t) UNIVERSE_DIM,
-				dz, (int32_t) UNIVERSE_DIM));
+				dz, (int32_t) UNIVERSE_DIM,
+				&go[index].orientation));
 	}
 	pthread_mutex_unlock(&universe_mutex);
 }
@@ -11286,9 +11556,8 @@ static void demon_button_create_item_3d(int button_mode)
 
 static void demon_modebutton_pressed(int whichmode)
 {
-	if (demon_ui.use_3d) {
-		if (whichmode != DEMON_BUTTON_CAPTAINMODE)
-			demon_button_create_item_3d(whichmode);
+	if (demon_ui.use_3d && whichmode != DEMON_BUTTON_CAPTAINMODE) {
+		demon_button_create_item_3d(whichmode);
 	} else {
 		if (demon_ui.buttonmode == whichmode)
 			demon_ui.buttonmode = DEMON_BUTTON_NOMODE;
@@ -11404,7 +11673,7 @@ static void demon_move_button_pressed(void *x)
 
 	avgx = 0.0;
 	avgy = 0.0;
-	avgy = 0.0;
+	avgz = 0.0;
 
 	count = 0;
 
@@ -11431,12 +11700,15 @@ static void demon_move_button_pressed(void *x)
 	dy = demon_ui.camera_pos.v.y - avgy;
 	dz = demon_ui.camera_pos.v.z - avgz;
 	for (i = 0; i < demon_ui.nselected; i++) {
-		queue_to_server(packed_buffer_new("bwSSS",
-				OPCODE_DEMON_MOVE_OBJECT,
-				demon_ui.selected_id[i],
-				dx, (int32_t) UNIVERSE_DIM,
-				dy, (int32_t) UNIVERSE_DIM,
-				dz, (int32_t) UNIVERSE_DIM));
+		int index = lookup_object_by_id(demon_ui.selected_id[i]);
+		if (index >= 0)
+			queue_to_server(packed_buffer_new("bwSSSQ",
+					OPCODE_DEMON_MOVE_OBJECT,
+					demon_ui.selected_id[i],
+					dx, (int32_t) UNIVERSE_DIM,
+					dy, (int32_t) UNIVERSE_DIM,
+					dz, (int32_t) UNIVERSE_DIM,
+					&go[index].orientation));
 	}
 }
 
@@ -11521,6 +11793,7 @@ static void init_demon_ui()
 	demon_ui.demon_scale_button = snis_button_init(x, y + dy * n++, txx(70), txy(20),
 			"EXAG SCALE", UI_COLOR(demon_deselected_button),
 			NANO_FONT, demon_scale_button_pressed, NULL);
+	snis_button_checkbox(demon_ui.demon_scale_button, &demon_ui.exaggerated_scale_active);
 	ui_add_button(demon_ui.demon_exec_button, DISPLAYMODE_DEMON);
 	ui_add_button(demon_ui.demon_home_button, DISPLAYMODE_DEMON);
 	ui_add_button(demon_ui.demon_ship_button, DISPLAYMODE_DEMON);
@@ -11545,6 +11818,7 @@ static void init_demon_ui()
 	demon_ui.camera_pos = demon_ui.desired_camera_pos;
 	demon_ui.exaggerated_scale = 1.0;
 	demon_ui.desired_exaggerated_scale = 1.0;
+	demon_ui.exaggerated_scale_active = 1.0;
 }
 
 static void calculate_new_2d_zoom(int direction, gdouble x, gdouble y, double zoom_amount,
@@ -11729,7 +12003,6 @@ static void show_demon_2d(GtkWidget *w)
 	}
 	show_demon_groups(w);
 	demon_cmd_help(w);
-	show_common_screen(w, "DEMON");
 }
 
 static void show_demon_3d(GtkWidget *w)
@@ -11740,10 +12013,23 @@ static void show_demon_3d(GtkWidget *w)
 	float angle_of_view = 60.0 * M_PI / 180.0;
 	union vec3 camera_pos_delta;
 	int color;
+	float camera_movement_rate = 0.05;
 
 	if (!axes) {
 		axes = mesh_fabricate_axes();
 		mesh_scale(axes, 0.002 * XKNOWN_DIM);
+	}
+
+	/* If in captain mode, then set desired camera position/orientation accordingly */
+	if (demon_ui.captain_of >= 0) {
+		struct snis_entity *o = &go[demon_ui.captain_of];
+		union vec3 rel_cam_pos = { { -50.0, 10.0, 0.0 } };
+		union vec3 ship_pos = { { o->x, o->y, o->z } };
+
+		demon_ui.desired_camera_orientation = o->orientation;
+		quat_rot_vec_self(&rel_cam_pos, &o->orientation);
+		vec3_add(&demon_ui.desired_camera_pos, &ship_pos, &rel_cam_pos);
+		camera_movement_rate = 0.1;
 	}
 
 	if (go[my_ship_oid].alive > 0)
@@ -11753,12 +12039,12 @@ static void show_demon_3d(GtkWidget *w)
 
 	/* Move camera towards desired position */
 	vec3_sub(&camera_pos_delta, &demon_ui.desired_camera_pos, &demon_ui.camera_pos);
-	vec3_mul_self(&camera_pos_delta, 0.05);
+	vec3_mul_self(&camera_pos_delta, camera_movement_rate);
 	vec3_add_self(&demon_ui.camera_pos, &camera_pos_delta);
 
 	/* Move camera towards desired orientation */
 	quat_slerp(&demon_ui.camera_orientation,
-			&demon_ui.camera_orientation, &demon_ui.desired_camera_orientation, 0.05);
+			&demon_ui.camera_orientation, &demon_ui.desired_camera_orientation, camera_movement_rate);
 
 	/* Move exaggerate scale factor towards desired value */
 	if (demon_ui.desired_exaggerated_scale != demon_ui.exaggerated_scale)
@@ -11918,8 +12204,8 @@ static void show_demon_3d(GtkWidget *w)
 				if (m) {
 					union vec3 right = { { 1.0, 0.0, 0.0, }, };
 					union vec3 up = { { 0.0, 0.0, 1.0 } };
-					float factor = (demon_ui.exaggerated_scale * XKNOWN_DIM / 100.0) +
-						(1.0 - demon_ui.exaggerated_scale) * XKNOWN_DIM / 2000.0;
+					float factor = (-demon_ui.exaggerated_scale * XKNOWN_DIM / 100.0) +
+						-(1.0 - demon_ui.exaggerated_scale) * XKNOWN_DIM / 2000.0;
 
 					vec3_sub(&dpos, &epos, &demon_ui.camera_pos);
 					vec3_normalize(&backoff, &dpos);
@@ -11929,6 +12215,20 @@ static void show_demon_3d(GtkWidget *w)
 					vec3_normalize_self(&dpos);
 					quat_rot_vec_self(&up, &demon_ui.camera_orientation);
 					quat_from_u2v(&demon_ui.desired_camera_orientation, &right, &dpos, &up);
+					if (demon_ui.captain_of != -1) {
+						double dx, dy, dz;
+
+						dx = demon_ui.desired_camera_pos.v.x - go[demon_ui.captain_of].x;
+						dy = demon_ui.desired_camera_pos.v.y - go[demon_ui.captain_of].y;
+						dz = demon_ui.desired_camera_pos.v.z - go[demon_ui.captain_of].z;
+						queue_to_server(packed_buffer_new("bwSSSQ",
+								OPCODE_DEMON_MOVE_OBJECT,
+								go[demon_ui.captain_of].id,
+								dx, (int32_t) UNIVERSE_DIM,
+								dy, (int32_t) UNIVERSE_DIM,
+								dz, (int32_t) UNIVERSE_DIM,
+								&demon_ui.desired_camera_orientation));
+					}
 					found = 1;
 					break;
 				}
@@ -11953,29 +12253,39 @@ static void show_demon_3d(GtkWidget *w)
 
 	/* Check if the user is trying to select something */
 	if (demon_ui.button2_released) {
-		struct snis_entity *o;
+		struct snis_entity *o = NULL;
+		struct snis_entity *closest = NULL;
+		float distance, closest_distance = 1000000;
 
 		demon_ui.button2_released = 0;
 		for (i = 0; i <= get_entity_count(instrumentecx); i++) {
-			const double threshold = real_screen_width * 0.005;
-			float sx, sy;
+			const double threshold = real_screen_width * 0.02;
+			float sx, sy, dx, dy;
 			struct entity *e;
 
 			e = get_entity(instrumentecx, i);
 			if (!entity_onscreen(e))
 				continue;
 			entity_get_screen_coords(e, &sx, &sy);
-			if (fabsf(sx - demon_ui.release_mousex) < threshold &&
-			    fabsf(sy - demon_ui.release_mousey) < threshold) {
-				o = entity_get_user_data(e);
-				if (!o) /* e.g. axes have no associated object */
-					continue;
-				if (demon_id_selected(o->id))
-					demon_deselect(o->id);
-				else
-					demon_select(o->id);
-				break;
+			dx = sx - demon_ui.release_mousex;
+			dy = sy - demon_ui.release_mousey;
+			if (fabsf(dx) < threshold &&
+			    fabsf(dy) < threshold) {
+				distance = sqrtf(dx * dx + dy * dy);
+				if (!closest || distance < closest_distance) {
+					o = entity_get_user_data(e);
+					if (!o) /* e.g. axes have no associated object */
+						continue;
+					closest_distance = distance;
+					closest = o;
+				}
 			}
+		}
+		if (closest) {
+			if (demon_id_selected(closest->id))
+				demon_deselect(closest->id);
+			else
+				demon_select(closest->id);
 		}
 	}
 	pthread_mutex_unlock(&universe_mutex);
@@ -12004,7 +12314,6 @@ static void show_demon_3d(GtkWidget *w)
 
 	show_demon_groups(w);
 	demon_cmd_help(w);
-	show_common_screen(w, "DEMON");
 	remove_all_entity(instrumentecx);
 }
 
@@ -12014,6 +12323,11 @@ static void show_demon(GtkWidget *w)
 		show_demon_3d(w);
 	else
 		show_demon_2d(w);
+	if (demon_ui.captain_of != -1) {
+		sng_set_foreground(WHITE);
+		sng_center_xy_draw_string("CAPTAIN MODE", SMALL_FONT, SCREEN_WIDTH / 2, txy(20));
+	}
+	show_common_screen(w, "DEMON");
 }
 
 struct warp_star {
@@ -13206,7 +13520,7 @@ static int load_static_textures(void)
 	for (i = 0; i < NPLANETARY_RING_MATERIALS; i++) {
 		material_init_textured_planet_ring(&planetary_ring_material[i]);
 		planetary_ring_material[i].textured_planet_ring.texture_id = planetary_ring_texture_id;
-		planetary_ring_material[i].textured_planet_ring.alpha = 0.5;
+		planetary_ring_material[i].textured_planet_ring.alpha = 1.0;
 		planetary_ring_material[i].textured_planet_ring.texture_v = (float) i / 256.0f;
 		planetary_ring_material[i].textured_planet_ring.inner_radius =
 					MIN_RING_RADIUS +
@@ -13322,6 +13636,8 @@ static int load_per_solarsystem_textures()
 	}
 	j = 0;
 	for (i = solarsystem_assets->nplanet_textures; i < NPLANET_MATERIALS; i++) {
+		if (i == NPLANET_MATERIALS / 2)
+			j = 0;
 		planet_material[i] = planet_material[j];
 		if (i < NPLANET_MATERIALS / 2)
 			planet_material[i].textured_planet.ring_material =
@@ -14467,151 +14783,154 @@ static void check_lobby_serverhost_options()
 	}
 }
 
+static struct option long_options[] = {
+	{ "allroles", no_argument, NULL, 'A' },
+	{ "soundserver", no_argument, NULL, 'a' },
+	{ "comms", no_argument, NULL, 'C' },
+	{ "engineering", no_argument, NULL, 'E' },
+	{ "fullscreen", no_argument, NULL, 'f' },
+	{ "nolobby", no_argument, NULL, 'L' },
+	{ "lobbyhost", required_argument, NULL, 'l' },
+	{ "navigation", no_argument, NULL, 'N' },
+	{ "starship", required_argument, NULL, 'n' },
+	{ "main", no_argument, NULL, 'M' },
+	{ "monitor", required_argument, NULL, 'm' },
+	{ "serverport", required_argument, NULL, 'p' },
+	{ "pw", required_argument, NULL, 'P' },
+	{ "quickstart", no_argument, NULL, 'q' },
+	{ "aspect-ratio", required_argument, NULL, 'r' },
+	{ "science", no_argument, NULL, 'S' },
+	{ "serverhost", required_argument, NULL, 's' },
+	{ "version", no_argument, NULL, 'v' },
+	{ "weapons", no_argument, NULL, 'W' },
+	{ "solarsystem", required_argument, NULL, '*'},
+};
+
+static void process_options(int argc, char *argv[])
+{
+	int x, y, rc, c, value;
+
+	x = -1;
+	y = -1;
+	while (1) {
+		int option_index;
+		c = getopt_long(argc, argv, "AaCEfLl:Nn:Mm:p:P:qr:Ss:vW*:", long_options, &option_index);
+		if (c == -1)
+			break;
+		switch (c) {
+		case 'v':
+			printf("snis_client v. %s\n", SNIS_VERSION);
+			break;
+		case 'q':
+			quickstartmode = 1;
+			break;
+		case 'l':
+			lobbyhost = optarg;
+			if (!lobbyhost)
+				usage();
+			break;
+		case 'L':
+			avoid_lobby = 1;
+			break;
+		case 's':
+			serverhost = optarg;
+			if (!serverhost)
+				usage();
+			break;
+		case 'm':
+			if (!optarg)
+				usage();
+			rc = sscanf(optarg, "%d", &value);
+			if (rc == 1)
+				monitorid = value;
+			else
+				usage();
+			break;
+		case 'p':
+			if (!optarg)
+				usage();
+			rc = sscanf(optarg, "%d", &value);
+			if (rc == 1)
+				serverport = value;
+			else
+				usage();
+			break;
+		case 'P':
+			password = optarg;
+			if (!password)
+				usage();
+			break;
+		case 'n':
+			shipname = optarg;
+			if (!shipname)
+				usage();
+			break;
+		case 'A':
+			role |= ROLE_ALL;
+			break;
+		case 'M':
+			role |= ROLE_MAIN;
+			break;
+		case 'N':
+			role |= ROLE_NAVIGATION;
+			break;
+		case 'W':
+			role |= ROLE_WEAPONS;
+			break;
+		case 'E':
+			role |= ROLE_ENGINEERING;
+			break;
+		case 'S':
+			role |= ROLE_SCIENCE;
+			break;
+		case 'C':
+			role |= ROLE_COMMS;
+			break;
+		case 'a':
+			role |= ROLE_SOUNDSERVER;
+			break;
+		case 'f':
+			fullscreen = 1;
+			break;
+		case 'r':
+			if (!optarg)
+				usage();
+			rc = sscanf(optarg, "%d%*[,:]%d", &x, &y);
+			if (rc != 2)
+				usage();
+			requested_aspect_x = x;
+			requested_aspect_y = y;
+			break;
+		case 'y':
+			if (!optarg)
+				usage();
+			rc = scanf(optarg, "%d", &y);
+			if (rc != 1)
+				usage();
+			requested_aspect_y = y;
+			break;
+		case '*':
+			if (!optarg)
+				usage();
+			solarsystem_name = optarg;
+			break;
+		default:
+			usage();
+		}
+	}
+}
+
 int main(int argc, char *argv[])
 {
 	GtkWidget *vbox;
-	int i;
 
 	take_your_locale_and_shove_it();
 	set_random_seed();
 
 	displaymode = DISPLAYMODE_NETWORK_SETUP;
 
-	/* *Sigh*  why am I too lazy to use getopt,
-	 * but not too lazy for this crap?
-	 */
-
 	role = 0;
-	for (i = 1; i < argc; i++) {
-		if (strcmp(argv[i], "--version") == 0) {
-			printf("snis_client v. %s\n", SNIS_VERSION);
-			continue;
-		}
-		if (strcmp(argv[i], "--quickstart") == 0) {
-			quickstartmode = 1;
-			continue;
-		}
-		if (strcmp(argv[i], "--lobbyhost") == 0) {
-			if ((i + 1) >= argc)
-				usage();
-			lobbyhost = argv[i + 1];
-			i++;
-			continue;
-		}
-		if (strcmp(argv[i], "--nolobby") == 0) {
-			avoid_lobby = 1;
-			continue;
-		}
-		if (strcmp(argv[i], "--serverhost") == 0) {
-			if ((i + 1) >= argc)
-				usage();
-			serverhost = argv[i + 1];
-			i++;
-			continue;
-		}
-		if (strcmp(argv[i], "--monitor") == 0) {
-			int rc, value;
-			char *monitorstr;
-
-			if ((i + 1) >= argc)
-				usage();
-			monitorstr = argv[i + 1];
-			rc = sscanf(monitorstr, "%d", &value);
-			if (rc == 1)
-				monitorid = value;
-			else
-				usage();
-			i++;
-			continue;
-		}
-		if (strcmp(argv[i], "--serverport") == 0) {
-			int rc, value;
-			char *portstr;
-
-			if ((i + 1) >= argc)
-				usage();
-			portstr = argv[i + 1];
-			rc = sscanf(portstr, "%d", &value);
-			if (rc == 1)
-				serverport = value;
-			else
-				usage();
-			i++;
-			continue;
-		}
-		if (strcmp(argv[i], "--pw") == 0) {
-			if ((i + 1) >= argc)
-				usage();
-			password = argv[i + 1];
-			i++;
-			continue;
-		}
-		if (strcmp(argv[i], "--starship") == 0) {
-			if ((i + 1) >= argc)
-				usage();
-			shipname = argv[i + 1];
-			i++;
-			continue;
-		}
-		if (strcmp(argv[i], "--allroles") == 0) {
-			role |= ROLE_ALL;
-			continue;
-		}
-		if (strcmp(argv[i], "--main") == 0) {
-			role |= ROLE_MAIN;
-			continue;
-		}
-		if (strcmp(argv[i], "--navigation") == 0) {
-			role |= ROLE_NAVIGATION;
-			continue;
-		}
-		if (strcmp(argv[i], "--weapons") == 0) {
-			role |= ROLE_WEAPONS;
-			continue;
-		}
-		if (strcmp(argv[i], "--engineering") == 0) {
-			role |= ROLE_ENGINEERING;
-			continue;
-		}
-		if (strcmp(argv[i], "--science") == 0) {
-			role |= ROLE_SCIENCE;
-			continue;
-		}
-		if (strcmp(argv[i], "--comms") == 0) {
-			role |= ROLE_COMMS;
-			continue;
-		}
-		if (strcmp(argv[i], "--soundserver") == 0) {
-			role |= ROLE_SOUNDSERVER;
-			continue;
-		}
-		if (strcmp(argv[i], "--fullscreen") == 0) {
-			fullscreen = 1;
-			continue;
-		}
-		if (strcmp(argv[i], "--aspect-ratio") == 0) {
-			int rc, x, y;
-			printf("argc = %d, i = %d\n", argc, i);
-			if (i + 1 >= argc)
-				usage();
-			rc = sscanf(argv[i + 1], "%d%*[,:]%d", &x, &y);
-			if (rc != 2)
-				usage();
-			requested_aspect_x = x;
-			requested_aspect_y = y;
-			i++;
-			continue;
-		}
-		if (strcmp(argv[i], "--solarsystem") == 0) {
-			if (i + 1 >= argc)
-				usage();
-			solarsystem_name = argv[i + 1];
-			i++;
-			continue;
-		}
-		fprintf(stderr, "Bad argument: %s\n", argv[i]);
-		usage();
-	}
+	process_options(argc, argv);
 	if (role == 0)
 		role = ROLE_ALL;
 

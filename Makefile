@@ -353,7 +353,8 @@ COMMONOBJS=mathutils.o snis_alloc.o snis_socket_io.o snis_marshal.o \
 SERVEROBJS=${COMMONOBJS} snis_server.o starbase-comms.o \
 		power-model.o quat.o vec4.o matrix.o snis_event_callback.o space-part.o fleet.o \
 		commodities.o docking_port.o elastic_collision.o snis_nl.o spelled_numbers.o \
-		snis_server_tracker.o snis_bridge_update_packet.o solarsystem_config.o a_star.o
+		snis_server_tracker.o snis_bridge_update_packet.o solarsystem_config.o a_star.o \
+		key_value_parser.o nonuniform_random_sampler.o
 MULTIVERSEOBJS=snis_multiverse.o snis_marshal.o snis_socket_io.o mathutils.o mtwist.o stacktrace.o \
 		snis_hash.o quat.o string-utils.o key_value_parser.o snis_bridge_update_packet.o
 
@@ -574,7 +575,8 @@ shield_strength.o:	shield_strength.c Makefile
 snis_server.o:	snis_server.c Makefile build_info.h
 	$(Q)$(COMPILE)
 
-snis_multiverse.o:	snis_multiverse.c snis_multiverse.h Makefile build_info.h
+snis_multiverse.o:	snis_multiverse.c snis_multiverse.h Makefile build_info.h \
+			snis_entity_key_value_specification.h
 	$(Q)$(COMPILE)
 
 snis_server_tracker.o:	snis_server_tracker.c snis_server_tracker.h ssgl/ssgl.h Makefile
@@ -854,6 +856,12 @@ device-io-sample-1:	device-io-sample-1.c snis-device-io.o
 	gcc -Wall -Wextra --pedantic -pthread -o device-io-sample-1 snis-device-io.o \
 			device-io-sample-1.c
 
+nonuniform_random_sampler.o:	nonuniform_random_sampler.c nonuniform_random_sampler.h
+	$(Q)$(COMPILE) -c nonuniform_random_sampler.c
+
+test_nonuniform_random_sampler:	nonuniform_random_sampler.o mathutils.o mtwist.o
+	gcc -D TEST_NONUNIFORM_SAMPLER -o test_nonuniform_random_sampler mtwist.o mathutils.o -lm nonuniform_random_sampler.c
+
 test-commodities:	commodities.o Makefile
 	gcc -DTESTCOMMODITIES=1 -c commodities.c -o test-commodities.o
 	gcc -DTESTCOMMODITIES=1 -o test-commodities string-utils.o test-commodities.o
@@ -878,6 +886,9 @@ earthlike.1.gz:	earthlike.1
 
 gaseous-giganticus.1.gz:	gaseous-giganticus.1
 	gzip -9 - < gaseous-giganticus.6 > gaseous-giganticus.6.gz
+
+print_ship_attributes:	snis_entity_key_value_specification.h key_value_parser.o
+	gcc -o print_ship_attributes print_ship_attributes.c key_value_parser.o
 
 install:	${PROGS} ${MODELS} ${AUDIOFILES} ${TEXTURES} \
 		${MATERIALS} ${CONFIGFILES} ${SHADERS} ${LUASCRIPTS} ${MANPAGES} ${SSGL} \

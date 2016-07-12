@@ -488,6 +488,7 @@ struct asteroid_data {
 	double r; /* distance from center of universe */
 	double angle_offset;
 	union quat rotational_velocity;
+	float v;
 	uint8_t carbon;
 	uint8_t nickeliron;
 	uint8_t silicates;
@@ -562,10 +563,6 @@ struct planet_data {
 #define PLAYER_PLANET_DIST_TOO_CLOSE (200)
 #define PLAYER_PLANET_DIST_WARN (400)
 	float radius;
-	uint8_t planet_type;
-#define PLANET_TYPE_ROCKY 0
-#define PLANET_TYPE_EARTHLIKE 1
-#define PLANET_TYPE_GASGIANT 2
 	uint8_t has_atmosphere;
 	uint8_t ring_selector;
 	uint8_t solarsystem_planet_type;
@@ -575,6 +572,7 @@ struct planet_data {
 	uint16_t contraband;
 	struct entity *atmosphere;
 	struct material atm_material;
+	union quat rotational_velocity;
 };
 
 struct warpgate_data {
