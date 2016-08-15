@@ -24,6 +24,7 @@
 #define SHIP_CLASS_DREADKNIGHT 18
 #define SHIP_CLASS_VANQUISHER 19
 #define SHIP_CLASS_ENFORCER 20
+#define SHIP_CLASS_ESCAPE_POD 21
 
 struct ship_type_entry {
 	char *class;
@@ -38,6 +39,8 @@ struct ship_type_entry {
 	int nrotations;
 	char axis[3];
 	float angle[3];
+	int has_lasers;
+	int has_torpedoes;
 };
 
 struct ship_type_entry *snis_read_ship_types(char *filename, int *count);

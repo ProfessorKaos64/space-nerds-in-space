@@ -563,6 +563,20 @@ static void free_timer_events(struct timer_event **e)
 	*e = NULL;
 }
 
+static int do_lua_pcall(char *function_name, lua_State *l, int nargs, int nresults, int errfunc)
+{
+	int rc;
+
+	rc = lua_pcall(l, nargs, nresults, errfunc);
+	if (rc) {
+		fprintf(stderr, "snis_server: lua callback '%s' had error %d: '%s'.\n",
+			function_name, rc, lua_tostring(l, -1));
+		stacktrace("do_lua_pcall");
+		fflush(stderr);
+	}
+	return rc;
+}
+
 static void fire_lua_timers(void)
 {
 	struct timer_event *i, *last, *next;
@@ -591,7 +605,7 @@ static void fire_lua_timers(void)
 		next = i->next;
 		lua_getglobal(lua_state, i->callback);
 		lua_pushnumber(lua_state, i->cookie_val);
-		lua_pcall(lua_state, 1, 0, 0);
+		do_lua_pcall(i->callback, lua_state, 1, 0, 0);
 		free_timer_event(&i);
 	}
 
@@ -715,7 +729,7 @@ static void fire_lua_proximity_checks(void)
 		lua_pushnumber(lua_state, (double) i->oid1);
 		lua_pushnumber(lua_state, (double) i->oid2);
 		lua_pushnumber(lua_state, (double) sqrt(dist2));
-		lua_pcall(lua_state, 3, 0, 0);
+		do_lua_pcall(i->callback, lua_state, 3, 0, 0);
 		free_lua_proximity_check(&i);
 	}
 }
@@ -731,7 +745,7 @@ void lua_object_id_event(char *event, uint32_t object_id)
 		lua_getglobal(lua_state, callback[i]);
 		tmp = (double) object_id;
 		lua_pushnumber(lua_state, tmp);
-		lua_pcall(lua_state, 1, 0, 0);
+		do_lua_pcall(callback[i], lua_state, 1, 0, 0);
 	}
 }
 
@@ -744,11 +758,11 @@ void fire_lua_callbacks(struct callback_schedule_entry **sched)
 		next = next_scheduled_callback(i);
 		callback = callback_name(i);
 		lua_getglobal(lua_state, callback);
-		free(callback);
 		lua_pushnumber(lua_state, callback_schedule_entry_param(i, 0));
 		lua_pushnumber(lua_state, callback_schedule_entry_param(i, 1));
 		lua_pushnumber(lua_state, callback_schedule_entry_param(i, 2));
-		lua_pcall(lua_state, 3, 0, 0);
+		do_lua_pcall(callback, lua_state, 3, 0, 0);
+		free(callback);
 	}
 	free_callback_schedule(sched);
 }
@@ -792,7 +806,14 @@ static void set_object_location(struct snis_entity *o, double x, double y, doubl
 	o->z = z;
 	normalize_coords(o);
 	space_partition_update(space_partition, o, x, z);
-} 
+}
+
+static void set_object_velocity(struct snis_entity *o, double vx, double vy, double vz)
+{
+	o->vx = vx;
+	o->vy = vy;
+	o->vz = vz;
+}
 
 static void get_peer_name(int connection, char *buffer)
 {
@@ -939,6 +960,8 @@ static void cargo_container_move(struct snis_entity *o)
 {
 	set_object_location(o, o->x + o->vx, o->y + o->vy, o->z + o->vz);
 	o->timestamp = universe_timestamp;
+	if (o->tsd.cargo_container.persistent)
+		return;
 	o->alive--;
 	if (o->alive == 0)
 		delete_from_clients_and_server(o);
@@ -1845,6 +1868,11 @@ static void push_attack_mode(struct snis_entity *attacker, uint32_t victim_id, i
 	if (safe_mode)
 		return;
 
+	/* Do not attack if no weapons */
+	if (!ship_type[attacker->tsd.ship.shiptype].has_lasers &&
+		!ship_type[attacker->tsd.ship.shiptype].has_torpedoes)
+		return;
+
 	if (recursion_level > 2) /* guard against infinite recursion */
 		return;
 
@@ -1955,7 +1983,7 @@ static int add_derelict(const char *name, double x, double y, double z,
 			int the_faction, int persistent);
 
 static int add_cargo_container(double x, double y, double z, double vx, double vy, double vz,
-				int item, float qty);
+				int item, float qty, int persistent);
 static int make_derelict(struct snis_entity *o)
 {
 	int i, rc;
@@ -1975,13 +2003,13 @@ static int make_derelict(struct snis_entity *o)
 				(void) add_cargo_container(o->x, o->y, o->z,
 					o->vx + snis_random_float() * 2.0,
 					o->vy + snis_random_float() * 2.0,
-					o->vz + snis_random_float(), item, qty);
+					o->vz + snis_random_float(), item, qty, 0);
 		}
 	} else {
 		(void) add_cargo_container(o->x, o->y, o->z,
 				o->vx + snis_random_float() * 2.0,
 				o->vy + snis_random_float() * 2.0,
-				o->vz + snis_random_float(), -1, 0.0);
+				o->vz + snis_random_float(), -1, 0.0, 0);
 	}
 	return rc;
 }
@@ -3019,7 +3047,8 @@ static void ai_attack_mode_brain(struct snis_entity *o)
 
 		if (snis_randn(1000) < 150 + imacop * 150 && vdist <= TORPEDO_RANGE + extra_range &&
 			o->tsd.ship.next_torpedo_time <= universe_timestamp &&
-			o->tsd.ship.torpedoes > 0) {
+			o->tsd.ship.torpedoes > 0 &&
+			ship_type[o->tsd.ship.shiptype].has_torpedoes) {
 			double dist, flight_time, tx, ty, tz, vx, vy, vz;
 			/* int inside_nebula = in_nebula(o->x, o->y) || in_nebula(v->x, v->y); */
 
@@ -3035,13 +3064,15 @@ static void ai_attack_mode_brain(struct snis_entity *o)
 
 				add_torpedo(o->x, o->y, o->z, vx, vy, vz, o->id);
 				o->tsd.ship.torpedoes--;
+				/* FIXME: how do the torpedoes refill? */
 				o->tsd.ship.next_torpedo_time = universe_timestamp +
 					ENEMY_TORPEDO_FIRE_INTERVAL;
 				check_for_incoming_fire(v);
 			}
 		} else {
 			if (snis_randn(1000) < 300 + imacop * 200 &&
-				o->tsd.ship.next_laser_time <= universe_timestamp) {
+				o->tsd.ship.next_laser_time <= universe_timestamp &&
+				ship_type[o->tsd.ship.shiptype].has_lasers) {
 				if (v->type == OBJTYPE_PLANET || !planet_in_the_way(o, v)) {
 					o->tsd.ship.next_laser_time = universe_timestamp +
 						ENEMY_LASER_FIRE_INTERVAL;
@@ -5602,6 +5633,47 @@ static int do_sunburn_damage(struct snis_entity *o)
 	}
 	return damage_was_done;
 }
+
+static void maybe_do_player_warp(struct snis_entity *o)
+{
+	int b = lookup_bridge_by_shipid(o->id);
+	if (b < 0)
+		return;
+
+	if (o->tsd.ship.warp_time >= 0)
+		o->tsd.ship.warp_time--;
+
+	if (o->tsd.ship.warp_time == 0) { /* Is it time to engage warp? */
+		/* 5 seconds of warp limbo */
+		send_packet_to_all_clients_on_a_bridge(o->id,
+			packed_buffer_new("bh", OPCODE_WARP_LIMBO,
+				(uint16_t) (5 * 30)), ROLE_ALL);
+		bridgelist[b].warpv.v.x = (bridgelist[b].warpx - o->x) / 50.0;
+		bridgelist[b].warpv.v.y = (bridgelist[b].warpy - o->y) / 50.0;
+		bridgelist[b].warpv.v.z = (bridgelist[b].warpz - o->z) / 50.0;
+		bridgelist[b].warptimeleft = 50;
+		add_warp_effect(o->id, o->x, o->y, o->z,
+				bridgelist[b].warpx,
+				bridgelist[b].warpy,
+				bridgelist[b].warpz);
+	}
+
+	if (bridgelist[b].warptimeleft <= 0)
+		return;
+
+	float angle = (2.0 * M_PI / 50.0) * (float) bridgelist[b].warptimeleft;
+
+	o->vx = bridgelist[b].warpv.v.x * (1.0 - cos(angle));
+	o->vy = bridgelist[b].warpv.v.y * (1.0 - cos(angle));
+	o->vz = bridgelist[b].warpv.v.z * (1.0 - cos(angle));
+	o->timestamp = universe_timestamp;
+	bridgelist[b].warptimeleft--;
+	if (bridgelist[b].warptimeleft == 0) {
+		o->vx = 0;
+		o->vy = 0;
+		o->vz = 0;
+	}
+}
 		
 static void player_move(struct snis_entity *o)
 {
@@ -5609,8 +5681,13 @@ static void player_move(struct snis_entity *o)
 	int phaser_chargerate, current_phaserbank;
 	float orientation_damping, velocity_damping;
 
-	if (o->tsd.ship.damage.shield_damage > 200 && (universe_timestamp % (10 * 5)) == 0)
-		snis_queue_add_sound(HULL_BREACH_IMMINENT, ROLE_SOUNDSERVER, o->id);
+	if (o->tsd.ship.damage.shield_damage > 200) {
+		if (universe_timestamp % (10 * 5) == 0)
+			snis_queue_add_sound(HULL_BREACH_IMMINENT, ROLE_SOUNDSERVER, o->id);
+		if (snis_randn(8000) < 100 + o->tsd.ship.damage.shield_damage)
+			snis_queue_add_sound(HULL_CREAK_0 + (snis_randn(1000) % NHULL_CREAK_SOUNDS),
+							ROLE_SOUNDSERVER, o->id);
+	}
 	if (o->tsd.ship.fuel < FUEL_CONSUMPTION_UNIT * 30 * 60 &&
 		(universe_timestamp % (20 * 5)) == 15) {
 		snis_queue_add_sound(FUEL_LEVELS_CRITICAL, ROLE_SOUNDSERVER, o->id);
@@ -5738,46 +5815,7 @@ static void player_move(struct snis_entity *o)
 	current_phaserbank = o->tsd.ship.phaser_charge;
 	phaser_chargerate = o->tsd.ship.power_data.phasers.i;
 	o->tsd.ship.phaser_charge = update_phaser_banks(current_phaserbank, phaser_chargerate, 255);
-
-	/* Warp the ship if it's time to engage warp. */
-	if (o->tsd.ship.warp_time >= 0) {
-		o->tsd.ship.warp_time--;
-		if (o->tsd.ship.warp_time == 0) {
-			int b;
-
-			b = lookup_bridge_by_shipid(o->id);
-			if (b >= 0) {
-				/* 5 seconds of warp limbo */
-				send_packet_to_all_clients_on_a_bridge(o->id,
-					packed_buffer_new("bh", OPCODE_WARP_LIMBO,
-						(uint16_t) (5 * 30)), ROLE_ALL);
-				bridgelist[b].warpv.v.x = (bridgelist[b].warpx - o->x) / 50.0;
-				bridgelist[b].warpv.v.y = (bridgelist[b].warpy - o->y) / 50.0;
-				bridgelist[b].warpv.v.z = (bridgelist[b].warpz - o->z) / 50.0;
-				bridgelist[b].warptimeleft = 50;
-				add_warp_effect(o->id, o->x, o->y, o->z,
-						bridgelist[b].warpx,
-						bridgelist[b].warpy,
-						bridgelist[b].warpz);
-			}
-		}
-	}
-	int b = lookup_bridge_by_shipid(o->id);
-	if (bridgelist[b].warptimeleft > 0) {
-		float angle = (2.0 * M_PI / 50.0) * (float) bridgelist[b].warptimeleft;
-
-		/* 2.0 below determined empirically.  I am lazy. :) */
-		o->vx = bridgelist[b].warpv.v.x * 2.0 * (1.0 - cos(angle)) * 0.5;
-		o->vy = bridgelist[b].warpv.v.y * 2.0 * (1.0 - cos(angle)) * 0.5;
-		o->vz = bridgelist[b].warpv.v.z * 2.0 * (1.0 - cos(angle)) * 0.5;
-		o->timestamp = universe_timestamp;
-		bridgelist[b].warptimeleft--;
-		if (bridgelist[b].warptimeleft == 0) {
-			o->vx = 0;
-			o->vy = 0;
-			o->vz = 0;
-		}
-	}
+	maybe_do_player_warp(o);
 	calculate_ship_scibeam_info(o);
 }
 
@@ -6755,7 +6793,7 @@ static int l_add_cargo_container(lua_State *l)
 	vz = lua_tonumber(lua_state, 6);
 
 	pthread_mutex_lock(&universe_mutex);
-	i = add_cargo_container(x, y, z, vx, vy, vz, -1, 0);
+	i = add_cargo_container(x, y, z, vx, vy, vz, -1, 0, 1);
 	if (i < 0) {
 		lua_pushnil(lua_state);
 		pthread_mutex_unlock(&universe_mutex);
@@ -6830,6 +6868,30 @@ static int l_move_object(lua_State *l)
 	return 0;
 }
 
+static int l_set_object_velocity(lua_State *l)
+{
+	int i;
+	double id, vx, vy, vz;
+	struct snis_entity *o;
+
+	id = lua_tonumber(lua_state, 1);
+	vx = lua_tonumber(lua_state, 2);
+	vy = lua_tonumber(lua_state, 3);
+	vz = lua_tonumber(lua_state, 4);
+
+	pthread_mutex_lock(&universe_mutex);
+	i = lookup_by_id((uint32_t) id);
+	if (i < 0) {
+		pthread_mutex_unlock(&universe_mutex);
+		return 0;
+	}
+	o = &go[i];
+	set_object_velocity(o, vx, vy, vz);
+	pthread_mutex_unlock(&universe_mutex);
+	return 0;
+}
+
+
 static int l_delete_object(lua_State *l)
 {
 	int i;
@@ -6898,7 +6960,7 @@ static int l_add_spacemonster(lua_State *l)
 }
 
 static int add_cargo_container(double x, double y, double z, double vx, double vy, double vz,
-			int item, float qty)
+			int item, float qty, int persistent)
 {
 	int i;
 
@@ -6918,6 +6980,7 @@ static int add_cargo_container(double x, double y, double z, double vx, double v
 	}
 	go[i].tsd.cargo_container.contents.item = item;
 	go[i].tsd.cargo_container.contents.qty = qty;
+	go[i].tsd.cargo_container.persistent = persistent & 0xff;
 	return i;
 }
 
@@ -9445,7 +9508,7 @@ static void meta_comms_eject(char *name, struct game_client *c, char *txt)
 
 	(void) add_cargo_container(container_loc.v.x, container_loc.v.y, container_loc.v.z,
 				container_vel.v.x, container_vel.v.y, container_vel.v.z,
-				item, qty);
+				item, qty, 1);
 	snprintf(msg, sizeof(msg), "CARGO BAY %d EJECTED", cargobay);
 	send_comms_packet(name, bridgelist[c->bridge].comms_channel, msg);
 	return;
@@ -10084,7 +10147,7 @@ void npc_menu_item_travel_advisory(struct npc_menu_item *item,
 	}
 	send_comms_packet(npcname, ch, " SPACE WEATHER ADVISORY: ALL CLEAR");
 	send_comms_packet(npcname, ch, "");
-	if (contraband >= 0) {
+	if (contraband != (uint16_t) -1) {
 		send_comms_packet(npcname, ch, " TRAVELERS TAKE NOTICE OF PROHIBITED ITEMS:");
 		snprintf(msg, sizeof(msg), "    %s", commodity[contraband].name);
 		send_comms_packet(npcname, ch, msg);
@@ -12218,6 +12281,26 @@ out:
 	return 1;
 }
 
+static int l_add_commodity(lua_State *l)
+{
+	const char *name = luaL_checkstring(l, 1);
+	const char *units = luaL_checkstring(l, 2);
+	const double base_price = luaL_checknumber(l, 3);
+	const double volatility = luaL_checknumber(l, 4);
+	const double legality = luaL_checknumber(l, 5);
+	const double econ_sensitivity = luaL_checknumber(l, 6);
+	const double govt_sensitivity = luaL_checknumber(l, 7);
+	const double tech_sensitivity = luaL_checknumber(l, 8);
+	const double odds = luaL_checknumber(l, 9);
+	int iodds = odds;
+
+	int n = add_commodity(&commodity, &ncommodities,
+		name, units, base_price, volatility, legality,
+		econ_sensitivity, govt_sensitivity, tech_sensitivity, iodds);
+	lua_pushnumber(l, (double) n);
+	return 1;
+}
+
 static int l_reset_player_ship(lua_State *l)
 {
 	const double lua_oid = luaL_checknumber(l, 1);
@@ -13983,7 +14066,7 @@ static void queue_up_to_clients_that_care(struct snis_entity *o)
 			continue;
 
 		if (too_far_away_to_care(c, o))
-			return;
+			continue;
 
 		if (o->timestamp != c->go_clients[go_index(o)].last_timestamp_sent) {
 			queue_up_client_object_update(c, o);
@@ -15314,6 +15397,7 @@ static void setup_lua(void)
 	add_lua_callable_fn(l_get_player_ship_ids, "get_player_ship_ids");
 	add_lua_callable_fn(l_get_object_location, "get_object_location");
 	add_lua_callable_fn(l_move_object, "move_object");
+	add_lua_callable_fn(l_set_object_velocity, "set_object_velocity");
 	add_lua_callable_fn(l_delete_object, "delete_object");
 	add_lua_callable_fn(l_register_callback, "register_callback");
 	add_lua_callable_fn(l_register_timer_callback, "register_timer_callback");
@@ -15337,6 +15421,7 @@ static void setup_lua(void)
 	add_lua_callable_fn(l_get_commodity_units, "get_commodity_units");
 	add_lua_callable_fn(l_lookup_commodity, "lookup_commodity");
 	add_lua_callable_fn(l_set_commodity_contents, "set_commodity_contents");
+	add_lua_callable_fn(l_add_commodity, "add_commodity");
 	add_lua_callable_fn(l_reset_player_ship, "reset_player_ship");
 	add_lua_callable_fn(l_show_menu, "show_menu");
 }

@@ -78,7 +78,17 @@ SOUNDFILES=${SOUNDSRCDIR}/Attribution.txt \
 	${SOUNDSRCDIR}/warning-hull-breach-imminent.ogg \
 	${SOUNDSRCDIR}/warp-drive-fumble.ogg \
 	${SOUNDSRCDIR}/warpdrive.ogg \
-	${SOUNDSRCDIR}/welcome-to-starbase.ogg
+	${SOUNDSRCDIR}/welcome-to-starbase.ogg \
+	${SOUNDSRCDIR}/hull-creak-0.ogg \
+	${SOUNDSRCDIR}/hull-creak-1.ogg \
+	${SOUNDSRCDIR}/hull-creak-2.ogg \
+	${SOUNDSRCDIR}/hull-creak-3.ogg \
+	${SOUNDSRCDIR}/hull-creak-4.ogg \
+	${SOUNDSRCDIR}/hull-creak-5.ogg \
+	${SOUNDSRCDIR}/hull-creak-6.ogg \
+	${SOUNDSRCDIR}/hull-creak-7.ogg \
+	${SOUNDSRCDIR}/hull-creak-8.ogg \
+	${SOUNDSRCDIR}/hull-creak-9.ogg
 TEXTUREDIR=${DATADIR}/textures
 TEXTURESRCDIR=${ASSETSSRCDIR}/textures
 TEXTUREFILES=${TEXTURESRCDIR}/AreaTex.h \
@@ -269,7 +279,8 @@ SCAD_PARAMS_FILES=${MODELSRCDIR}/disruptor.scad_params.h \
 	${MODELSRCDIR}/scrambler.scad_params.h \
 	${MODELSRCDIR}/spaceship2.scad_params.h \
 	${MODELSRCDIR}/skorpio.scad_params.h \
-	${MODELSRCDIR}/spaceship.scad_params.h
+	${MODELSRCDIR}/spaceship.scad_params.h \
+	${MODELSRCDIR}/escapepod.scad_params.h
 
 DOCKING_PORT_FILES=${MODELSRCDIR}/starbase2.docking_ports.h \
 	${MODELSRCDIR}/starbase3.docking_ports.h \
@@ -444,7 +455,8 @@ MODELS=${MD}/freighter.stl \
 	${MD}/vanquisher.stl \
 	${MD}/docking_port.stl \
 	${MD}/docking_port2.stl \
-	${MD}/warpgate.stl
+	${MD}/warpgate.stl \
+	${MD}/escapepod.stl
 
 MYCFLAGS=-DPREFIX=${PREFIX} ${DEBUGFLAG} ${PROFILEFLAG} ${OPTIMIZEFLAG}\
 	--pedantic -Wall ${STOP_ON_WARN} -pthread -std=gnu99 -rdynamic
