@@ -111,6 +111,7 @@
 #define OPCODE_UPDATE_TRACTORBEAM	182
 #define OPCODE_REQUEST_TRACTOR_PWR	183
 #define OPCODE_COMMS_MAINSCREEN	184
+#define COMMS_CHANNEL_CHANGE_MSG "TX/RX INITIATED ON CHANNEL "
 #define OPCODE_LOAD_SKYBOX 185
 #define OPCODE_ROBOT_AUTO_MANUAL 	186
 #define OPCODE_ADD_WARP_EFFECT		187
@@ -217,6 +218,7 @@ struct update_ship_packet {
 	int32_t weap_orientation[4];
 	uint8_t in_secure_area;
 	uint8_t docking_magnets;
+	uint8_t emf_detector;
 };
 
 struct ship_sdata_packet {

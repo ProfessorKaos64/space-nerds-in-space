@@ -79,6 +79,7 @@
 #include "snis_sliders.h"
 #include "snis_text_window.h"
 #include "snis_text_input.h"
+#include "snis_strip_chart.h"
 #include "snis_socket_io.h"
 #include "ssgl/ssgl.h"
 #include "snis_marshal.h"
@@ -288,6 +289,7 @@ ui_element_drawing_function ui_slider_draw = (ui_element_drawing_function) snis_
 ui_element_button_press_function ui_slider_button_press = (ui_element_button_press_function) snis_slider_button_press;
 
 ui_element_drawing_function ui_button_draw = (ui_element_drawing_function) snis_button_draw;
+ui_element_drawing_function ui_strip_chart_draw = (ui_element_drawing_function) snis_strip_chart_draw;
 ui_element_drawing_function ui_label_draw = (ui_element_drawing_function) snis_label_draw;
 ui_element_button_press_function ui_button_button_press = (ui_element_button_press_function) snis_button_button_press;
 ui_element_drawing_function ui_gauge_draw = (ui_element_drawing_function) gauge_draw;
@@ -2748,6 +2750,7 @@ static void do_view_mode_change()
 }
 
 static void comms_dirkey(int h, int v);
+static inline int nav_ui_computer_active(void);
 
 static void do_dirkey(int h, int v, int r, int t)
 {
@@ -2764,6 +2767,8 @@ static void do_dirkey(int h, int v, int r, int t)
 	switch (displaymode) {
 		case DISPLAYMODE_MAINSCREEN:
 		case DISPLAYMODE_NAVIGATION:
+			if (nav_ui_computer_active()) /* suppress keystrokes typed to computer */
+				break;
 			navigation_dirkey(h, v, r); 
 			break;
 		case DISPLAYMODE_WEAPONS:
@@ -3215,7 +3220,7 @@ static gint key_press_cb(GtkWidget* widget, GdkEventKey* event, gpointer data)
 	case key_camera_mode:
 		if (displaymode == DISPLAYMODE_MAINSCREEN)
 			do_mainscreen_camera_mode();
-		else if (displaymode == DISPLAYMODE_NAVIGATION)
+		else if (displaymode == DISPLAYMODE_NAVIGATION && !nav_ui_computer_active())
 			do_nav_camera_mode();
 		break;
 	case keyf1:
@@ -3590,6 +3595,8 @@ static int process_update_coolant_data(void)
 	return rc;
 }
 
+static void update_emf_detector(uint8_t emf_value);
+
 static struct navigation_ui {
 	struct slider *warp_slider;
 	struct slider *navzoom_slider;
@@ -3600,8 +3607,17 @@ static struct navigation_ui {
 	struct button *standard_orbit_button;
 	struct button *reverse_button;
 	struct button *trident_button;
+	struct button *computer_button;
 	int gauge_radius;
+	struct snis_text_input_box *computer_input;
+	char input[100];
+	int computer_active;
 } nav_ui;
+
+static inline int nav_ui_computer_active(void)
+{
+	return nav_ui.computer_active;
+}
 
 static int process_update_ship_packet(uint8_t opcode)
 {
@@ -3618,7 +3634,7 @@ static int process_update_ship_packet(uint8_t opcode)
 	uint8_t tloading, tloaded, throttle, rpm, temp, scizoom, weapzoom, navzoom,
 		mainzoom, warpdrive, requested_warpdrive,
 		requested_shield, phaser_charge, phaser_wavelength, shiptype,
-		reverse, trident, in_secure_area, docking_magnets;
+		reverse, trident, in_secure_area, docking_magnets, emf_detector;
 	union quat orientation, sciball_orientation, weap_orientation;
 	union euler ypr;
 	struct entity *e;
@@ -3641,14 +3657,14 @@ static int process_update_ship_packet(uint8_t opcode)
 				&dgunyawvel,
 				&dsheading,
 				&dbeamwidth);
-	packed_buffer_extract(&pb, "bbbwbbbbbbbbbbbbbwQQQbb",
+	packed_buffer_extract(&pb, "bbbwbbbbbbbbbbbbbwQQQbbb",
 			&tloading, &throttle, &rpm, &fuel, &temp,
 			&scizoom, &weapzoom, &navzoom, &mainzoom,
 			&warpdrive, &requested_warpdrive,
 			&requested_shield, &phaser_charge, &phaser_wavelength, &shiptype,
 			&reverse, &trident, &victim_id, &orientation.vec[0],
 			&sciball_orientation.vec[0], &weap_orientation.vec[0], &in_secure_area,
-			&docking_magnets);
+			&docking_magnets, &emf_detector);
 	tloaded = (tloading >> 4) & 0x0f;
 	tloading = tloading & 0x0f;
 	quat_to_euler(&ypr, &orientation);	
@@ -3704,6 +3720,9 @@ static int process_update_ship_packet(uint8_t opcode)
 	o->tsd.ship.shiptype = shiptype;
 	o->tsd.ship.in_secure_area = in_secure_area;
 	o->tsd.ship.docking_magnets = docking_magnets;
+	o->tsd.ship.emf_detector = emf_detector;
+	/* FIXME: really update_emf_detector should get called every frame and passed o->tsd.ship.emf_detector. */
+	update_emf_detector(emf_detector);
 
 	/* shift old updates to make room for this one */
 	int j;
@@ -4583,6 +4602,8 @@ struct comms_ui {
 	struct snis_text_input_box *comms_input;
 	struct slider *mainzoom_slider;
 	char input[100];
+	uint32_t channel;
+	struct strip_chart *emf_strip_chart;
 } comms_ui;
 
 static void comms_dirkey(int h, int v)
@@ -4627,7 +4648,10 @@ static int process_comm_transmission(void)
 	unsigned char buffer[sizeof(struct comms_transmission_packet) + 100];
 	char string[256];
 	uint8_t length;
-	int rc;
+	int rc, n;
+	uint32_t comms_channel;
+	const char const *channel_change_pattern = COMMS_CHANNEL_CHANGE_MSG " %u";
+	char *channel_change_msg;
 
 	rc = read_and_unpack_buffer(buffer, "b", &length);
 	if (rc != 0)
@@ -4639,6 +4663,16 @@ static int process_comm_transmission(void)
 	main_screen_add_text(string);
 	if (strstr(string, ": *** HAILING "))
 		wwviaudio_add_sound(COMMS_HAIL_SOUND);
+	/* This is a little hoaky.  The client doesn't actually know which
+	 * channel comms is on, that's 100% server side.  But we can snoop
+	 * channel change messages so we can have a channel indicator.
+	 */
+	channel_change_msg = strstr(string, COMMS_CHANNEL_CHANGE_MSG);
+	if (channel_change_msg) {
+		n = sscanf(channel_change_msg, channel_change_pattern, &comms_channel);
+		if (n == 1)
+			comms_ui.channel = comms_channel;
+	}
 	return 0;
 }
 
@@ -8136,6 +8170,15 @@ static void ui_add_button(struct button *b, int active_displaymode)
 	ui_element_list_add_element(&uiobjs, uie); 
 }
 
+static void ui_add_strip_chart(struct strip_chart *sc, int active_displaymode)
+{
+	struct ui_element *uie;
+
+	uie = ui_element_init(sc, ui_strip_chart_draw, NULL,
+		active_displaymode, &displaymode);
+	ui_element_list_add_element(&uiobjs, uie);
+}
+
 static void ui_hide_widget(void *widget)
 {
 	struct ui_element *uie;
@@ -8256,7 +8299,28 @@ static void show_manual_weapons(GtkWidget *w)
 	show_common_screen(w, "WEAPONS");
 }
 
+static void send_natural_language_request_to_server(char *msg);
+static void nav_computer_data_entered(void *x)
+{
+	trim_whitespace(nav_ui.input);
+	clean_spaces(nav_ui.input);
+	if (strcmp(nav_ui.input, "") != 0) /* skip blank lines */
+		send_natural_language_request_to_server(nav_ui.input);
+	snis_text_input_box_zero(nav_ui.computer_input);
+	nav_ui.computer_active = 0;
+	ui_unhide_widget(nav_ui.computer_button);
+	ui_hide_widget(nav_ui.computer_input);
+}
+
 static double sample_warpdrive(void);
+
+static void nav_computer_button_pressed(__attribute__((unused)) void *s)
+{
+	nav_ui.computer_active = 1;
+	ui_hide_widget(nav_ui.computer_button);
+	ui_unhide_widget(nav_ui.computer_input);
+}
+
 static void init_nav_ui(void)
 {
 	int x;
@@ -8302,6 +8366,13 @@ static void init_nav_ui(void)
 			NANO_FONT, reverse_button_pressed, NULL);
 	nav_ui.trident_button = snis_button_init(10, 250, -1, -1, "ABSOLUTE", button_color,
 			NANO_FONT, trident_button_pressed, NULL);
+	nav_ui.computer_button = snis_button_init(txx(10), txy(570), -1, -1, "COMPUTER", UI_COLOR(nav_warning),
+			NANO_FONT, nav_computer_button_pressed, NULL);
+	nav_ui.computer_active = 0;
+	nav_ui.computer_input = snis_text_input_box_init(txx(10), txy(560), txy(30), txx(550),
+					UI_COLOR(nav_warning), TINY_FONT, nav_ui.input, 50, &timer, NULL, NULL);
+	snis_text_input_box_set_return(nav_ui.computer_input, nav_computer_data_entered);
+	snis_text_input_box_set_dynamic_width(nav_ui.computer_input, txx(100), txx(550));
 	ui_add_slider(nav_ui.warp_slider, DISPLAYMODE_NAVIGATION);
 	ui_add_slider(nav_ui.navzoom_slider, DISPLAYMODE_NAVIGATION);
 	ui_add_slider(nav_ui.throttle_slider, DISPLAYMODE_NAVIGATION);
@@ -8311,6 +8382,9 @@ static void init_nav_ui(void)
 	ui_add_button(nav_ui.reverse_button, DISPLAYMODE_NAVIGATION);
 	ui_add_button(nav_ui.trident_button, DISPLAYMODE_NAVIGATION);
 	ui_add_gauge(nav_ui.warp_gauge, DISPLAYMODE_NAVIGATION);
+	ui_add_button(nav_ui.computer_button, DISPLAYMODE_NAVIGATION);
+	ui_add_text_input_box(nav_ui.computer_input, DISPLAYMODE_NAVIGATION);
+	ui_hide_widget(nav_ui.computer_input);
 	instrumentecx = entity_context_new(5000, 1000);
 	tridentecx = entity_context_new(10, 0);
 }
@@ -10016,7 +10090,7 @@ static void init_comms_ui(void)
 {
 	int x = txx(200);
 	int y = txy(20);
-	int bw = txx(75);
+	int bw = txx(70);
 	int bh = txy(25);
 	const int button_color = UI_COLOR(comms_button);
 	const int slider_color = UI_COLOR(comms_slider);
@@ -10057,6 +10131,7 @@ static void init_comms_ui(void)
 					comms_input_entered, NULL);
 	snis_text_input_box_set_return(comms_ui.comms_input,
 					comms_transmit_button_pressed);
+	snis_text_input_box_set_dynamic_width(comms_ui.comms_input, txx(100), txx(550));
 	comms_ui.comms_transmit_button = snis_button_init(txx(10), txy(550), -1, txy(30),
 			"TRANSMIT", button_color,
 			TINY_FONT, comms_transmit_button_pressed, NULL);
@@ -10064,6 +10139,10 @@ static void init_comms_ui(void)
 				slider_color, "ZOOM",
 				"1", "10", 0.0, 100.0, sample_mainzoom,
 				do_mainzoom);
+	comms_ui.emf_strip_chart =
+		snis_strip_chart_init(txx(705), txy(5), txx(90.0), txy(50.0),
+				"EMF", "SCAN DETECTED", UI_COLOR(science_graph_plot_strong),
+				UI_COLOR(common_red_alert), 100, NANO_FONT, 900);
 	ui_add_text_window(comms_ui.tw, DISPLAYMODE_COMMS);
 	ui_add_button(comms_ui.comms_onscreen_button, DISPLAYMODE_COMMS);
 	ui_add_button(comms_ui.nav_onscreen_button, DISPLAYMODE_COMMS);
@@ -10077,6 +10156,13 @@ static void init_comms_ui(void)
 	ui_add_button(comms_ui.comms_transmit_button, DISPLAYMODE_COMMS);
 	ui_add_text_input_box(comms_ui.comms_input, DISPLAYMODE_COMMS);
 	ui_add_slider(comms_ui.mainzoom_slider, DISPLAYMODE_COMMS);
+	ui_add_strip_chart(comms_ui.emf_strip_chart, DISPLAYMODE_COMMS);
+	comms_ui.channel = 0;
+}
+
+static void update_emf_detector(uint8_t emf_value)
+{
+	snis_strip_chart_update(comms_ui.emf_strip_chart, emf_value);
 }
 
 #define SCIDIST2 100
@@ -10576,7 +10662,7 @@ static void show_3d_science(GtkWidget *w)
 static void show_comms(GtkWidget *w)
 {
 	struct snis_entity *o;
-	char current_date[32], comms_clock[16];
+	char current_date[32], comms_buffer[64];
 
 	if (!(o = find_my_ship()))
 		return;
@@ -10594,9 +10680,11 @@ static void show_comms(GtkWidget *w)
 		sng_center_xy_draw_string(buf, NANO_FONT, shield_ind_x_center, shield_ind_y_center);
 	}
 	sng_set_foreground(UI_COLOR(comms_text));
-	format_date(current_date, sizeof(comms_clock), universe_timestamp());
-	sprintf(comms_clock, "TIME: %s", current_date);
-	sng_abs_xy_draw_string(comms_clock, TINY_FONT, txx(25), txy(55));
+	format_date(current_date, sizeof(current_date), universe_timestamp());
+	sprintf(comms_buffer, "TIME: %s", current_date);
+	sng_abs_xy_draw_string(comms_buffer, TINY_FONT, txx(25), txy(55));
+	sprintf(comms_buffer, "CHANNEL: %u", comms_ui.channel);
+	sng_center_xy_draw_string(comms_buffer, NANO_FONT, shield_ind_x_center, shield_ind_y_center - txy(15));
 	show_common_screen(w, "COMMS");
 }
 
@@ -11752,11 +11840,10 @@ static void init_demon_ui()
 	demon_ui.demon_input = snis_text_input_box_init(txx(10), txy(520), txy(30), txx(550),
 					UI_COLOR(demon_input), TINY_FONT,
 					demon_ui.input, 50, &timer, NULL, NULL);
-	snis_text_input_box_set_return(demon_ui.demon_input,
-					demon_exec_button_pressed); 
-	demon_ui.demon_exec_button = snis_button_init(txx(570), txy(520), -1, -1,
-			"EXECUTE", UI_COLOR(demon_input),
-			TINY_FONT, demon_exec_button_pressed, NULL);
+	snis_text_input_box_set_dynamic_width(demon_ui.demon_input, txx(100), txx(550));
+	snis_text_input_box_set_return(demon_ui.demon_input, demon_exec_button_pressed);
+	demon_ui.demon_exec_button = snis_button_init(txx(10), txy(555), -1, -1,
+			"EXECUTE", UI_COLOR(demon_input), TINY_FONT, demon_exec_button_pressed, NULL);
 	x = txx(3);
 	y = txy(60);
 	dy = txy(25);
@@ -12811,6 +12898,12 @@ static int main_da_scroll(GtkWidget *w, GdkEvent *event, gpointer p)
 			do_zoom(10);
 		if (e->direction == GDK_SCROLL_DOWN)
 			do_zoom(-10);
+		return 0;
+	case DISPLAYMODE_COMMS:
+		if (e->direction == GDK_SCROLL_UP)
+			comms_dirkey(0, -1);
+		if (e->direction == GDK_SCROLL_DOWN)
+			comms_dirkey(0, 1);
 		return 0;
 	default:
 		return 0;

@@ -170,6 +170,8 @@ static void npc_menu_item_request_dock(struct npc_menu_item *item,
 				char *npcname, struct npc_bot_state *botstate);
 static void npc_menu_item_warp_gate_tickets(struct npc_menu_item *item,
 				char *npcname, struct npc_bot_state *botstate);
+static void npc_menu_item_towing_service(struct npc_menu_item *item,
+				char *npcname, struct npc_bot_state *botstate);
 static void npc_menu_item_buy_cargo(struct npc_menu_item *item,
 				char *npcname, struct npc_bot_state *botstate);
 static void npc_menu_item_sell_cargo(struct npc_menu_item *item,
@@ -242,7 +244,7 @@ static struct npc_menu_item starbase_main_menu[] = {
 	{ "LOCAL TRAVEL ADVISORY", 0, 0, npc_menu_item_travel_advisory },
 	{ "REQUEST PERMISSION TO DOCK", 0, 0, npc_menu_item_request_dock },
 	{ "BUY WARP-GATE TICKETS", 0, 0, npc_menu_item_warp_gate_tickets },
-	{ "REQUEST REMOTE FUEL DELIVERY", 0, 0, npc_menu_item_not_implemented },
+	{ "REQUEST TOWING SERVICE", 0, 0, npc_menu_item_towing_service },
 	{ "BUY FUEL", 0, 0, npc_menu_item_not_implemented },
 	{ "REPAIRS AND MAINTENANCE", 0, repairs_and_maintenance_menu, 0 },
 	{ "ARRANGE TRANSPORT CONTRACTS", 0, arrange_transport_contracts_menu, 0 },
@@ -2842,6 +2844,33 @@ static void update_ship_orientation(struct snis_entity *o)
 	quat_from_u2v(&o->orientation, &right, &current, &up);
 }
 
+static void update_towed_ship(struct snis_entity *o)
+{
+	int i, n;
+	struct snis_entity *disabled_ship;
+	union vec3 towing_offset = { { 0.0, -20.0, 0.0 } };
+
+	if (o->tsd.ship.shiptype != SHIP_CLASS_MANTIS)
+		return;
+	n = o->tsd.ship.nai_entries - 1;
+	if (n < 0)
+		return;
+	if (o->tsd.ship.ai[n].ai_mode != AI_MODE_TOW_SHIP)
+		return;
+	if (!o->tsd.ship.ai[n].u.tow_ship.ship_connected)
+		return;
+	i = lookup_by_id(o->tsd.ship.ai[n].u.tow_ship.disabled_ship);
+	if (i < 0)
+		return;
+	disabled_ship = &go[i];
+	quat_rot_vec_self(&towing_offset, &o->orientation);
+	disabled_ship->orientation = o->orientation;
+	disabled_ship->x = o->x + towing_offset.v.x;
+	disabled_ship->y = o->y + towing_offset.v.y;
+	disabled_ship->z = o->z + towing_offset.v.z;
+	disabled_ship->timestamp = universe_timestamp;
+}
+
 static void update_ship_position_and_velocity(struct snis_entity *o);
 static int add_laserbeam(uint32_t origin, uint32_t target, int alive);
 
@@ -3001,6 +3030,15 @@ static void ai_attack_mode_brain(struct snis_entity *o)
 		pop_ai_attack_mode(o);
 		return;
 	}
+
+	/* Trigger the victim ship's emf detector */
+	if (v->type == OBJTYPE_SHIP1 || v->type == OBJTYPE_SHIP2) {
+		uint8_t emf_value = (uint8_t) (snis_randn(120) +
+			130.0 * ATTACK_MODE_GIVE_UP_DISTANCE / vdist);
+		if (v->tsd.ship.emf_detector < emf_value)
+			v->tsd.ship.emf_detector = emf_value;
+	}
+
 	extra_range = 0.0;
 	if (v->type == OBJTYPE_PLANET)
 		extra_range = v->tsd.planet.radius;
@@ -3649,6 +3687,56 @@ static void ai_mining_mode_mine_asteroid(struct snis_entity *o, struct ai_mining
 	ai->mode = MINING_MODE_RETURN_TO_PARENT;
 }
 
+static void ai_tow_ship_mode_brain(struct snis_entity *o)
+{
+	int i, n;
+	struct snis_entity *disabled_ship, *starbase_dispatcher;
+
+	n = o->tsd.ship.nai_entries - 1;
+	if (n < 0)
+		return;
+
+	/* Find the ship we're supposed to be towing */
+	i = lookup_by_id(o->tsd.ship.ai[n].u.tow_ship.disabled_ship);
+	if (i < 0) {
+		pop_ai_stack(o);
+		return;
+	}
+	disabled_ship = &go[i];
+
+	/* Find the starbase we are supposed to tow it to */
+	i = lookup_by_id(o->tsd.ship.ai[n].u.tow_ship.starbase_dispatcher);
+	if (i < 0) {
+		pop_ai_stack(o);
+		return;
+	}
+	starbase_dispatcher = &go[i];
+
+	if (o->tsd.ship.ai[n].u.tow_ship.ship_connected) {
+		double dist2 = ai_ship_travel_towards(o,
+			starbase_dispatcher->x, starbase_dispatcher->y, starbase_dispatcher->z);
+		if (dist2 < (TOWING_DROP_DIST * TOWING_DROP_DIST)) {
+			/* Give player a little fuel if they're super low. */
+			if (disabled_ship->tsd.ship.fuel < FUEL_CONSUMPTION_UNIT * 30 * 60)
+				disabled_ship->tsd.ship.fuel = FUEL_CONSUMPTION_UNIT * 30 * 60;
+			/* We're done */
+			pop_ai_stack(o);
+			return;
+		}
+	} else {
+		double dist2 = ai_ship_travel_towards(o,
+			disabled_ship->x, disabled_ship->y, disabled_ship->z);
+		if (dist2 < (TOWING_PICKUP_DIST * TOWING_PICKUP_DIST)) {
+			o->tsd.ship.ai[n].u.tow_ship.ship_connected = 1;
+			snis_queue_add_sound(HULL_CREAK_0 + (snis_randn(1000) % NHULL_CREAK_SOUNDS),
+							ROLE_SOUNDSERVER, disabled_ship->id);
+			snis_queue_add_text_to_speech("Mantis tow ship has attached.",
+							ROLE_TEXT_TO_SPEECH, disabled_ship->id);
+			return;
+		}
+	}
+}
+
 static void ai_mining_mode_brain(struct snis_entity *o)
 {
 	int n = o->tsd.ship.nai_entries - 1;
@@ -3802,6 +3890,9 @@ static void ai_brain(struct snis_entity *o)
 	case AI_MODE_MINING_BOT:
 		ai_mining_mode_brain(o);
 		break;
+	case AI_MODE_TOW_SHIP:
+		ai_tow_ship_mode_brain(o);
+		break;
 	default:
 		break;
 	}
@@ -3951,6 +4042,7 @@ static void ship_move(struct snis_entity *o)
 
 	update_ship_position_and_velocity(o);
 	update_ship_orientation(o);
+	update_towed_ship(o);
 	o->timestamp = universe_timestamp;
 
 	o->tsd.ship.phaser_charge = update_phaser_banks(o->tsd.ship.phaser_charge, 200, 100);
@@ -5233,6 +5325,11 @@ static void player_collision_detection(void *player, void *object)
 		}
 	}
 
+	/* Prevent tow ship from bumping us */
+	if (t->type == OBJTYPE_SHIP2 && t->tsd.ship.shiptype == SHIP_CLASS_MANTIS) {
+		return;
+	}
+
 	dist2 = dist3dsqrd(o->x - t->x, o->y - t->y, o->z - t->z);
 	if (t->type == OBJTYPE_CARGO_CONTAINER && dist2 < 150.0 * 150.0) {
 			scoop_up_cargo(o, t);
@@ -5681,9 +5778,11 @@ static void player_move(struct snis_entity *o)
 	int phaser_chargerate, current_phaserbank;
 	float orientation_damping, velocity_damping;
 
-	if (o->tsd.ship.damage.shield_damage > 200) {
-		if (universe_timestamp % (10 * 5) == 0)
-			snis_queue_add_sound(HULL_BREACH_IMMINENT, ROLE_SOUNDSERVER, o->id);
+	if (o->tsd.ship.damage.shield_damage > 100) {
+		if (o->tsd.ship.damage.shield_damage > 200) {
+			if (universe_timestamp % (10 * 5) == 0)
+				snis_queue_add_sound(HULL_BREACH_IMMINENT, ROLE_SOUNDSERVER, o->id);
+		}
 		if (snis_randn(8000) < 100 + o->tsd.ship.damage.shield_damage)
 			snis_queue_add_sound(HULL_CREAK_0 + (snis_randn(1000) % NHULL_CREAK_SOUNDS),
 							ROLE_SOUNDSERVER, o->id);
@@ -6469,6 +6568,7 @@ static void init_player(struct snis_entity *o, int clear_cargo_bay, float *charg
 	o->tsd.ship.ncargo_bays = 8;
 	o->tsd.ship.passenger_berths = 2;
 	o->tsd.ship.mining_bots = 1;
+	o->tsd.ship.emf_detector = 0;
 	o->tsd.ship.orbiting_object_id = 0xffffffff;
 	o->tsd.ship.nav_damping_suppression = 0.0;
 	quat_init_axis(&o->tsd.ship.computer_desired_orientation, 0, 1, 0, 0);
@@ -6665,6 +6765,8 @@ static int add_ship(int faction, int auto_respawn)
 	memset(go[i].tsd.ship.cargo, 0, sizeof(go[i].tsd.ship.cargo));
 	if (faction >= 0 && faction < nfactions())
 		go[i].sdata.faction = faction;
+	if (st == SHIP_CLASS_MANTIS) /* Ensure all Mantis tow ships are neutral faction */
+		faction = 0;
 	ship_name(mt, go[i].sdata.name, sizeof(go[i].sdata.name));
 	uppercase(go[i].sdata.name);
 	return i;
@@ -9459,7 +9561,8 @@ static void meta_comms_channel(char *name, struct game_client *c, char *txt)
 		bridgelist[c->bridge].npcbot.special_bot = NULL;
 	}
 
-	snprintf(msg, sizeof(msg), "TX/RX INITIATED ON CHANNEL %u", newchannel);
+	/* Note: client snoops this channel change message. */
+	snprintf(msg, sizeof(msg), "%s%u", COMMS_CHANNEL_CHANGE_MSG, newchannel);
 	send_comms_packet(name, newchannel, msg);
 }
 
@@ -10277,6 +10380,95 @@ void npc_menu_item_warp_gate_tickets(struct npc_menu_item *item,
 	botstate->special_bot(o, bridge, npcname, "");
 }
 
+void push_tow_mode(struct snis_entity *tow_ship, uint32_t disabled_ship,
+					uint32_t starbase_dispatcher)
+{
+	if (!tow_ship)
+		return;
+	if (tow_ship->type != OBJTYPE_SHIP2)
+		return;
+	if (tow_ship->tsd.ship.shiptype != SHIP_CLASS_MANTIS)
+		return;
+
+	/* Drop everything and go tow the disabled ship */
+	tow_ship->tsd.ship.nai_entries = 1;
+	tow_ship->tsd.ship.ai[0].ai_mode = AI_MODE_TOW_SHIP;
+	tow_ship->tsd.ship.ai[0].u.tow_ship.disabled_ship = disabled_ship;
+	tow_ship->tsd.ship.ai[0].u.tow_ship.starbase_dispatcher = starbase_dispatcher;
+	tow_ship->tsd.ship.ai[0].u.tow_ship.ship_connected = 0;
+}
+
+void npc_menu_item_towing_service(struct npc_menu_item *item,
+				char *npcname, struct npc_bot_state *botstate)
+{
+	char msg[100];
+	struct snis_entity *o;
+	struct bridge_data *b = container_of(botstate, struct bridge_data, npcbot);
+	int i, bridge = b - bridgelist;
+	int closest_tow_ship;
+	double closest_tow_ship_distance;
+	uint32_t channel = bridgelist[bridge].npcbot.channel;
+	float charges = 5000.0;
+
+	pthread_mutex_lock(&universe_mutex);
+	i = lookup_by_id(b->shipid);
+	if (i < 0)
+		goto out;
+	o = &go[i];
+
+	closest_tow_ship = -1;
+	for (i = 0; i <= snis_object_pool_highest_object(pool); i++) {
+		if (!go[i].alive)
+			continue;
+		if (go[i].type == OBJTYPE_SHIP2 && go[i].tsd.ship.shiptype == SHIP_CLASS_MANTIS) {
+			/* Check to see if this tow ship is already en route someplace */
+			int n = go[i].tsd.ship.nai_entries - 1;
+			if (go[i].tsd.ship.ai[n].ai_mode == AI_MODE_TOW_SHIP) {
+				/* Check to see if there's a tow ship already en route to this player */
+				if (go[i].tsd.ship.ai[n].u.tow_ship.disabled_ship == b->shipid) {
+					snprintf(msg, sizeof(msg),
+						"%s, THE MANTIS TOW SHIP %s IS ALREADY EN ROUTE TO YOUR LOCATION.",
+						b->shipname, go[i].sdata.name);
+					send_comms_packet(npcname, channel, msg);
+					goto out;
+				}
+			} else {
+				/* Tow ship is not busy, see how far away */
+				double dx, dy, dz, dist;
+				dx = o->x - go[i].x;
+				dy = o->y - go[i].y;
+				dz = o->z - go[i].z;
+				dist = sqrt(dx * dx + dy * dy + dz * dz);
+				if (closest_tow_ship == -1 || dist < closest_tow_ship_distance) {
+					closest_tow_ship = i;
+					closest_tow_ship_distance = dist;
+				}
+			}
+		}
+	}
+
+	if (closest_tow_ship == -1) { /* No tow ships, or all tow ships busy */
+		snprintf(msg, sizeof(msg), "%s, SORRY, ALL MANTIS TOW SHPS ARE CURRENTLY BUSY.",
+				b->shipname);
+		send_comms_packet(npcname, channel, msg);
+		goto out;
+	}
+
+	/* Send the tow ship to the player */
+	push_tow_mode(&go[closest_tow_ship], o->id, botstate->object_id);
+	snprintf(msg, sizeof(msg), "%s, THE MANTIS TOW SHIP %s HAS BEEN DISPATCHED TO YOUR LOCATION",
+			b->shipname, go[closest_tow_ship].sdata.name);
+	send_comms_packet(npcname, channel, msg);
+	snprintf(msg, sizeof(msg), "%s, YOUR ACCOUNT HAS BEEN BILLED $%5.2f\n",
+		b->shipname, charges);
+	o->tsd.ship.wallet -= charges;
+	send_comms_packet(npcname, channel, msg);
+
+out:
+	pthread_mutex_unlock(&universe_mutex);
+	return;
+}
+
 static void send_npc_menu(char *npcname,  int bridge)
 {
 	int i;
@@ -10761,7 +10953,8 @@ channels_maxxed:
 		bridgelist[c->bridge].npcbot.channel = channel[0];
 		bridgelist[c->bridge].npcbot.current_menu = starbase_main_menu;
 		bridgelist[c->bridge].npcbot.special_bot = NULL;
-		snprintf(msg, sizeof(msg), "TX/RX INITIATED ON CHANNEL %u", channel[0]);
+		/* Note: client snoops this channel change message */
+		snprintf(msg, sizeof(msg), "%s%u", COMMS_CHANNEL_CHANGE_MSG, channel[0]);
 		send_comms_packet(name, channel[0], msg);
 		send_to_npcbot(c->bridge, name, msg);
 	} else {
@@ -14433,7 +14626,7 @@ static void send_update_ship_packet(struct game_client *c,
 	packed_buffer_append(pb, "bwwhSSS", opcode, o->id, o->timestamp, o->alive,
 			o->x, (int32_t) UNIVERSE_DIM, o->y, (int32_t) UNIVERSE_DIM,
 			o->z, (int32_t) UNIVERSE_DIM);
-	packed_buffer_append(pb, "RRRwwRRRbbbwbbbbbbbbbbbbbwQQQbb",
+	packed_buffer_append(pb, "RRRwwRRRbbbwbbbbbbbbbbbbbwQQQbbb",
 			o->tsd.ship.yaw_velocity,
 			o->tsd.ship.pitch_velocity,
 			o->tsd.ship.roll_velocity,
@@ -14453,8 +14646,12 @@ static void send_update_ship_packet(struct game_client *c,
 			&o->tsd.ship.sciball_orientation.vec[0],
 			&o->tsd.ship.weap_orientation.vec[0],
 			o->tsd.ship.in_secure_area,
-			o->tsd.ship.docking_magnets);
+			o->tsd.ship.docking_magnets,
+			o->tsd.ship.emf_detector);
 	pb_queue_to_client(c, pb);
+
+	/* now that we've sent the accumulated value, clear the emf_detector to the noise floor */
+	o->tsd.ship.emf_detector = snis_randn(50);
 }
 
 static void send_update_damcon_obj_packet(struct game_client *c,
@@ -17220,6 +17417,14 @@ no_understand:
 	queue_add_text_to_speech(c, "I do not understand your request.");
 }
 
+static void nl_help(void *context, int argc, char *argv[], int pos[],
+			union snis_nl_extra_data extra_data[])
+{
+	struct game_client *c = context;
+
+	queue_add_text_to_speech(c, "Sure.  Just ask me what you would like me to do in plain English.");
+}
+
 static void nl_target_n(void *context, int argc, char *argv[], int pos[], union snis_nl_extra_data extra_data[])
 {
 	struct game_client *c = context;
@@ -17853,6 +18058,7 @@ static void init_dictionary(void)
 	snis_nl_add_dictionary_verb("short range",	"short range scan",	"", nl_shortlong_range_scan);
 	snis_nl_add_dictionary_verb("details",		"details",		"", nl_shortlong_range_scan);
 	snis_nl_add_dictionary_verb("detail",		"details",		"", nl_shortlong_range_scan);
+	snis_nl_add_dictionary_verb("help",		"help",			"", nl_help);
 
 	snis_nl_add_dictionary_word("drive",		"drive",	POS_NOUN);
 	snis_nl_add_dictionary_word("system",		"system",	POS_NOUN);
