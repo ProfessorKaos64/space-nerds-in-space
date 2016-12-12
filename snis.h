@@ -46,6 +46,7 @@
 #define CRASH_DIST2 (40.0 * 40.0)
 #define TOWING_DROP_DIST (500.0)
 #define TOWING_PICKUP_DIST (40.0)
+#define TOW_SHIP_CHARGE (5000.0)
 
 #define MAXGAMEOBJS 5000
 #define MAXSPARKS 5000
@@ -69,6 +70,8 @@
 #define NWARPGATES 10
 
 #define NPLANETS 6
+#define NATMOSPHERE_TYPES 100
+#define ATMOSPHERE_TYPE_GEN_SEED 31415927
 #define MIN_PLANET_SEPARATION (UNIVERSE_DIM / 10.0)
 #define NBASES (NPLANETS + 10)
 #define COMMODITIES_PER_BASE 10
@@ -580,6 +583,7 @@ struct planet_data {
 	uint8_t solarsystem_planet_type;
 	uint8_t ring;
 	uint8_t atmosphere_r, atmosphere_g, atmosphere_b;
+	uint16_t atmosphere_type;
 	double atmosphere_scale;
 	uint16_t contraband;
 	struct entity *atmosphere;

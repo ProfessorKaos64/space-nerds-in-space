@@ -361,7 +361,7 @@ COMMONOBJS=mathutils.o snis_alloc.o snis_socket_io.o snis_marshal.o \
 		bline.o shield_strength.o stacktrace.o snis_ship_type.o \
 		snis_faction.o mtwist.o names.o infinite-taunt.o snis_damcon_systems.o \
 		string-utils.o c-is-the-locale.o starbase_metadata.o arbitrary_spin.o \
-		snis_hash.o
+		snis_hash.o planetary_atmosphere.o
 SERVEROBJS=${COMMONOBJS} snis_server.o starbase-comms.o \
 		power-model.o quat.o vec4.o matrix.o snis_event_callback.o space-part.o fleet.o \
 		commodities.o docking_port.o elastic_collision.o snis_nl.o spelled_numbers.o \
@@ -373,7 +373,8 @@ MULTIVERSEOBJS=snis_multiverse.o snis_marshal.o snis_socket_io.o mathutils.o mtw
 COMMONCLIENTOBJS=${COMMONOBJS} ${OGGOBJ} ${SNDOBJS} snis_ui_element.o snis_font.o snis_text_input.o \
 	snis_typeface.o snis_gauge.o snis_button.o snis_label.o snis_sliders.o snis_text_window.o \
 	snis_strip_chart.o mesh.o material.o stl_parser.o entity.o matrix.o my_point.o liang-barsky.o joystick.o \
-	quat.o vec4.o thrust_attachment.o docking_port.o ui_colors.o snis_keyboard.o solarsystem_config.o
+	quat.o vec4.o thrust_attachment.o docking_port.o ui_colors.o snis_keyboard.o solarsystem_config.o \
+	pronunciation.o
 
 CLIENTOBJS=${COMMONCLIENTOBJS} shader.o graph_dev_opengl.o opengl_cap.o snis_graph.o snis_client.o
 
@@ -405,10 +406,10 @@ MULTIVERSELIBS=-Lssgl -lssglclient ${LRTLIB} -ldl -lm -lcrypto -lssl
 #
 
 
-PROGS=snis_server snis_client snis_limited_client mesh_viewer snis_multiverse
+PROGS=snis_server snis_client snis_limited_client snis_multiverse
 BINPROGS=bin/ssgl_server bin/snis_server bin/snis_client bin/snis_limited_client bin/text_to_speech.sh \
 		bin/snis_multiverse
-UTILPROGS=util/mask_clouds util/cloud-mask-normalmap
+UTILPROGS=util/mask_clouds util/cloud-mask-normalmap mesh_viewer
 
 # model directory
 MD=${ASSETSSRCDIR}/models
@@ -508,9 +509,11 @@ GGOBJS=mtwist.o mathutils.o open-simplex-noise.o quat.o png_utils.o
 GGLIBS=-lm ${LRTLIB} -lpng
 GGLINK=$(CC) ${MYCFLAGS} -o $@ ${GTKCFLAGS} gaseous-giganticus.o ${GGOBJS} ${GGLIBS} && $(ECHO) '  LINK' $@
 
-all:	${COMMONOBJS} ${SERVEROBJS} ${MULTIVERSEOBJS} ${CLIENTOBJS} ${LIMCLIENTOBJS} ${PROGS} ${MODELS} ${BINPROGS} ${SCAD_PARAMS_FILES} ${DOCKING_PORT_FILES} ${UTILPROGS}
+all:	${COMMONOBJS} ${SERVEROBJS} ${MULTIVERSEOBJS} ${CLIENTOBJS} ${LIMCLIENTOBJS} ${PROGS} ${MODELS} ${BINPROGS} ${SCAD_PARAMS_FILES} ${DOCKING_PORT_FILES}
 
 build:	all
+
+utils:	${UTILPROGS}
 
 graph_dev_opengl.o : graph_dev_opengl.c Makefile
 	$(Q)$(GLEXTCOMPILE)
@@ -643,6 +646,9 @@ mathutils.o:	mathutils.c Makefile
 	$(Q)$(COMPILE)
 
 crater.o:	crater.c crater.h Makefile
+	$(Q)$(COMPILE)
+
+test_crater.o:	test_crater.c
 	$(Q)$(COMPILE)
 
 snis_alloc.o:	snis_alloc.c Makefile
@@ -815,6 +821,18 @@ commodities.o:	commodities.c Makefile
 string-utils.o:	string-utils.c Makefile
 	$(Q)$(COMPILE)
 
+pronunciation.o:	pronunciation.c Makefile
+	$(Q)$(COMPILE)
+
+test_pronunciation:	pronunciation.c Makefile
+	gcc -DTEST_PRONUNCIATION_FIXUP -o test_pronunciation pronunciation.c
+
+planetary_atmosphere.o:	planetary_atmosphere.c Makefile
+	$(Q)$(COMPILE)
+
+test_planetary_atmosphere:	planetary_atmosphere.c mtwist.o Makefile
+	gcc -g -DTEST_PLANETARY_ATMOSPHERE_PROFILE -o test_planetary_atmosphere planetary_atmosphere.c mtwist.o
+
 key_value_parser.o:	key_value_parser.c key_value_parser.h Makefile
 	$(Q)$(COMPILE)
 
@@ -851,7 +869,8 @@ ${SSGL}:
 
 mostly-clean:
 	rm -f ${SERVEROBJS} ${CLIENTOBJS} ${LIMCLIENTOBJS} ${SDLCLIENTOBJS} ${PROGS} ${SSGL} \
-	${BINPROGS} stl_parser snis_limited_graph.c snis_limited_client.c test-space-partition
+	${BINPROGS} ${UTILPROGS} stl_parser snis_limited_graph.c snis_limited_client.c \
+	test-space-partition
 	( cd ssgl; ${MAKE} clean )
 
 test-marshal:	snis_marshal.c stacktrace.o Makefile
@@ -892,6 +911,9 @@ test:	test-matrix test-space-partition test-marshal test-quat test-fleet test-mt
 
 test_solarsystem_config:	test_solarsystem_config.c solarsystem_config.o string-utils.o
 	gcc -o $@ $< solarsystem_config.o string-utils.o
+
+test_crater:	test_crater.o crater.o mathutils.o mtwist.o png_utils.o png_utils.o
+	gcc -o $@ ${PNGCFLAGS} test_crater.o crater.o mtwist.o png_utils.o ${PNGLIBS} mathutils.o -lm
 
 snis_client.6.gz:	snis_client.6
 	gzip -9 - < snis_client.6 > snis_client.6.gz
@@ -990,7 +1012,7 @@ uninstall:
 	${UPDATE_DESKTOP}
 
 clean:	mostly-clean
-	rm -f ${MODELS} test_marshal
+	rm -f ${MODELS} test_marshal test_crater
 
 depend:
 	rm -f Makefile.depend

@@ -95,6 +95,7 @@
 #include "key_value_parser.h"
 #include "a_star.h"
 #include "nonuniform_random_sampler.h"
+#include "planetary_atmosphere.h"
 
 #include "snis_entity_key_value_specification.h"
 
@@ -2228,6 +2229,8 @@ static void pop_ai_stack(struct snis_entity *o)
 	if (o->tsd.ship.ai[n].ai_mode == AI_MODE_ATTACK)
 		calculate_attack_vector(o, MIN_COMBAT_ATTACK_DIST,
 						MAX_COMBAT_ATTACK_DIST);
+	if (o->tsd.ship.ai[n].ai_mode == AI_MODE_TOW_SHIP)
+		o->tsd.ship.ai[n].u.tow_ship.ship_connected = 0;
 }
 
 static void pop_ai_attack_mode(struct snis_entity *o)
@@ -2844,22 +2847,57 @@ static void update_ship_orientation(struct snis_entity *o)
 	quat_from_u2v(&o->orientation, &right, &current, &up);
 }
 
-static void update_towed_ship(struct snis_entity *o)
+/* Returns 0 if not being towed, the id of the tow ship otherwise */
+static uint32_t is_being_towed(struct snis_entity *o)
+{
+	int i, j, n;
+
+	for (i = 0; i <= snis_object_pool_highest_object(pool); i++) {
+		if (go[i].type != OBJTYPE_SHIP2)
+			continue;
+		if (!go[i].alive)
+			continue;
+		n = go[i].tsd.ship.nai_entries - 1;
+		for (j = n; n >= 0; n--) {
+			if (go[i].tsd.ship.ai[j].ai_mode != AI_MODE_TOW_SHIP)
+				continue;
+			if (go[i].tsd.ship.ai[j].u.tow_ship.ship_connected &&
+				go[i].tsd.ship.ai[n].u.tow_ship.disabled_ship == o->id)
+					return go[i].id;
+		}
+	}
+	return 0;
+}
+
+/* Returns 0 if ship is not towing anything, the object ID of the thing it's towing otherwise */
+static uint32_t ship_is_towing(struct snis_entity *o)
 {
 	int i, n;
+	if (o->type != OBJTYPE_SHIP2)
+		return 0;
+	n = o->tsd.ship.nai_entries - 1;
+	for (i = n; n >= 0; n--) {
+		if (o->tsd.ship.ai[i].ai_mode != AI_MODE_TOW_SHIP)
+			continue;
+		if (o->tsd.ship.ai[i].u.tow_ship.ship_connected)
+			return o->tsd.ship.ai[n].u.tow_ship.disabled_ship;
+	}
+	return 0;
+}
+
+static void update_towed_ship(struct snis_entity *o)
+{
+	int i;
 	struct snis_entity *disabled_ship;
+	uint32_t disabled_ship_id;
 	union vec3 towing_offset = { { 0.0, -20.0, 0.0 } };
 
 	if (o->tsd.ship.shiptype != SHIP_CLASS_MANTIS)
 		return;
-	n = o->tsd.ship.nai_entries - 1;
-	if (n < 0)
+	disabled_ship_id = ship_is_towing(o);
+	if (!disabled_ship_id)
 		return;
-	if (o->tsd.ship.ai[n].ai_mode != AI_MODE_TOW_SHIP)
-		return;
-	if (!o->tsd.ship.ai[n].u.tow_ship.ship_connected)
-		return;
-	i = lookup_by_id(o->tsd.ship.ai[n].u.tow_ship.disabled_ship);
+	i = lookup_by_id(disabled_ship_id);
 	if (i < 0)
 		return;
 	disabled_ship = &go[i];
@@ -2899,43 +2937,54 @@ static void check_for_nearby_targets(struct snis_entity *o)
 	}
 }
 
-/* check if a planet is in the way of a shot */
-static int planet_in_the_way(struct snis_entity *origin,
-				struct snis_entity *target)
+/* check if a planet is between two points */
+static struct snis_entity *planet_between_points(union vec3 *ray_origin, union vec3 *target)
 {
 	int i;
-	union vec3 ray_origin, ray_direction, sphere_origin;
-	const float radius = 800.0; /* FIXME: nuke this hardcoded crap */
+	union vec3 ray_direction, sphere_origin;
 	float target_dist;
 	float planet_dist;
 
-	ray_origin.v.x = origin->x;
-	ray_origin.v.y = origin->y;
-	ray_origin.v.z = origin->z;
-
-	ray_direction.v.x = target->x - ray_origin.v.x;
-	ray_direction.v.y = target->y - ray_origin.v.y;
-	ray_direction.v.z = target->z - ray_origin.v.z;
-
+	vec3_sub(&ray_direction, target, ray_origin);
 	target_dist = vec3_magnitude(&ray_direction);
 	vec3_normalize_self(&ray_direction);
 
 	for (i = 0; i <= snis_object_pool_highest_object(pool); i++) {
+		if (!go[i].alive)
+			continue;
 		if (go[i].type != OBJTYPE_PLANET)
 			continue;
 		sphere_origin.v.x = go[i].x;
 		sphere_origin.v.y = go[i].y;
 		sphere_origin.v.z = go[i].z;
-		if (!ray_intersects_sphere(&ray_origin, &ray_direction,
-						&sphere_origin, radius))
+		if (!ray_intersects_sphere(ray_origin, &ray_direction,
+						&sphere_origin,
+						go[i].tsd.planet.radius * 1.05))
 			continue;
-		planet_dist = dist3d(sphere_origin.v.x - ray_origin.v.x,
-					sphere_origin.v.y - ray_origin.v.y,
-					sphere_origin.v.z - ray_origin.v.z);
+		planet_dist = dist3d(sphere_origin.v.x - ray_origin->v.x,
+					sphere_origin.v.y - ray_origin->v.y,
+					sphere_origin.v.z - ray_origin->v.z);
 		if (planet_dist < target_dist) /* planet blocks... */
-			return 1;
+			return &go[i];
 	}
-	return 0; /* no planets blocking */
+	return NULL; /* no planets blocking */
+}
+
+/* check if a planet is between two objects */
+static struct snis_entity *planet_between_objs(struct snis_entity *origin,
+				struct snis_entity *target)
+{
+	union vec3 from, to;
+
+	from.v.x = origin->x;
+	from.v.y = origin->y;
+	from.v.z = origin->z;
+
+	to.v.x = target->x;
+	to.v.y = target->y;
+	to.v.z = target->z;
+
+	return planet_between_points(&from, &to);
 }
 
 static float calculate_threat_level(struct snis_entity *o)
@@ -3090,7 +3139,7 @@ static void ai_attack_mode_brain(struct snis_entity *o)
 			double dist, flight_time, tx, ty, tz, vx, vy, vz;
 			/* int inside_nebula = in_nebula(o->x, o->y) || in_nebula(v->x, v->y); */
 
-			if (v->type == OBJTYPE_PLANET || !planet_in_the_way(o, v)) {
+			if (v->type == OBJTYPE_PLANET || !planet_between_objs(o, v)) {
 				dist = hypot3d(v->x - o->x, v->y - o->y, v->z - o->z);
 				flight_time = dist / TORPEDO_VELOCITY;
 				tx = v->x + (v->vx * flight_time);
@@ -3111,7 +3160,7 @@ static void ai_attack_mode_brain(struct snis_entity *o)
 			if (snis_randn(1000) < 300 + imacop * 200 &&
 				o->tsd.ship.next_laser_time <= universe_timestamp &&
 				ship_type[o->tsd.ship.shiptype].has_lasers) {
-				if (v->type == OBJTYPE_PLANET || !planet_in_the_way(o, v)) {
+				if (v->type == OBJTYPE_PLANET || !planet_between_objs(o, v)) {
 					o->tsd.ship.next_laser_time = universe_timestamp +
 						ENEMY_LASER_FIRE_INTERVAL;
 					add_laserbeam(o->id, v->id, LASERBEAM_DURATION);
@@ -3322,15 +3371,17 @@ static void ai_add_ship_movement_variety(struct snis_entity *o,
 			float destx, float desty, float destz, float fractional_distance)
 {
 	union vec3 v, vn;
+	union quat q;
 
+	random_quat(&q);
 	v.v.x = destx - o->x;
 	v.v.y = desty - o->y;
 	v.v.z = destz - o->z;
-	vec3_normalize(&vn, &v);
 	vec3_mul(&v, &vn, fractional_distance);
-	v.v.x += (float) snis_randn((int) (fractional_distance / 15.0f));
-	v.v.y += (float) snis_randn((int) (fractional_distance / 15.0f));
-	v.v.z += (float) snis_randn((int) (fractional_distance / 15.0f));
+	quat_rot_vec_self(&v, &q);
+	v.v.x += vn.v.x;
+	v.v.y += vn.v.y;
+	v.v.z += vn.v.z;
 
 	o->tsd.ship.dox = v.v.x + o->x;
 	o->tsd.ship.doy = v.v.y + o->y;
@@ -3361,6 +3412,67 @@ static float ai_ship_travel_towards(struct snis_entity *o,
 {
 	double maxv = ship_type[o->tsd.ship.shiptype].max_speed;
 	o->tsd.ship.desired_velocity = maxv;
+	int warproll = 10000;
+
+	union vec3 startv, endv;
+	struct snis_entity *planet;
+
+	startv.v.x = o->x;
+	startv.v.y = o->y;
+	startv.v.z = o->z;
+	endv.v.x = destx;
+	endv.v.y = desty;
+	endv.v.z = destz;
+
+	/* Check if there's a planet in the way and try to avoid it. */
+	planet = planet_between_points(&startv, &endv);
+	if (planet) {
+		double planet_distance;
+		double dx, dy, dz;
+		dx = planet->x - o->x;
+		dy = planet->y - o->y;
+		dz = planet->z - o->z;
+
+		/* Don't bother trying to avoid the planet unless it is close */
+		planet_distance = sqrt(dx * dx + dy * dy + dz + dz);
+		if (planet_distance < 2.0 * planet->tsd.planet.radius) {
+			union vec3 planetv, planet_to_dest, planet_to_ship;
+			union quat ship_to_dest;
+			double angle;
+			planetv.v.x = planet->x;
+			planetv.v.y = planet->y;
+			planetv.v.z = planet->z;
+
+			/*
+			 * Find vector from planet to ship, and from planet to
+			 * destination and quaterion to rotate between these.
+			 * vectors.
+			 */
+			vec3_sub(&planet_to_dest, &endv, &planetv);
+			vec3_sub(&planet_to_ship, &startv, &planetv);
+			vec3_normalize_self(&planet_to_dest);
+			vec3_normalize_self(&planet_to_ship);
+			quat_from_u2v(&ship_to_dest, &planet_to_ship, &planet_to_dest, NULL);
+
+			/* Find a path along the great circle around planet from ship
+			 * to destination at 1.5 * radius of planet.  First dest point
+			 * on this path is (say) 5% around the curve from where the ship
+			 * is now.
+			 */
+			vec3_mul_self(&planet_to_ship, planet->tsd.planet.radius * 1.5);
+
+			/* Find the 5% of the angle of the quaternion, and change
+			 * the quaternion to the new angle. */
+			angle = 0.05f * 2.0f * acosf(ship_to_dest.v.w);
+			ship_to_dest.v.w = cos(0.5f * angle);
+
+			/* Find our new intermediate destination, 5% along our great circle. */
+			quat_rot_vec_self(&planet_to_ship, &ship_to_dest);
+			destx = planet->x + planet_to_ship.v.x;
+			desty = planet->y + planet_to_ship.v.y;
+			destz = planet->z + planet_to_ship.v.z;
+		}
+	}
 
 	double dist2 = dist3dsqrd(o->x - destx, o->y - desty, o->z - destz);
 	if (dist2 > 2000.0 * 2000.0) {
@@ -3368,9 +3480,24 @@ static float ai_ship_travel_towards(struct snis_entity *o,
 				o->y - o->tsd.ship.doy, o->z - o->tsd.ship.doz);
 		/* give ships some variety in movement */
 		if (((universe_timestamp + o->id) & 0x3ff) == 0 || ld < 50.0 * 50.0)
-			ai_add_ship_movement_variety(o, destx, desty, destz, 1500.0f);
+			ai_add_ship_movement_variety(o, destx, desty, destz, 0.05);
+
+		/* Check that current destination isn't too far from desired destination,
+		 * If we have just set a new destination, we want it to take effect right
+		 * away, not just within the (possibly) 400 secs of the above variety
+		 * injecting code.
+		 */
+		double dest_discrepancy = dist3dsqrd(
+					o->tsd.ship.dox - destx,
+					o->tsd.ship.doy - desty,
+					o->tsd.ship.doz - destz);
+		if (dest_discrepancy > 0.05 * dist2 * 0.05 * dist2) {
+			o->tsd.ship.dox = destx;
+			o->tsd.ship.doy = desty;
+			o->tsd.ship.doz = destz;
+		}
 		/* sometimes just warp if it's too far... */
-		if (snis_randn(10000) < ship_type[o->tsd.ship.shiptype].warpchance)
+		if (snis_randn(warproll) < ship_type[o->tsd.ship.shiptype].warpchance)
 			ai_ship_warp_to(o, destx, desty, destz);
 	} else {
 		o->tsd.ship.dox = destx;
@@ -3687,6 +3814,15 @@ static void ai_mining_mode_mine_asteroid(struct snis_entity *o, struct ai_mining
 	ai->mode = MINING_MODE_RETURN_TO_PARENT;
 }
 
+static void disconnect_from_tow_ship(struct snis_entity *towing_ship,
+		__attribute__((unused)) struct snis_entity *towed_ship)
+{
+	pop_ai_stack(towing_ship);
+	snis_queue_add_text_to_speech("Disconnected from mantis tow ship.",
+					ROLE_TEXT_TO_SPEECH, towed_ship->id);
+	towed_ship->tsd.ship.wallet -= TOW_SHIP_CHARGE; /* Charge player */
+}
+
 static void ai_tow_ship_mode_brain(struct snis_entity *o)
 {
 	int i, n;
@@ -3720,7 +3856,7 @@ static void ai_tow_ship_mode_brain(struct snis_entity *o)
 			if (disabled_ship->tsd.ship.fuel < FUEL_CONSUMPTION_UNIT * 30 * 60)
 				disabled_ship->tsd.ship.fuel = FUEL_CONSUMPTION_UNIT * 30 * 60;
 			/* We're done */
-			pop_ai_stack(o);
+			disconnect_from_tow_ship(o, disabled_ship);
 			return;
 		}
 	} else {
@@ -3732,6 +3868,8 @@ static void ai_tow_ship_mode_brain(struct snis_entity *o)
 							ROLE_SOUNDSERVER, disabled_ship->id);
 			snis_queue_add_text_to_speech("Mantis tow ship has attached.",
 							ROLE_TEXT_TO_SPEECH, disabled_ship->id);
+			dist2 = ai_ship_travel_towards(o,
+				starbase_dispatcher->x, starbase_dispatcher->y, starbase_dispatcher->z);
 			return;
 		}
 	}
@@ -3938,6 +4076,11 @@ static void ship_collision_avoidance(void *context, void *entity)
 	if (obstacle->type == OBJTYPE_SPARK) /* no point trying to avoid */
 		return;
 
+	/* Tow ship should not try to avoid thing it's towing */
+	if ((obstacle->type == OBJTYPE_SHIP2 || obstacle->type == OBJTYPE_SHIP1) &&
+		ship_is_towing(o) == obstacle->id)
+		return;
+
 	/* hmm, server has no idea about meshes... */
 	d = dist3dsqrd(o->x - obstacle->x, o->y - obstacle->y, o->z - obstacle->z);
 
@@ -3946,7 +4089,7 @@ static void ship_collision_avoidance(void *context, void *entity)
 			o->alive = 0;
 			return;
 		}
-		d -= (obstacle->tsd.planet.radius * 1.2 * obstacle->tsd.planet.radius * 1.2);
+		d -= (obstacle->tsd.planet.radius * 1.3 * obstacle->tsd.planet.radius * 1.3);
 		if (d <= 0.0)
 			d = 1.0;
 	}
@@ -6106,7 +6249,7 @@ static void starbase_move(struct snis_entity *o)
 			continue;
 		if (snis_randn(1000) < STARBASE_FIRE_CHANCE)
 			continue;
-		if (planet_in_the_way(o, a))
+		if (planet_between_objs(o, a))
 			continue;
 		if (snis_randn(100) < 30 &&
 			o->tsd.starbase.next_torpedo_time <= universe_timestamp) {
@@ -8004,6 +8147,23 @@ static int has_atmosphere(int i)
 	return (strcmp(solarsystem_assets->planet_type[i], "rocky") != 0);
 }
 
+static int select_atmospheric_profile(struct snis_entity *planet)
+{
+	enum planetary_atmosphere_type atm_type;
+	int planet_type = planet->tsd.planet.solarsystem_planet_type;
+	int atm_instance = snis_randn(NATMOSPHERE_TYPES);
+
+	if (strcmp(solarsystem_assets->planet_type[planet_type], "rocky") == 0)
+		atm_type = marslike_atmosphere_type;
+	else if (strcmp(solarsystem_assets->planet_type[planet_type], "earth-like") == 0)
+		atm_type = earthlike_atmosphere_type;
+	else if (strcmp(solarsystem_assets->planet_type[planet_type], "gas-giant") == 0)
+		atm_type = gas_giant_atmosphere_type;
+	else
+		atm_type = gas_giant_atmosphere_type;
+	return random_planetary_atmosphere_by_type(NULL, atm_type, atm_instance);
+}
+
 static int add_planet(double x, double y, double z, float radius, uint8_t security)
 {
 	int i;
@@ -8030,6 +8190,7 @@ static int add_planet(double x, double y, double z, float radius, uint8_t securi
 	go[i].tsd.planet.ring = snis_randn(100) < 50;
 	go[i].tsd.planet.solarsystem_planet_type = (uint8_t) (go[i].id % solarsystem_assets->nplanet_textures);
 	go[i].tsd.planet.has_atmosphere = has_atmosphere(go[i].tsd.planet.solarsystem_planet_type);
+	go[i].tsd.planet.atmosphere_type = select_atmospheric_profile(&go[i]);
 	go[i].tsd.planet.ring_selector = snis_randn(256);
 	go[i].tsd.planet.security = security;
 	go[i].tsd.planet.contraband = choose_contraband();
@@ -8375,6 +8536,7 @@ static void add_passengers(void)
 static void make_universe(void)
 {
 	initialize_random_orientations_and_spins(COMMON_MTWIST_SEED);
+	planetary_atmosphere_model_init_models(ATMOSPHERE_TYPE_GEN_SEED, NATMOSPHERE_TYPES);
 	pthread_mutex_lock(&universe_mutex);
 	snis_object_pool_setup(&pool, MAXGAMEOBJS);
 
@@ -10408,7 +10570,6 @@ void npc_menu_item_towing_service(struct npc_menu_item *item,
 	int closest_tow_ship;
 	double closest_tow_ship_distance;
 	uint32_t channel = bridgelist[bridge].npcbot.channel;
-	float charges = 5000.0;
 
 	pthread_mutex_lock(&universe_mutex);
 	i = lookup_by_id(b->shipid);
@@ -10427,7 +10588,7 @@ void npc_menu_item_towing_service(struct npc_menu_item *item,
 				/* Check to see if there's a tow ship already en route to this player */
 				if (go[i].tsd.ship.ai[n].u.tow_ship.disabled_ship == b->shipid) {
 					snprintf(msg, sizeof(msg),
-						"%s, THE MANTIS TOW SHIP %s IS ALREADY EN ROUTE TO YOUR LOCATION.",
+						"%s, THE MANTIS TOW SHIP %s IS ALREADY EN ROUTE",
 						b->shipname, go[i].sdata.name);
 					send_comms_packet(npcname, channel, msg);
 					goto out;
@@ -10456,13 +10617,18 @@ void npc_menu_item_towing_service(struct npc_menu_item *item,
 
 	/* Send the tow ship to the player */
 	push_tow_mode(&go[closest_tow_ship], o->id, botstate->object_id);
-	snprintf(msg, sizeof(msg), "%s, THE MANTIS TOW SHIP %s HAS BEEN DISPATCHED TO YOUR LOCATION",
+	snprintf(msg, sizeof(msg), "%s, THE MANTIS TOW SHIP %s HAS BEEN",
 			b->shipname, go[closest_tow_ship].sdata.name);
 	send_comms_packet(npcname, channel, msg);
-	snprintf(msg, sizeof(msg), "%s, YOUR ACCOUNT HAS BEEN BILLED $%5.2f\n",
-		b->shipname, charges);
-	o->tsd.ship.wallet -= charges;
+	snprintf(msg, sizeof(msg), "DISPATCHED TO YOUR LOCATION");
 	send_comms_packet(npcname, channel, msg);
+	snprintf(msg, sizeof(msg), "%s, UPON DELIVERY YOUR ACCOUNT\n", b->shipname);
+	send_comms_packet(npcname, channel, msg);
+	snprintf(msg, sizeof(msg), "WILL BE BILLED $%5.2f\n", TOW_SHIP_CHARGE);
+	send_comms_packet(npcname, channel, msg);
+	send_comms_packet(npcname, channel, " WARNING THE TOW SHIP NAVIGATION ALGORITHM IS BUGGY");
+	send_comms_packet(npcname, channel, " AND IT MAY OCCASIONALLY TRY TO DRIVE YOU INTO A PLANET");
+	send_comms_packet(npcname, channel, " USE DOCKING MAGNETS TO DISCONNECT IF NECESSARY");
 
 out:
 	pthread_mutex_unlock(&universe_mutex);
@@ -12792,6 +12958,7 @@ static int process_docking_magnets(struct game_client *c)
 	uint8_t __attribute__((unused)) v;
 	int i;
 	int sound;
+	uint32_t tow_ship_id;
 
 	int rc = read_and_unpack_buffer(c, buffer, "wb", &id, &v);
 	if (rc)
@@ -12807,6 +12974,13 @@ static int process_docking_magnets(struct game_client *c)
 	go[i].tsd.ship.docking_magnets = !go[i].tsd.ship.docking_magnets;
 	go[i].timestamp = universe_timestamp;
 	sound = go[i].tsd.ship.docking_magnets ? DOCKING_SYSTEM_ENGAGED : DOCKING_SYSTEM_DISENGAGED;
+	tow_ship_id = is_being_towed(&go[i]);
+	if (!go[i].tsd.ship.docking_magnets && tow_ship_id) {
+		int tow_ship_index;
+		tow_ship_index = lookup_by_id(tow_ship_id);
+		if (tow_ship_index >= 0)
+			disconnect_from_tow_ship(&go[tow_ship_index], &go[i]);
+	}
 	pthread_mutex_unlock(&universe_mutex);
 	/* snis_queue_add_sound(sound, ROLE_NAVIGATION, c->shipid); */
 	snis_queue_add_text_to_speech(sound == DOCKING_SYSTEM_ENGAGED ?
@@ -14742,7 +14916,7 @@ static void send_update_planet_packet(struct game_client *c,
 	else
 		ring = 1.0;
 
-	pb_queue_to_client(c, packed_buffer_new("bwwSSSSwbbbbhbbbSbbb", OPCODE_UPDATE_PLANET, o->id, o->timestamp,
+	pb_queue_to_client(c, packed_buffer_new("bwwSSSSwbbbbhbbbSbhbb", OPCODE_UPDATE_PLANET, o->id, o->timestamp,
 					o->x, (int32_t) UNIVERSE_DIM,
 					o->y, (int32_t) UNIVERSE_DIM,
 					o->z, (int32_t) UNIVERSE_DIM,
@@ -14758,6 +14932,7 @@ static void send_update_planet_packet(struct game_client *c,
 					o->tsd.planet.atmosphere_b,
 					o->tsd.planet.atmosphere_scale, (int32_t) UNIVERSE_DIM,
 					o->tsd.planet.has_atmosphere,
+					o->tsd.planet.atmosphere_type,
 					o->tsd.planet.solarsystem_planet_type,
 					o->tsd.planet.ring_selector));
 }
@@ -15794,6 +15969,7 @@ static uint32_t natural_language_object_lookup(void *context, char *word)
 		case OBJTYPE_PLANET:
 		case OBJTYPE_ASTEROID:
 		case OBJTYPE_SHIP2:
+		case OBJTYPE_WARPGATE:
 			if (strcmp(go[i].sdata.name, w) == 0) {
 				answer = go[i].id;
 				goto done;
@@ -15953,8 +16129,17 @@ static void nl_describe_game_object(struct game_client *c, uint32_t id)
 		queue_add_text_to_speech(c, description);
 		return;
 	case OBJTYPE_STARBASE:
+		if (go[i].tsd.starbase.associated_planet_id < 0) {
+			sprintf(description, "%s is a star base in deep space", go[i].tsd.starbase.name);
+		} else {
+			planet = lookup_by_id(go[i].tsd.starbase.associated_planet_id);
+			if (planet < 0)
+				sprintf(description, "%s is a star base in deep space", go[i].tsd.starbase.name);
+			else
+				sprintf(description, "%s is a star base in orbit around the planet %s",
+					go[i].tsd.starbase.name, go[planet].sdata.name);
+		}
 		pthread_mutex_unlock(&universe_mutex);
-		sprintf(description, "%s is a starbase", go[i].tsd.starbase.name);
 		queue_add_text_to_speech(c, description);
 		return;
 	case OBJTYPE_SHIP2:
@@ -16060,6 +16245,8 @@ static int nl_find_nearest_object(struct game_client *c, int argc, char *argv[],
 		objtype = OBJTYPE_SHIP2;
 	else if (strcmp(argv[object], "asteroid") == 0)
 		objtype = OBJTYPE_ASTEROID;
+	else if (strcmp(argv[object], "gate") == 0)
+		objtype = OBJTYPE_WARPGATE;
 	else
 		objtype = -1;
 	if (objtype < 0)
@@ -16689,6 +16876,125 @@ no_understand2:
 	return;
 }
 
+/* Eg: "set a course for starbase one..." */
+static void nl_set_npnq(void *context, int argc, char *argv[], int pos[],
+		union snis_nl_extra_data extra_data[])
+{
+	struct game_client *c = context;
+	int setthing, prep, settowhat;
+	char *name, *namecopy, reply[100];
+	int i = -1;
+	union vec3 direction, right;
+	union quat new_orientation;
+	struct snis_entity *dest, *ship;
+	char *modifier;
+	int number;
+	float value;
+	char buffer[100];
+
+	setthing = nl_find_next_word(argc, pos, POS_NOUN, 0);
+	if (setthing < 0)
+		goto no_understand;
+	prep = nl_find_next_word(argc, pos, POS_PREPOSITION, 0);
+	if (prep < 0)
+		goto no_understand;
+	settowhat = nl_find_next_word(argc, pos, POS_NOUN, prep);
+	if (settowhat < 0)
+		goto no_understand;
+	number = nl_find_next_word(argc, pos, POS_NUMBER, 0);
+	if (number < 0)
+		goto no_understand;
+	value = extra_data[number].number.value;
+	if (strcasecmp(argv[settowhat], "starbase") == 0) {
+		sprintf(buffer, "SB-%02.0f", value);
+		i = natural_language_object_lookup(NULL, buffer); /* slightly racy */
+		pthread_mutex_lock(&universe_mutex);
+		if (i < 0) {
+			pthread_mutex_unlock(&universe_mutex);
+			goto no_understand;
+		}
+	} else if (strcasecmp(argv[settowhat], "gate") == 0) {
+		sprintf(buffer, "WG-%02.0f", value);
+		i = natural_language_object_lookup(NULL, buffer); /* slightly racy */
+		pthread_mutex_lock(&universe_mutex);
+		if (i < 0) {
+			pthread_mutex_unlock(&universe_mutex);
+			goto no_understand;
+		}
+	}
+
+	if (strcasecmp(argv[prep], "for") != 0 &&
+		strcasecmp(argv[prep], "to") != 0 &&
+		strcasecmp(argv[prep], "toward") != 0) {
+		pthread_mutex_unlock(&universe_mutex);
+		goto no_understand;
+	}
+
+	if (strcasecmp(argv[setthing], "course") != 0) {
+		pthread_mutex_unlock(&universe_mutex);
+		goto no_understand;
+	}
+
+	if (i < 0)
+		i = lookup_by_id(extra_data[settowhat].external_noun.handle);
+	if (i < 0) {
+		pthread_mutex_unlock(&universe_mutex);
+		queue_add_text_to_speech(c, "Sorry, I am not sure where that is.");
+		return;
+	}
+	dest = &go[i];
+	name = nl_get_object_name(dest);
+	if (!name) {
+		pthread_mutex_unlock(&universe_mutex);
+		queue_add_text_to_speech(c, "Sorry, I am not sure where that is.");
+		return;
+	}
+	namecopy = strdup(name);
+	i = lookup_by_id(c->shipid);
+	if (i < 0) {
+		pthread_mutex_unlock(&universe_mutex);
+		queue_add_text_to_speech(c, "Sorry, I am not quite sure where we are.");
+		free(namecopy);
+		return;
+	}
+	ship = &go[i];
+
+	/* Calculate new desired orientation of ship pointing towards destination */
+	right.v.x = 1.0;
+	right.v.y = 0.0;
+	right.v.z = 0.0;
+
+	direction.v.x = dest->x - ship->x;
+	direction.v.y = dest->y - ship->y;
+	direction.v.z = dest->z - ship->z;
+	vec3_normalize_self(&direction);
+
+	quat_from_u2v(&new_orientation, &right, &direction, NULL);
+
+	ship->tsd.ship.computer_desired_orientation = new_orientation;
+	ship->tsd.ship.computer_steering_time_left = COMPUTER_STEERING_TIME;
+	ship->tsd.ship.orbiting_object_id = 0xffffffff;
+
+	if (dest->type == OBJTYPE_PLANET)
+		modifier = "the planet ";
+	else if (dest->type == OBJTYPE_ASTEROID)
+		modifier = "the asteroid ";
+	else if (dest->type == OBJTYPE_SHIP1 || dest->type == OBJTYPE_SHIP2)
+		modifier = "the ship ";
+	else
+		modifier = "";
+
+	pthread_mutex_unlock(&universe_mutex);
+	sprintf(reply, "Setting course for %s%s.", modifier, namecopy);
+	queue_add_text_to_speech(c, reply);
+	free(namecopy);
+	return;
+
+no_understand:
+	queue_add_text_to_speech(c, "Sorry, I am not sure what you're asking me to do.");
+	return;
+}
+
 /* Eg: "set a course for blah..." */
 static void nl_set_npn(void *context, int argc, char *argv[], int pos[],
 		union snis_nl_extra_data extra_data[])
@@ -16700,6 +17006,7 @@ static void nl_set_npn(void *context, int argc, char *argv[], int pos[],
 	union vec3 direction, right;
 	union quat new_orientation;
 	struct snis_entity *dest, *ship;
+	char *modifier;
 
 	setthing = nl_find_next_word(argc, pos, POS_NOUN, 0);
 	if (setthing < 0)
@@ -16769,8 +17076,17 @@ static void nl_set_npn(void *context, int argc, char *argv[], int pos[],
 	ship->tsd.ship.computer_steering_time_left = COMPUTER_STEERING_TIME;
 	ship->tsd.ship.orbiting_object_id = 0xffffffff;
 
+	if (dest->type == OBJTYPE_PLANET)
+		modifier = "the planet ";
+	else if (dest->type == OBJTYPE_ASTEROID)
+		modifier = "the asteroid ";
+	else if (dest->type == OBJTYPE_SHIP1 || dest->type == OBJTYPE_SHIP2)
+		modifier = "the ship ";
+	else
+		modifier = "";
+
 	pthread_mutex_unlock(&universe_mutex);
-	sprintf(reply, "Setting course for %s.", namecopy);
+	sprintf(reply, "Setting course for %s%s.", modifier, namecopy);
 	queue_add_text_to_speech(c, reply);
 	free(namecopy);
 	return;
@@ -17469,6 +17785,60 @@ target_lost:
 	return;
 }
 
+/* E.g.: target warp gate 1, target star base 2 */
+static void nl_target_nq(void *context, int argc, char *argv[], int pos[], union snis_nl_extra_data extra_data[])
+{
+	struct game_client *c = context;
+	int i, noun;
+	char *name, *namecopy;
+	char reply[100];
+	uint32_t id;
+	int number;
+	char buffer[20];
+	float amount;
+
+	noun = nl_find_next_word(argc, pos, POS_NOUN, 0);
+	if (noun < 0)
+		goto target_lost;
+	number = nl_find_next_word(argc, pos, POS_NUMBER, noun);
+	if (number < 0)
+		goto target_lost;
+	amount = extra_data[number].number.value;
+	if (strcmp(argv[noun], "starbase") == 0) {
+		sprintf(buffer, "SB-%02.0f", amount);
+		i = natural_language_object_lookup(NULL, buffer); /* slightly racy */
+	} else if (strcmp(argv[noun], "gate") == 0) {
+		sprintf(buffer, "WG-%02.0f", amount);
+		i = natural_language_object_lookup(NULL, buffer); /* slightly racy */
+	} else {
+		goto target_lost;
+	}
+
+	pthread_mutex_lock(&universe_mutex);
+	if (i < 0) {
+		pthread_mutex_unlock(&universe_mutex);
+		goto target_lost;
+	}
+	id = go[i].id;
+	name = nl_get_object_name(&go[i]);
+	if (name)
+		namecopy = strdup(name);
+	else
+		namecopy = NULL;
+	pthread_mutex_unlock(&universe_mutex);
+	if (!namecopy)
+		goto target_lost;
+	sprintf(reply, "Targeting sensors on %s", namecopy);
+	free(namecopy);
+	queue_add_text_to_speech(c, reply);
+	science_select_target(c, id);
+	return;
+
+target_lost:
+	queue_add_text_to_speech(c, "Unable to locate the specified target for scanning.");
+	return;
+}
+
 struct damage_report_entry {
 	char system[100];
 	int percent;
@@ -17969,10 +18339,13 @@ static void init_dictionary(void)
 	snis_nl_add_dictionary_verb("set",		"set",		"npa", sorry_dave);
 	snis_nl_add_dictionary_verb("set",		"set",		"npn", nl_set_npn);
 	snis_nl_add_dictionary_verb("set",		"set",		"npan", nl_set_npn);
+	snis_nl_add_dictionary_verb("set",		"set",		"npnq", nl_set_npnq);
 	snis_nl_add_dictionary_verb("plot",		"plot",		"npn", nl_set_npn);
 	snis_nl_add_dictionary_verb("plot",		"plot",		"npan", nl_set_npn);
+	snis_nl_add_dictionary_verb("plot",		"plot",		"npnq", nl_set_npnq);
 	snis_nl_add_dictionary_verb("lay in",		"lay in",	"npn", nl_set_npn);
 	snis_nl_add_dictionary_verb("lay in",		"lay in",	"npan", nl_set_npn);
+	snis_nl_add_dictionary_verb("lay in",		"lay in",	"npnq", nl_set_npnq);
 	snis_nl_add_dictionary_verb("lower",		"lower",	"npq", nl_set_npq);
 	snis_nl_add_dictionary_verb("lower",		"lower",	"npn", nl_set_npn);
 	snis_nl_add_dictionary_verb("lower",		"lower",	"npa", nl_lower_npa); /* lower power to impulse */
@@ -18047,8 +18420,11 @@ static void init_dictionary(void)
 	snis_nl_add_dictionary_verb("science",		"science",	"n", nl_onscreen_verb_n);
 	snis_nl_add_dictionary_verb("communications",	"communications", "n", nl_onscreen_verb_n);
 	snis_nl_add_dictionary_verb("target",		"target",	"n", nl_target_n);
+	snis_nl_add_dictionary_verb("target",		"target",	"nq", nl_target_nq);
 	snis_nl_add_dictionary_verb("scan",		"target",	"n", nl_target_n);
+	snis_nl_add_dictionary_verb("scan",		"target",	"nq", nl_target_nq);
 	snis_nl_add_dictionary_verb("select",		"target",	"n", nl_target_n);
+	snis_nl_add_dictionary_verb("select",		"target",	"nq", nl_target_nq);
 	snis_nl_add_dictionary_verb("reverse",		"reverse",	"n", nl_reverse_n);
 	snis_nl_add_dictionary_verb("long range scanner",	"long range scan",	"", nl_shortlong_range_scan);
 	snis_nl_add_dictionary_verb("long range scan",	"long range scan",	"", nl_shortlong_range_scan);
