@@ -76,6 +76,7 @@ struct key_value_specification snis_entity_kvs[] = {
 	UINT16_TSDFIELD(torpedo_load_time),
 	UINT8_TSDFIELD(phaser_bank_charge),
 	UINT32_TSDFIELD(fuel),
+	UINT32_TSDFIELD(oxygen),
 	UINT8_TSDFIELD(rpm),
 	UINT8_TSDFIELD(throttle),
 	UINT8_TSDFIELD(temp),
@@ -95,6 +96,7 @@ struct key_value_specification snis_entity_kvs[] = {
 	UINT8_TSDFIELD(damage.sensors_damage),
 	UINT8_TSDFIELD(damage.comms_damage),
 	UINT8_TSDFIELD(damage.tractor_damage),
+	UINT8_TSDFIELD(damage.lifesupport_damage),
 	/* TODO damcon data... */
 	UINT8_TSDFIELD(view_mode),
 	DOUBLE_TSDFIELD(view_angle),
@@ -140,6 +142,11 @@ struct key_value_specification snis_entity_kvs[] = {
 	UINT8_TSDFIELD(power_data.tractor.r3),
 	UINT8_TSDFIELD(power_data.tractor.i),
 
+	UINT8_TSDFIELD(power_data.lifesupport.r1),
+	UINT8_TSDFIELD(power_data.lifesupport.r2),
+	UINT8_TSDFIELD(power_data.lifesupport.r3),
+	UINT8_TSDFIELD(power_data.lifesupport.i),
+
 	UINT8_TSDFIELD(power_data.voltage),
 	/* End of power_data */
 
@@ -184,6 +191,11 @@ struct key_value_specification snis_entity_kvs[] = {
 	UINT8_TSDFIELD(coolant_data.tractor.r3),
 	UINT8_TSDFIELD(coolant_data.tractor.i),
 
+	UINT8_TSDFIELD(coolant_data.lifesupport.r1),
+	UINT8_TSDFIELD(coolant_data.lifesupport.r2),
+	UINT8_TSDFIELD(coolant_data.lifesupport.r3),
+	UINT8_TSDFIELD(coolant_data.lifesupport.i),
+
 	UINT8_TSDFIELD(coolant_data.voltage),
 	/* End of coolant_data */
 
@@ -195,6 +207,7 @@ struct key_value_specification snis_entity_kvs[] = {
 	UINT8_TSDFIELD(temperature_data.sensors_damage),
 	UINT8_TSDFIELD(temperature_data.comms_damage),
 	UINT8_TSDFIELD(temperature_data.tractor_damage),
+	UINT8_TSDFIELD(temperature_data.lifesupport_damage),
 	DOUBLE_TSDFIELD(warp_time),
 	DOUBLE_TSDFIELD(scibeam_a1),
 	DOUBLE_TSDFIELD(scibeam_a2),
@@ -282,8 +295,6 @@ struct key_value_specification snis_entity_kvs[] = {
 	UINT8_FIELD(sdata.shield_width),
 	UINT8_FIELD(sdata.shield_depth),
 	UINT8_FIELD(sdata.faction),
-	DOUBLE_FIELD(sci_coordx),
-	DOUBLE_FIELD(sci_coordz),
 	FLOAT_FIELD(orientation.vec[0]),
 	FLOAT_FIELD(orientation.vec[1]),
 	FLOAT_FIELD(orientation.vec[2]),

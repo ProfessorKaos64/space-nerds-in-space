@@ -1,8 +1,14 @@
-.TH SPACE-NERDS-IN-SPACE "6" "Aug 2016" "mesh_viewer" "Games"
+.TH SPACE-NERDS-IN-SPACE "6" "Feb 2017" "mesh_viewer" "Games"
 .SH NAME
 mesh_viewer \- a utility for viewing models for "Space Nerds In Space."
 .SH SYNOPSIS
-.B mesh_viewer [ -p ] filename [ -n normalmap-prefix ] [ -c cubemap-texture-prefix ]
+.B mesh_viewer [ -p ] filename [ -n normalmap-prefix ] [ -c cubemap-texture-prefix ] [ -s skybox-prefix ]
+.br
+.B mesh_viewer -T turret-model -B turret-base-model
+.br
+.B mesh_viewer [ -b ]
+.br
+.B mesh_viewer [ -t thrustimage.png ]
 .SH DESCRIPTION
 .\" Add any additional description here
 .warn 511
@@ -10,6 +16,24 @@ mesh_viewer \- a utility for viewing models for "Space Nerds In Space."
 mesh_viewer is a tool for viewing models for the game "Space Nerds In Space."  It can read STL files and a subset of OBJ files, and can also be used with the -p option to view a sphere with a cube mapped texture applied.
 .SH Options:
 .TP
+\fB-b\fR
+Invoke "burstrod" mode.  This means the model is constructed as a cylinder full of randomly
+oriented lines which emanate from a the central axis of the cylinder and radiate outward
+(see init_burst_rod_mesh() in mesh.c) and these lines are used as paths for a particle system.
+This is what is used for a laser bolt effect in Space Nerds In Space.   The -b option can be
+used to see what the laser bolt will look like.
+.TP
+\fB-B, --turretbase\fR turret-base-model
+Set "turret-mode" and specify the model for the "base" of the turret.
+In "turret mode", two models are required, the turret, and the turret
+base. (See the --turret option, below.) The turret is animated to
+always try to point at the light source.
+.TP
+\fB-T, --turret\fR turret-model
+Set "turret-mode" and specify the model for the turret.
+In "turret mode", two models are required, the turret, and the turret
+base. (See the --turretbase option, above.) The turret is animated to
+always try to point at the light source.
 \fB\-p\fR
 Invoke "planet" mode.  In this case, the filename is actually a partial filename,
 and six png files are expected to exist with the given partial filename with the
@@ -26,6 +50,16 @@ Only makes sense in combination with -p option.
 .TP
 \fB\-c\fR cubemap-texture-prefix
 Use 6 cubemapped texture images with numbered 0 - 5.
+.TP
+\fB\-s, --skybox\fR skybox-prefix.  Specify alternate skybox images.
+For example: ./mesh_viewer -m model.stl -s my/alt/skybox will uses
+images: my/alt/skybox0.png, my/alt/skybox1.png, my/alt/skybox2.png,
+my/alt/skybox3.png, my/alt/skybox4.png, my/alt/skybox5.png.
+.TP
+\fB\-t\fR thrust-image-file
+Invoke "thrust" mode.  This means the model is constructed and a particle system
+is created to show a rocket thrust animation.  The image used for the animation
+is thrust-image-file, which must be an RGBA png file, typically 128x128 pixels.
 .SH BASIC OPERATION
 .TP
 Drag with the right mouse button pressed to rotate the model.  Drag with the
@@ -54,6 +88,7 @@ Here are some sample invocations of mesh viewer:
   ./mesh_viewer -m share/snis/models/wombat/snis3006.obj
   ./mesh_viewer -m share/snis/models/starbase5.stl
   ./mesh_viewer -m share/snis/models/asteroid3.stl -c share/snis/textures/asteroid1-
+  ./mesh_viewer -p myplanet -n myplanet-normalmap -s myalternate-skybox
 .SH SEE ALSO
 .PP
 snis_client(6), ssgl_server(6), snis_server(6)

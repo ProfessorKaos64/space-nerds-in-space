@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <math.h>
 #include <stdlib.h>
@@ -15,13 +16,16 @@
 #include "open-simplex-noise.h"
 #include "png_utils.h"
 #include "crater.h"
+#include "pthread_util.h"
 
 static struct osn_context *ctx;
 
 #define MAXBUMPS 100000
-#define MAXCRATERS 1000
+#define MAXCRATERS 2000
 #define RADII (3.0f)
 static float sealevel = 0.08;
+static int height_histogram[256] = { 0 };
+static float fraction_land = 0.35;
 
 static char *landfile = "land.png";
 static char *waterfile = "water.png";
@@ -66,6 +70,58 @@ static char *sampledata;
 static int samplew, sampleh, samplea, sample_bytes_per_row;
 static float minn, maxn; /* min and max noise values encountered */
 static float crater_min_height, crater_max_height;
+
+static unsigned char get_sampledata(int x, int y, int bytes_per_row, char *sampledata)
+{
+	int p;
+	unsigned char *c;
+
+	p = y * bytes_per_row + x * 3;
+	c = (unsigned char *) &sampledata[p];
+	return *c;
+}
+
+static void set_sampledata(int x, int y, int bytes_per_row, char *sampledata, unsigned char value)
+{
+	int i, p;
+	unsigned char *c;
+
+	p = y * bytes_per_row + x * 3;
+	c = (unsigned char *) &sampledata[p];
+	for (i = 0; i < 3; i++)
+		c[i] = value;
+}
+
+static void scale_sampledata(char *sampledata, int samplew, int sampleh, int sample_bytes_per_row)
+{
+	int x, y;
+	float lowest, highest, diff;
+	lowest = 1000;
+	highest = 0;
+
+	printf("Scaling sample height data\n");
+	for (y = 0; y < sampleh; y++) {
+		for (x = 0; x < samplew; x++) {
+			unsigned char c = get_sampledata(x, y, sample_bytes_per_row, sampledata);
+			if (c > highest)
+				highest = c;
+			if (c < lowest)
+				lowest = c;
+		}
+	}
+	diff = (highest - lowest);
+	for (y = 0; y < sampleh; y++) {
+		for (x = 0; x < samplew; x++) {
+			unsigned char c = get_sampledata(x, y, sample_bytes_per_row, sampledata);
+			float v = c;
+			v = v - lowest;
+			v = 100 + 155.0 * v / diff;
+			c = (unsigned char) v;
+			set_sampledata(x, y, sample_bytes_per_row, sampledata, c);
+		}
+	}
+	printf("scale sampledata done\n");
+}
 
 static inline float fbmnoise4(float x, float y, float z)
 {
@@ -168,7 +224,8 @@ static inline void distort_vertex(union vec3 *v, float d, struct bump *b)
 	}
 	p = y * b->sample_bytes_per_row + x * 3;
 	c = (unsigned char *) &b->sampledata[p];
-	m = ((float) *c - (float) crater_base_level * (float) b->is_crater) / 255.0f;
+	m = (float) *c;
+	m = (m - 127.0) / 256.0; /* essentially, convert to signed. */
 	vec3_mul_self(&distortion, nr * m);
 	vec3_add_self(v, &distortion);
 }
@@ -232,9 +289,9 @@ static void multithread_face_render(render_on_face_fn render, struct bump *bumpl
 		t[f].f = f;
 		t[f].bumplist = bumplist;
 		t[f].bumpcount = bumpcount;
-		rc = pthread_create(&t[f].thread, NULL, render, &t[f]);
+		rc = create_thread(&t[f].thread, render, &t[f], "face-render", 0);
 		if (rc)
-			fprintf(stderr, "%s: pthread_create failed: %s\n",
+			fprintf(stderr, "%s: create_thread failed: %s\n",
 					__func__, strerror(errno));
 	}
 	for (f = 0; f < 6; f++) {
@@ -314,8 +371,8 @@ static void add_crater(int i, union vec3 p, float r, float h)
 	b->samplew = 1024;
 	b->sampleh = 1024;
 	b->sample_bytes_per_row = 3 * b->samplew;
-	crater_r = (0.5 * (snis_random_float() + 1.0) * 5.5) *
-			(0.5 * (snis_random_float() + 1.0) * 5.5) + 2.5;
+	crater_r = (0.5 * (snis_random_float)() + 1.0);
+	crater_r = (-logf(1.0 - crater_r) / 10.0) * 35.0 + 1.0;
 	create_crater_heightmap((unsigned char *) b->sampledata, 1024, 1024, 512, 512, (int) crater_r, 6);
 	quat_from_u2v(&b->texelq, &p, &right_at_ya, &up);
 }
@@ -437,7 +494,22 @@ static void paint_height_maps(float min, float max)
 				output_image[f][p + 1] = c;
 				output_image[f][p + 2] = c;
 				output_image[f][p + 3] = 255;
+				height_histogram[c]++;
 			}
+		}
+	}
+}
+
+static void set_sealevel(float fraction_land)
+{
+	int i, cutoff, so_far = 0;
+
+	cutoff = (int) ((1.0 - fraction_land) * 6.0 * dim * dim);
+	for (i = 0; i < 256; i++) {
+		so_far += height_histogram[i];
+		if (so_far >= cutoff) {
+			sealevel = ((float) i / (float) 256);
+			return;
 		}
 	}
 }
@@ -641,6 +713,7 @@ static struct option long_options[] = {
 	{ "heightmap-output", required_argument, NULL, 'H' },
 	{ "ibumps", required_argument, NULL, 'i' },
 	{ "land", required_argument, NULL, 'l' },
+	{ "land-fraction", required_argument, NULL, 'L' },
 	{ "oceanlevel", required_argument, NULL, 'O' },
 	{ "output", required_argument, NULL, 'o' },
 	{ "normal", required_argument, NULL, 'n' },
@@ -665,10 +738,16 @@ static void usage(void)
 	fprintf(stderr, "   -c, craters : number of craters to add.\n");
 	fprintf(stderr, "   -h, height : png file containing height map data to sample for terrain\n");
 	fprintf(stderr, "   -H, heightmap-output : prefix of filename for height map output data\n");
+	fprintf(stderr, "                Default is to append '-heightmap' to the output filename\n");
+	fprintf(stderr, "                prefex (-o option). If the -o option is not specified, then\n");
+	fprintf(stderr, "                'heightmap' is used.\n");
 	fprintf(stderr, "   -k, shrink : factor to shrink each recursive iteration.  Default is 0.55\n");
 	fprintf(stderr, "   -l, land : png file containing land color data to sample for terrain\n");
-	fprintf(stderr, "   -n, normal : filename prefix for normal map images, default is 'normalmap'\n");
-	fprintf(stderr, "   -o, output : filename prefix for output images, default is 'heightmap'\n");
+	fprintf(stderr, "   -L, land fraction: Range 0.0 to 1.0, approximate fraction of planet to be land\n");
+	fprintf(stderr, "   -n, normal : filename prefix for normal map images, default is to append\n");
+	fprintf(stderr, "                '-normalmap' to the output filename prefex (-o option). If the\n");
+	fprintf(stderr, "                -o option is not specified, then 'normalmap' is used.\n");
+	fprintf(stderr, "   -o, output : filename prefix for output images, default is 'terrainmap'\n");
 	fprintf(stderr, "   -O, oceanlevel : set sealevel, default is 0.08\n");
 	fprintf(stderr, "   -r, rlimit : limit to how small bumps may get before stopping recursion\n");
 	fprintf(stderr, "                default rlimit is 0.005\n");
@@ -680,11 +759,12 @@ static void usage(void)
 	fprintf(stderr, "Examples:\n");
 	fprintf(stderr, "\n");
 	fprintf(stderr, "  For earthlike planets:\n");
-	fprintf(stderr, "  ./earthlike -B 25 -h heightdata.png -l land.png -w water.png --bumpsize 0.5 -o myplanet\n");
+	fprintf(stderr, "  ./earthlike -B 400 -h heightdata.png -l land.png -w water.png --bumpsize 0.5 \\\n");
+	fprintf(stderr, "              -L 0.35 -o myplanet\n");
 	fprintf(stderr, "\n");
 	fprintf(stderr, "  For more rocky, mars-like planets (a.png and b.png should both be land images):\n");
-	fprintf(stderr, "  ./earthlike -B 400 -b 1 -h heightdata.png -l ~/a.png -w ~/b.png -O 0 --bumpsize 0.5 \\\n");
-	fprintf(stderr, "         --craters 250 -o myplanet\n");
+	fprintf(stderr, "  ./earthlike -B 400 -b 1 -h heightdata.png -l ~/a.png -w ~/b.png -L 1.0 --bumpsize 0.5 \\\n");
+	fprintf(stderr, "         --craters 2000 -o myplanet\n");
 	fprintf(stderr, "\n");
 	fprintf(stderr, "\n");
 	exit(1);
@@ -721,7 +801,7 @@ static void process_options(int argc, char *argv[])
 
 	while (1) {
 		int option_index;
-		c = getopt_long(argc, argv, "B:b:d:c:H:h:i:n:O:k:l:o:r:s:S:w:", long_options, &option_index);
+		c = getopt_long(argc, argv, "B:L:b:d:c:H:h:i:n:O:k:l:o:r:s:S:w:", long_options, &option_index);
 		if (c == -1)
 			break;
 		switch (c) {
@@ -787,10 +867,61 @@ static void process_options(int argc, char *argv[])
 		case 'z':
 			process_float_option("bumpsize", optarg, &initial_bump_size);
 			break;
+		case 'L':
+			process_float_option("land_fraction", optarg, &fraction_land);
+			if (fraction_land < 0.0 || fraction_land > 1.0) {
+				fprintf(stderr, "land-fraction must be between 0 and 1.\n");
+				exit(1);
+			}
+			break;
 		default:
 			fprintf(stderr, "Unknown option.\n");
 			usage();
 		}
+	}
+
+	/* Set a reasonable default normalmap file name if none is specified */
+	if (strcmp(normal_file_prefix, "normalmap") == 0 &&
+		strcmp(output_file_prefix, "terrainmap") != 0) {
+		char new_normalmap_prefix[PATH_MAX];
+
+		snprintf(new_normalmap_prefix, PATH_MAX, "%s-normalmap", output_file_prefix);
+		normal_file_prefix = strdup(new_normalmap_prefix);
+	}
+
+	/* Set a reasonable default heightmap file name if none is specified */
+	if (strcmp(normal_file_prefix, "heightmap") == 0 &&
+		strcmp(output_file_prefix, "terrainmap") != 0) {
+		char new_normalmap_prefix[PATH_MAX];
+
+		snprintf(new_normalmap_prefix, PATH_MAX, "%s-heightmap", output_file_prefix);
+		normal_file_prefix = strdup(new_normalmap_prefix);
+	}
+}
+
+static void print_histogram_bar(int nchars, int bucket, int value)
+{
+	int i;
+
+	printf("%3d %10d: ", bucket, value);
+	for (i = 0; i < nchars; i++)
+		printf("#");
+	printf("\n");
+}
+
+static void print_height_histogram(int h[], int n)
+{
+	int i;
+	int max = 0;
+
+	for (i = 0; i < n; i++) {
+		if (h[i] > max)
+			max = h[i];
+	}
+	for (i = 0; i < n; i++) {
+		float ratio = (float) h[i] / (float) max;
+		int nchars = (int) (ratio * 60.0);
+		print_histogram_bar(nchars, i, h[i]);
 	}
 }
 
@@ -806,6 +937,8 @@ int main(int argc, char *argv[])
 	printf("Loading %s\n", heightfile);
 	sampledata = load_image(heightfile, &samplew, &sampleh, &samplea,
 					&sample_bytes_per_row);
+	if (sampledata)
+		scale_sampledata(sampledata, samplew, sampleh, sample_bytes_per_row);
 	printf("Loading %s\n", landfile);
 	land = load_image(landfile, &landw, &landh, &landa, &landbpr);
 	printf("Loading %s\n", waterfile);
@@ -823,6 +956,7 @@ int main(int argc, char *argv[])
 	find_min_max_height(&min, &max);
 	printf("min h = %f, max h = %f\n", min, max);
 	paint_height_maps(min, max);
+	set_sealevel(fraction_land);
 	calculate_normals();
 	paint_normal_and_height_maps(min, max);
 	printf("painting terrain colors\n");
@@ -835,6 +969,7 @@ int main(int argc, char *argv[])
 	save_height_maps();
 	open_simplex_noise_free(ctx);
 	printf("Done.\n");
+	print_height_histogram(height_histogram, 256);
 	return 0;
 }
 

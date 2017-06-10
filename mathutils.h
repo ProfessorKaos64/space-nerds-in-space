@@ -110,4 +110,20 @@ int circle_line_segment_intersection(double x1, double y1, double x2, double y2,
 
 float float_lerp(float from, float to, float t);
 
+/* Given angles from and to (radians) returns the difference between them
+ * going the short way around the circle
+ */
+double short_angular_distance(double from, double to);
+
+/* See: http://www.jfurness.uk/sigmoid-functions-in-game-design/
+ *
+ * This function maps real numbers 0 <= x <= +infinity to the range 0 - 1.0
+ * in a "sigmoid" ("S") shape that is controlled by sigma and lambda.
+ * (Approximately) sigma controls how fast the curve ramps up to 1.0
+ * and lambda controls the "shape" of the curve with values < 1.0
+ * making the curve steep at first then slowing, and values > 1.0
+ * making the curve gradual, then steep, then gradual.
+ */
+float sigmoid(float x, float sigma, float lambda);
+
 #endif

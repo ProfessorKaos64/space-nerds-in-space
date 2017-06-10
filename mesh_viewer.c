@@ -29,6 +29,7 @@
 #include "opengl_cap.h"
 #include "build_info.h"
 #include "png_utils.h"
+#include "turret_aimer.h"
 
 #define FOV (30.0 * M_PI / 180.0)
 #define FPS 60
@@ -52,9 +53,14 @@ static char *planetname = NULL;
 static char *normalmapname = NULL;
 static char *cubemapname = NULL;
 static char *modelfile = NULL;
+static char *thrustfile = NULL;
 static char *program;
+static char *skyboxfile = NULL;
+static char *turret_model = NULL;
+static char *turret_base_model = NULL;
 union quat autorotation; 
-static int icosohedron_subdivision = 4;
+static int icosahedron_subdivision = 4;
+#define LASER_VELOCITY 200.0
 
 static int display_frame_stats = 1;
 
@@ -159,7 +165,7 @@ static void take_picture(char *filename)
 	int width, height;
 	graph_dev_grab_framebuffer(&buffer, &width, &height);
 	printf("Saved snapshot: %s %dx%d\n", filename, width, height);
-	png_utils_write_png_image(filename, buffer, width, height, 0, 1);
+	png_utils_write_png_image(filename, buffer, width, height, 1, 1);
 	free(buffer);
 }
 
@@ -235,6 +241,8 @@ static union quat last_lobby_orientation = IDENTITY_QUAT_INITIALIZER;
 static union quat last_light_orientation = IDENTITY_QUAT_INITIALIZER;
 static union quat lobby_orientation = IDENTITY_QUAT_INITIALIZER;
 static union quat light_orientation = IDENTITY_QUAT_INITIALIZER;
+static union quat turret_orientation = IDENTITY_QUAT_INITIALIZER;
+static union quat turret_base_orientation = IDENTITY_QUAT_INITIALIZER;
 static float desired_lobby_zoom = 255;
 static float lobby_zoom = 255;
 
@@ -279,6 +287,7 @@ static int main_da_motion_notify(int x, int y)
 		quat_from_u2v(&rotation, &v1, &v2, 0);
 		if (isDraggingLight) {
 			quat_mul(&light_orientation, &rotation, &last_light_orientation);
+			quat_normalize_self(&light_orientation);
 			last_light_orientation = light_orientation;
 		} else {
 			quat_mul(&lobby_orientation, &rotation, &last_lobby_orientation);
@@ -421,12 +430,41 @@ static void process_events()
 
 
 static struct mesh *target_mesh;
+static struct mesh *turret_base_mesh;
 static struct mesh *atmosphere_mesh;
 static struct mesh *light_mesh;
 static struct material planet_material;
+static struct material green_phaser_material;
+static struct material thrust_material;
 static struct material atmosphere_material;
 static int planet_mode = 0;
 static int cubemap_mode = 0;
+static int burst_rod_mode = 0;
+static int thrust_mode = 0;
+static int turret_mode = 0;
+
+static void check_modes(void)
+{
+	/* modes are mutually exclusive, ensure at most one is selected. */
+	int sum = planet_mode + cubemap_mode + burst_rod_mode + thrust_mode + turret_mode;
+	if (turret_mode) {
+		if (!turret_model) {
+			fprintf(stderr,
+				"mesh_viewer: turret mode selected, but no turret model specified.\n");
+			exit(1);
+		}
+		if (!turret_base_model) {
+			fprintf(stderr,
+				"mesh_viewer: turret mode selected, but no turret base model specified.\n");
+			exit(1);
+		}
+	}
+	if (sum <= 1)
+		return;
+	fprintf(stderr, "mesh_viewer: burstrod, cubemap, planet, thrust and turret\n");
+	fprintf(stderr, "             modes are mutually exclusive.\n");
+	exit(1);
+}
 
 #define FRAME_INDEX_MAX 10
 
@@ -476,6 +514,7 @@ static void draw_screen()
 	calculate_camera_transform(cx);
 
 	struct entity *e = add_entity(cx, target_mesh, 0, 0, 0, WHITE);
+	struct entity *turret_base_entity = NULL;
 	struct entity *ae = NULL;
 	if (planet_mode) {
 		update_entity_material(e, &planet_material);
@@ -486,8 +525,41 @@ static void draw_screen()
 		}
 	} else if (cubemap_mode) {
 		update_entity_material(e, &planet_material);
+	} else if (burst_rod_mode) {
+		update_entity_material(e, &green_phaser_material);
+	} else if (thrust_mode) {
+		update_entity_material(e, &thrust_material);
 	}
-	update_entity_orientation(e, &lobby_orientation);
+	if (!turret_mode) {
+		update_entity_orientation(e, &lobby_orientation);
+	} else {
+		union quat new_turret_orientation, new_turret_base_orientation;
+		union vec3 aim = { { 1.0, 0.0, 0.0 } };
+		struct turret_params tparams;
+		int aim_is_good = 0;
+
+		tparams.elevation_lower_limit = -30.0 * M_PI / 180.0;
+		tparams.elevation_upper_limit = 90.0 * M_PI / 180.0;
+		tparams.azimuth_lower_limit = -3.0 * M_PI; /* no limit */
+		tparams.azimuth_upper_limit = 3.0 * M_PI; /* no limit */
+		tparams.elevation_rate_limit = 1.0 * M_PI / 180.0; /* 60 degrees/sec at 60Hz */
+		tparams.azimuth_rate_limit = 1.0 * M_PI / 180.0; /* 60 degrees/sec at 60Hz */
+
+		/* Aim turret at the light source */
+		quat_rot_vec_self(&aim, &light_orientation);
+
+		turret_aim(aim.v.x, aim.v.y, aim.v.z, 0.0, 0.0, 0.0,
+			&lobby_orientation, /* turret rest orientation */
+			&turret_orientation, /* current turret orientation */
+			&tparams, &new_turret_orientation, &new_turret_base_orientation,
+			&aim_is_good);
+
+		turret_orientation = new_turret_orientation;
+		turret_base_orientation = new_turret_base_orientation;
+		turret_base_entity = add_entity(cx, turret_base_mesh, 0, 0, 0, WHITE);
+		update_entity_orientation(e, &turret_orientation);
+		update_entity_orientation(turret_base_entity, &turret_base_orientation);
+	}
 
 	if (isDraggingLight) {
 		union vec3 light_dir = { { 10.75 * r_cam, 0, 0 } };
@@ -606,8 +678,13 @@ static void setup_skybox(char *skybox_prefix)
 	int i;
 	char filename[6][PATH_MAX + 1];
 
-	for (i = 0; i < 6; i++)
-		sprintf(filename[i], "%s/%s%d.png", asset_dir, skybox_prefix, i);
+	if (!skyboxfile) {
+		for (i = 0; i < 6; i++)
+			sprintf(filename[i], "%s/%s%d.png", asset_dir, skybox_prefix, i);
+	} else {
+		for (i = 0; i < 6; i++)
+			sprintf(filename[i], "%s%d.png", skyboxfile, i);
+	}
 
 	graph_dev_load_skybox_texture(filename[3], filename[1], filename[4],
 					filename[5], filename[0], filename[2]);
@@ -619,6 +696,9 @@ __attribute__((noreturn)) void usage(char *program)
 	fprintf(stderr, "%s -p <planet-texture> [ -i icosohedrion-subdivision] [ -n <normal-map-texture> ]\n",
 			program);
 	fprintf(stderr, " %s -m <mesh-file> [ -c cubemap-texture- ]\n", program);
+	fprintf(stderr, " %s --burstrod\n", program);
+	fprintf(stderr, " %s --thrust <image-file>\n", program);
+	fprintf(stderr, " %s --turret <turret-model> --turretbase <turret-base-model>\n", program);
 	exit(-1);
 }
 
@@ -636,11 +716,16 @@ static void process_int_option(char *option_name, char *option_value, int *value
 
 static struct option long_options[] = {
 	{ "model", required_argument, NULL, 'm' },
+	{ "turretbase", required_argument, NULL, 'B' },
 	{ "cubemap", required_argument, NULL, 'c' },
 	{ "help", no_argument, NULL, 'h' },
 	{ "planetmode", required_argument, NULL, 'p' },
-	{ "icosohedron", required_argument, NULL, 'i' },
+	{ "icosahedron", required_argument, NULL, 'i' },
 	{ "normalmap", required_argument, NULL, 'n' },
+	{ "burstrod", no_argument, NULL, 'b' },
+	{ "thrust", required_argument, NULL, 't' },
+	{ "skybox", required_argument, NULL, 's' },
+	{ "turret", required_argument, NULL, 'T' },
 };
 
 static void process_options(int argc, char *argv[])
@@ -650,11 +735,22 @@ static void process_options(int argc, char *argv[])
 	while (1) {
 		int option_index;
 
-		c = getopt_long(argc, argv, "c:hi:m:n:p:", long_options, &option_index);
+		c = getopt_long(argc, argv, "B:T:bc:hi:m:n:p:s:t:", long_options, &option_index);
 		if (c < 0) {
 			break;
 		}
 		switch (c) {
+		case 'B':
+			turret_mode = 1;
+			turret_base_model = optarg;
+			break;
+		case 'T':
+			turret_mode = 1;
+			turret_model = optarg;
+			break;
+		case 'b':
+			burst_rod_mode = 1;
+			break;
 		case 'p':
 			planet_mode = 1;
 			planetname = optarg;
@@ -667,13 +763,13 @@ static void process_options(int argc, char *argv[])
 			cubemapname = optarg;
 			break;
 		case 'i':
-			process_int_option("icosohedron", optarg, &icosohedron_subdivision);
-			if (icosohedron_subdivision > 4) {
-				fprintf(stderr, "Max icosohedron subdivision is 4\n");
-				icosohedron_subdivision = 4;
-			} else if (icosohedron_subdivision < 0) {
-				fprintf(stderr, "Min icosohedron subdivision is 0\n");
-				icosohedron_subdivision = 0;
+			process_int_option("icosahedron", optarg, &icosahedron_subdivision);
+			if (icosahedron_subdivision > 4) {
+				fprintf(stderr, "Max icosahedron subdivision is 4\n");
+				icosahedron_subdivision = 4;
+			} else if (icosahedron_subdivision < 0) {
+				fprintf(stderr, "Min icosahedron subdivision is 0\n");
+				icosahedron_subdivision = 0;
 			}
 			break;
 		case 'n':
@@ -681,11 +777,19 @@ static void process_options(int argc, char *argv[])
 			break;
 		case 'h':
 			usage(program);
+		case 't':
+			thrust_mode = 1;
+			thrustfile = optarg;
+			break;
+		case 's':
+			skyboxfile = optarg;
+			break;
 		default:
 			fprintf(stderr, "%s: Unknown option.\n", program);
 			usage(program);
 		}
 	}
+	check_modes();
 	return;
 }
 
@@ -702,13 +806,16 @@ int main(int argc, char *argv[])
 
 	process_options(argc, argv);
 	filename = modelfile;
-	if (!filename && !planet_mode)
+	if (!filename && !(planet_mode || burst_rod_mode || thrust_mode || turret_mode))
 		usage(program);
 
-	if (!planet_mode && stat(filename, &statbuf) != 0) {
+	if (!planet_mode && !burst_rod_mode && !thrust_mode && !turret_mode && stat(filename, &statbuf) != 0) {
 		fprintf(stderr, "%s: %s: %s\n", program, filename, strerror(errno));
 		exit(1);
 	}
+
+	if (thrust_mode && !thrustfile)
+		usage(program);
 
 	/* Information about the current video settings. */
 	const SDL_VideoInfo *info = NULL;
@@ -791,9 +898,17 @@ int main(int argc, char *argv[])
 	sng_set_screen_size(real_screen_width, real_screen_height);
 	sng_set_clip_window(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
 
-	if (planet_mode) {
+	if (burst_rod_mode) {
+		target_mesh = init_burst_rod_mesh(1000, LASER_VELOCITY * 2 / 3, 0.5, 0.5);
+		atmosphere_mesh = NULL;
+		material_init_textured_particle(&green_phaser_material);
+		green_phaser_material.textured_particle.texture_id =
+			graph_dev_load_texture("share/snis/textures/green-burst.png");
+		green_phaser_material.textured_particle.radius = 0.75;
+		green_phaser_material.textured_particle.time_base = 0.25;
+	} else if (planet_mode) {
 		target_mesh = mesh_unit_spherified_cube(16);
-		atmosphere_mesh = mesh_unit_icosphere(icosohedron_subdivision);
+		atmosphere_mesh = mesh_unit_icosphere(icosahedron_subdivision);
 		material_init_textured_planet(&planet_material);
 		planet_material.textured_planet.texture_id = load_cubemap_textures(0, planetname);
 		if (normalmapname)
@@ -812,7 +927,17 @@ int main(int argc, char *argv[])
 			planet_material.textured_planet.normalmap_id = load_cubemap_textures(0, normalmapname);
 		else
 			planet_material.textured_planet.normalmap_id = -1;
-	} else {
+	} else if (thrust_mode) {
+		target_mesh = init_thrust_mesh(30, 30, 1.3, 1);
+		material_init_textured_particle(&thrust_material);
+		thrust_material.textured_particle.texture_id = graph_dev_load_texture(thrustfile);
+		thrust_material.textured_particle.radius = 1.5;
+		thrust_material.textured_particle.time_base = 0.1;
+	} else if (turret_mode) {
+		target_mesh = snis_read_model(turret_model);
+		turret_base_mesh = snis_read_model(turret_base_model);
+		atmosphere_mesh = NULL;
+	} else { /* just ordinary model mode */
 		target_mesh = snis_read_model(filename);
 		atmosphere_mesh = NULL;
 	}
@@ -821,7 +946,7 @@ int main(int argc, char *argv[])
 		exit(-1);
 	}
 
-	light_mesh = mesh_fabricate_billboard(0, 0, 10, 10); //target_mesh->radius / 10.0, target_mesh->radius / 10.0);
+	light_mesh = mesh_fabricate_billboard(10, 10);
 
 	struct material light_material;
 	material_init_texture_mapped_unlit(&light_material);

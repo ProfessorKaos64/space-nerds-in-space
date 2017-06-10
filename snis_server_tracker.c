@@ -33,11 +33,11 @@
 #include <pthread.h>
 
 #include "ssgl/ssgl.h"
+#include "pthread_util.h"
 
 struct server_tracker {
 	char *lobbyhost;
 	pthread_t thread;
-	pthread_attr_t thread_attr;
 	int sock;
 	pthread_mutex_t mutex;
 	int time_to_quit;
@@ -94,18 +94,18 @@ static int compare_game_server_list(struct ssgl_game_server *a, int acount,
 static void copy_game_server_list(struct ssgl_game_server **output, int *outputcount,
 				struct ssgl_game_server *input, int inputcount)
 {
-	fprintf(stderr, "copy_game_server_list 1\n");
+	/* fprintf(stderr, "copy_game_server_list 1\n"); */
 	if (*output) {
 		free(*output);
 		*output = NULL;
-		fprintf(stderr, "copy_game_server_list 2\n");
+		/* fprintf(stderr, "copy_game_server_list 2\n"); */
 	}
 	if (inputcount > 0) {
 		*output = malloc(sizeof(**output) * inputcount);
 		memcpy(*output, input, sizeof(**output) * inputcount);
-		fprintf(stderr, "copy_game_server_list 3\n");
+		/* fprintf(stderr, "copy_game_server_list 3\n"); */
 	}
-	fprintf(stderr, "copy_game_server_list 4, count = %d\n", inputcount);
+	/* fprintf(stderr, "copy_game_server_list 4, count = %d\n", inputcount); */
 	*outputcount = inputcount;
 }
 
@@ -178,10 +178,10 @@ static void *server_tracker_thread(void *tracker_info)
 
 		pthread_mutex_unlock(&st->mutex);
 		if (changed && st->notifier) {
-			fprintf(stderr, "server tracker calling callback zzz\n");
+			/* fprintf(stderr, "server tracker calling callback zzz\n"); */
 			st->notifier(st->cookie);
 		} else if (changed) {
-			fprintf(stderr, "server tracker noticed change, but not calling callback zzz\n");
+			/* fprintf(stderr, "server tracker noticed change, but not calling callback zzz\n"); */
 		}
 
 		if (mverse_server_count == 0 || game_server_count == 0)
@@ -209,17 +209,14 @@ struct server_tracker *server_tracker_start(char *lobbyhost,
 	st->cookie = cookie;
 	st->notifier = notifier;
 
-	pthread_attr_init(&st->thread_attr);
-	pthread_attr_setdetachstate(&st->thread_attr, PTHREAD_CREATE_DETACHED);
-	rc = pthread_create(&st->thread, &st->thread_attr, server_tracker_thread, st);
+	rc = create_thread(&st->thread, server_tracker_thread, st, "sniss-srvtrack", 1);
 	if (rc) {
-		fprintf(stderr, "snis_server: failed to create server tracker theread: %d, %s, %s.\n",
+		fprintf(stderr, "snis_server: failed to create server tracker thread: %d, %s, %s.\n",
 			rc, strerror(rc), strerror(errno));
 		free(st->lobbyhost);
 		free(st);
 		return NULL;
 	}
-	pthread_setname_np(st->thread, "sniss-srvtrack");
 	return st;
 }
 

@@ -55,6 +55,7 @@ struct solarsystem_asset_spec *solarsystem_asset_spec_read(char *filename)
 	int rc, ln = 0;
 	int planet_textures_read = 0;
 	int planet_textures_expected = 0;
+	int got_position = 0;
 
 	f = fopen(filename, "r");
 	if (!f) {
@@ -105,6 +106,7 @@ struct solarsystem_asset_spec *solarsystem_asset_spec_read(char *filename)
 			memset(a->planet_normalmap, 0, sizeof(a->planet_normalmap[0]) * PLANET_TYPE_COUNT_SHALL_BE);
 			a->planet_type = malloc(sizeof(a->planet_type[0]) * PLANET_TYPE_COUNT_SHALL_BE);
 			memset(a->planet_type, 0, sizeof(a->planet_type[0]) * PLANET_TYPE_COUNT_SHALL_BE);
+			a->atmosphere_color = malloc(sizeof(a->atmosphere_color[0]) * PLANET_TYPE_COUNT_SHALL_BE);
 			continue;
 		} else if (has_prefix("planet texture:", line)) {
 			if (a->nplanet_textures == 0) {
@@ -117,12 +119,38 @@ struct solarsystem_asset_spec *solarsystem_asset_spec_read(char *filename)
 				goto bad_line;
 			}
 			char word1[1000], word2[1000], word3[1000];
+			unsigned char r, g, b;
 			field = get_field(line);
+			rc = sscanf(field, "%s %s %s %hhu %hhu %hhu", word1, word2, word3, &r, &g, &b);
+			if (rc == 6) {
+				a->planet_texture[planet_textures_read] = strdup(word1);
+				a->planet_normalmap[planet_textures_read] = strdup(word2);
+				a->planet_type[planet_textures_read] = strdup(word3);
+				a->atmosphere_color[planet_textures_read].r = r;
+				a->atmosphere_color[planet_textures_read].g = g;
+				a->atmosphere_color[planet_textures_read].b = b;
+				planet_textures_read++;
+				continue;
+			}
+			rc = sscanf(field, "%s %s %hhu %hhu %hhu", word1, word2, &r, &g, &b);
+			if (rc == 5) {
+				a->planet_texture[planet_textures_read] = strdup(word1);
+				a->planet_type[planet_textures_read] = strdup(word2);
+				a->planet_normalmap[planet_textures_read] = strdup("no-normal-map");
+				a->atmosphere_color[planet_textures_read].r = r;
+				a->atmosphere_color[planet_textures_read].g = g;
+				a->atmosphere_color[planet_textures_read].b = b;
+				planet_textures_read++;
+				continue;
+			}
 			rc = sscanf(field, "%s %s %s", word1, word2, word3);
 			if (rc == 3) {
 				a->planet_texture[planet_textures_read] = strdup(word1);
 				a->planet_normalmap[planet_textures_read] = strdup(word2);
 				a->planet_type[planet_textures_read] = strdup(word3);
+				a->atmosphere_color[planet_textures_read].r = 153;
+				a->atmosphere_color[planet_textures_read].g = 153;
+				a->atmosphere_color[planet_textures_read].b = 255;
 				planet_textures_read++;
 				continue;
 			}
@@ -131,6 +159,9 @@ struct solarsystem_asset_spec *solarsystem_asset_spec_read(char *filename)
 				a->planet_texture[planet_textures_read] = strdup(word1);
 				a->planet_normalmap[planet_textures_read] = strdup("no-normal-map");
 				a->planet_type[planet_textures_read] = strdup(word2);
+				a->atmosphere_color[planet_textures_read].r = 153;
+				a->atmosphere_color[planet_textures_read].g = 153;
+				a->atmosphere_color[planet_textures_read].b = 255;
 				planet_textures_read++;
 				fprintf(stderr,
 					"%s:line %d: expected planet texture prefix, planet normal map prefix, and planet type\n",
@@ -158,9 +189,30 @@ struct solarsystem_asset_spec *solarsystem_asset_spec_read(char *filename)
 			}
 			a->skybox_prefix = strdup(get_field(line));
 			continue;
+		} else if (has_prefix("star location:", line)) {
+			/* On the client, this info will be overridden by info from the lobby,
+			 * On the server, this info is authoritative.
+			 */
+			double x, y, z;
+			field = get_field(line);
+			rc = sscanf(field, "%lf %lf %lf", &x, &y, &z);
+			if (rc == 3) {
+				a->x = x;
+				a->y = y;
+				a->z = z;
+				got_position = 1;
+			}
+			continue;
 		}
 bad_line:
 		fprintf(stderr, "solar system asset file %s:ignoring line %d:%s\n", filename, ln, line);
+	}
+
+	if (!got_position) {
+		fprintf(stderr, "Solar system '%s' had no position information, using default.\n", filename);
+		a->x = 0.0;
+		a->y = 0.0;
+		a->z = 0.0;
 	}
 	fclose(f);
 
@@ -210,9 +262,53 @@ void solarsystem_asset_spec_free(struct solarsystem_asset_spec *s)
 	free(s->planet_texture);
 	free(s->planet_normalmap);
 	free(s->planet_type);
+	if (s->atmosphere_color)
+		free(s->atmosphere_color);
 	s->planet_texture = NULL;
 	s->planet_normalmap = NULL;
 	s->planet_type = NULL;
+	s->atmosphere_color = NULL;
 	free(s);
 }
 
+#ifdef SOLARSYSTEM_CONFIG_TEST
+
+static void print_solarsystem_config(char *name, struct solarsystem_asset_spec *ss)
+{
+	int i;
+
+	printf("-----------------------------\n");
+	printf("Solarsystem %s:\n", name);
+	printf("  Sun texture: %s\n", ss->sun_texture);
+	printf("  skybox prefix: %s\n", ss->skybox_prefix);
+	printf("  nplanet textures: %d\n", ss->nplanet_textures);
+
+	for (i = 0; i < ss->nplanet_textures; i++) {
+		printf("    planet_texture[%d]   : %s\n", i, ss->planet_texture[i]);
+		printf("    planet_normalmap[%d] : %s\n", i, ss->planet_normalmap[i]);
+		printf("    planet_type[%d] : %s\n", i, ss->planet_type[i]);
+		printf("    planet  rgb[%d] : %hhu, %hhu, %hhu\n", i,
+			ss->atmosphere_color[i].r, ss->atmosphere_color[i].g, ss->atmosphere_color[i].b);
+	}
+}
+
+int main(int argc, char *argv[])
+{
+	struct solarsystem_asset_spec *ss;
+	int i;
+
+	for (i = 1; i < argc; i++) {
+		printf("Reading solarsystem config file %s\n", argv[i]);
+		ss = solarsystem_asset_spec_read(argv[i]);
+		if (!ss) {
+			fprintf(stderr, "Failed to read solarsystem config '%s'\n", argv[i]);
+			continue;
+		}
+		print_solarsystem_config(argv[i], ss);
+		solarsystem_asset_spec_free(ss);
+		ss = NULL;
+	}
+	exit(0);
+}
+
+#endif

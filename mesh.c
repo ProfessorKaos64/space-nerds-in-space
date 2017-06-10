@@ -31,6 +31,19 @@ float mesh_compute_radius(struct mesh *m)
 	return max_radius;
 }
 
+float mesh_compute_nonuniform_scaled_radius(struct mesh *m, double sx, double sy, double sz)
+{
+	int i;
+	float r, max_radius = 0.0;
+
+	for (i = 0; i < m->nvertices; i++) {
+		r = dist3d(m->v[i].x * sx, m->v[i].y * sy, m->v[i].z * sz);
+		if (r > max_radius)
+			max_radius = r;
+	}
+	return max_radius;
+}
+
 void mesh_distort_helper(struct mesh *m, float distortion)
 {
 	int i;
@@ -833,14 +846,14 @@ bail:
 
 /* mesh_fabricate_billboard() makes a billboard:
  *   quad is centered on 0,0 and texture coords are 0,0 in lower left per opengl convention
- *               .-- x = cx
+ *               .-- x
  *    -x <--     V     ---> +x
  * +y       0         1
  * ^   (0,1) +-------+ (1,1)
  * |         |\      |
  * |         | \     |
  *           |  \    |
- * y = cy -> |   \   |
+ * y ------> |   \   |
  *           |    \  |
  * |         |     \ |
  * |   (0,0) |      \| (1,0)
@@ -849,7 +862,7 @@ bail:
  *          normal = +z
  */
 
-struct mesh *mesh_fabricate_billboard(float cx, float cy, float width, float height)
+struct mesh *mesh_fabricate_billboard(float width, float height)
 {
 	struct mesh *m;
 
@@ -875,17 +888,17 @@ struct mesh *mesh_fabricate_billboard(float cx, float cy, float width, float hei
 	m->l = NULL;
 
 	m->geometry_mode = MESH_GEOMETRY_TRIANGLES;
-	m->v[0].x = -width / 2.0f + cx;
-	m->v[0].y = height / 2.0f + cy;
+	m->v[0].x = -width / 2.0f;
+	m->v[0].y = height / 2.0f;
 	m->v[0].z = 0;
-	m->v[1].x = width / 2.0f + cx;
-	m->v[1].y = height / 2.0f + cy;
+	m->v[1].x = width / 2.0f;
+	m->v[1].y = height / 2.0f;
 	m->v[1].z = 0;
-	m->v[2].x = width / 2.0f + cx;
-	m->v[2].y = -height / 2.0f + cy;
+	m->v[2].x = width / 2.0f;
+	m->v[2].y = -height / 2.0f;
 	m->v[2].z = 0;
-	m->v[3].x = -width / 2.0f + cx;
-	m->v[3].y = -height / 2.0f + cy;
+	m->v[3].x = -width / 2.0f;
+	m->v[3].y = -height / 2.0f;
 	m->v[3].z = 0;
 
 	m->t[0].v[0] = &m->v[0];
@@ -946,7 +959,7 @@ static struct vertex *lookup_maybe_add_vertex(struct mesh *m, struct vertex *v, 
 }
 
 /* See: http://blog.andreaskahler.com/2009/06/creating-icosphere-mesh-in-code.html */
-struct mesh *mesh_unit_icosohedron(void)
+struct mesh *mesh_unit_icosahedron(void)
 {
 	const double tau = (1.0 + sqrt(5.0)) / 2.0;
 	const double scale = 1.0 / sqrt(1.0 + tau * tau);
@@ -1215,7 +1228,7 @@ static struct mesh *mesh_subdivide_icosphere(struct mesh *m, int subdivisions)
 
 struct mesh *mesh_unit_icosphere(int subdivisions)
 {
-	struct mesh *m = mesh_unit_icosohedron();
+	struct mesh *m = mesh_unit_icosahedron();
 	struct mesh *m2, *m3;
 
 	if (!m)
@@ -1571,6 +1584,54 @@ void mesh_map_xy_to_uv(struct mesh *m)
 	mesh_graph_dev_init(m);
 }
 
+void mesh_unit_cube_uv_map(struct mesh *m)
+{
+	float u0, v0, u1, v1, u2, v2;
+	int i;
+
+	if (m->tex)
+		free(m->tex);
+
+	m->tex = malloc(sizeof(*m->tex) * m->ntriangles * 3);
+	if (!m->tex)
+		return;
+
+	for (i = 0; i < m->ntriangles; i++) {
+		struct vertex *vtx0, *vtx1, *vtx2;
+
+		vtx0 = m->t[i].v[0];
+		vtx1 = m->t[i].v[1];
+		vtx2 = m->t[i].v[2];
+
+		if (fabs(vtx0->x - vtx2->x) < 0.01 && fabs(vtx0->x - vtx1->x) < 0.01) {
+			/* x is constant, y and z control the mapping */
+			u0 = vtx0->z + 0.5;
+			v0 = vtx0->y + 0.5;
+			u1 = vtx1->z + 0.5;
+			v1 = vtx1->y + 0.5;
+			u2 = vtx2->z + 0.5;
+			v2 = vtx2->y + 0.5;
+		} else if (fabs(vtx0->y - vtx2->y) < 0.01 && fabs(vtx0->y - vtx1->y) < 0.01) {
+			/* y is constant, x and z control the mapping */
+			u0 = vtx0->z + 0.5;
+			v0 = vtx0->x + 0.5;
+			u1 = vtx1->z + 0.5;
+			v1 = vtx1->x + 0.5;
+			u2 = vtx2->z + 0.5;
+			v2 = vtx2->x + 0.5;
+		} else {
+			u0 = vtx0->x + 0.5;
+			v0 = vtx0->y + 0.5;
+			u1 = vtx1->x + 0.5;
+			v1 = vtx1->y + 0.5;
+			u2 = vtx2->x + 0.5;
+			v2 = vtx2->y + 0.5;
+		}
+		mesh_set_triangle_texture_coords(m, i, u0, v0, u1, v1, u2, v2);
+	}
+	mesh_graph_dev_init(m);
+}
+
 struct mesh *mesh_fabricate_planetary_ring(float ir, float or)
 {
 	struct mesh *m;
@@ -1651,16 +1712,19 @@ struct particle {
 
 static void create_particle(float h, float r1, struct particle *particles, int i)
 {
+	float angle, r;
 	particles[i].offset = fabs(snis_random_float());
 	particles[i].lifetime = fabs(snis_random_float());
 	particles[i].decay = 0.1;
 
+	angle = snis_random_float() * M_PI * 2;
+	r = snis_random_float();
 	particles[i].xpos = 0.0;
-	particles[i].ypos = 0.0;
-	particles[i].zpos = 0.0;
+	particles[i].ypos = 0.0 + cos(angle) * r * r1;
+	particles[i].zpos = 0.0 + sin(angle) * r * r1;
 
 	/* uniform_random_point_in_spehere(r1 * 0.1, &particles[i].yspeed, &particles[i].zspeed); */
-	particles[i].xspeed = -fabs(snis_random_float()) * h * 0.1;
+	particles[i].xspeed = -fabs(snis_random_float() * 0.5 + 0.5) * h * 0.1;
 	particles[i].yspeed = 0;
 	particles[i].zspeed = 0;
 

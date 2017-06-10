@@ -29,6 +29,9 @@ GLOBAL void snis_text_input_box_set_return(struct snis_text_input_box *t,
 		snis_text_input_box_callback return_function);
 GLOBAL void snis_text_input_box_set_dynamic_width(struct snis_text_input_box *t,
 		int minwidth, int maxwidth);
+GLOBAL void snis_text_input_box_set_contents(struct snis_text_input_box *t, char *contents);
+GLOBAL int snis_text_input_box_get_x(struct snis_text_input_box *t);
+GLOBAL int snis_text_input_box_get_y(struct snis_text_input_box *t);
 	
 #undef GLOBAL
 #endif

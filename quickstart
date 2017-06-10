@@ -85,15 +85,18 @@ uppercase()
 SS1=$(get_solarsystem_name karado)
 SS2=$(get_solarsystem_name sirius)
 SS3=$(get_solarsystem_name polaris)
+SS4=$(get_solarsystem_name tau-scorpii)
 
 export SNISRAND=12345
-./snis_server -l localhost -g SPACENERDS -L $(uppercase "$SS1") x --enable-enscript -m narnia -s "$SS1" &
+./snis_server -l localhost -L $(uppercase "$SS1") --enable-enscript -m narnia -s "$SS1" &
 if [ "$MULTIVERSE_TEST" != "" ]
 then
 	export SNISRAND=54321
-	./snis_server -l localhost -g XSPACENERDS -L $(uppercase "$SS2") x --enable-enscript -m narnia -s "$SS2" &
+	./snis_server -l localhost -L $(uppercase "$SS2") --enable-enscript -m narnia -s "$SS2" &
 	export SNISRAND=9557
-	./snis_server -l localhost -g YSPACENERDS -L $(uppercase "$SS3") x --enable-enscript -m narnia -s "$SS3" &
+	./snis_server -l localhost -L $(uppercase "$SS3") --enable-enscript -m narnia -s "$SS3" &
+	export SNISRAND=1337
+	./snis_server -l localhost -L $(uppercase "$SS4") --enable-enscript -m narnia -s "$SS4" &
 fi
 
 sleep 2.50
@@ -101,15 +104,23 @@ sleep 2.50
 # Some common aspect ratios.  Note: the game was designed on a machine
 # with a 16:9 aspect ratio.  Other aspect ratios may have some UI issues.
 #
-ASPECT_RATIO="" # unspecified, figure it out from window manager
-# ASPECT_RATIO="--aspect-ratio 5:4"
-# ASPECT_RATIO="--aspect-ratio 4:3"
-# ASPECT_RATIO="--aspect-ratio 16:10"
-# ASPECT_RATIO="--aspect-ratio 16:9"
+# ASPECT_RATIO, if unspecified, will figure it out from window manager
+ASPECT_RATIO="${ASPECT_RATIO:-}"
+# ASPECT_RATIO="5:4"
+# ASPECT_RATIO="4:3"
+# ASPECT_RATIO="16:10"
+# ASPECT_RATIO="16:9"
+
+if [ "$ASPECT_RATIO" != "" ]
+then
+	ASPECT_RATIO_ARG="--aspect-ratio $ASPECT_RATIO"
+else
+	ASPECT_RATIO_ARG=""
+fi
 
 # start the game client and server in quickstart mode
 # ./snis_client $ASPECT_RATIO --fullscreen --solarsystem "$SNIS_SOLARSYSTEM" --quickstart --starship "$shipname" --pw "$password" $@
-./snis_client $ASPECT_RATIO --fullscreen --starship "$shipname" --pw "$password" $@
+./snis_client $ASPECT_RATIO_ARG --fullscreen --starship "$shipname" --pw "$password" $@
 
 exit $?
 

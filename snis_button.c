@@ -9,6 +9,9 @@
 #define DEFINE_BUTTON_GLOBALS
 #include "snis_button.h"
 #undef DEFINE_BUTTON_GLOBALS
+#include "wwviaudio.h"
+
+static int default_button_sound = -1;
 
 struct button {
 	int x, y, width, height;
@@ -17,6 +20,7 @@ struct button {
 	int font;
 	int *checkbox_value;
 	button_function bf;
+	int button_sound;
 	void *cookie;
 	unsigned char button_press_feedback_counter;
 };
@@ -59,6 +63,7 @@ struct button *snis_button_init(int x, int y, int width, int height,
 	b->cookie = cookie;
 	b->checkbox_value = NULL;
 	b->button_press_feedback_counter = 0;
+	b->button_sound = default_button_sound;
 	if (b->width < 0 || b->height < 0)
 		snis_button_compute_dimensions(b);
 	return b;
@@ -83,6 +88,14 @@ static void snis_button_draw_outline(float x1, float y1, float width, float heig
 	sng_current_draw_line(x1 + width - d, y1, x1 + width, y1 + d);
 	sng_current_draw_line(x1, y1 + height - d, x1 + d, y1 + height);
 	sng_current_draw_line(x1 + width, y1 + height - d, x1 + width - d, y1 + height);
+}
+
+int snis_button_inside(struct button *b, int x, int y)
+{
+	x = sng_pixelx_to_screenx(x);
+	y = sng_pixely_to_screeny(y);
+	return x >= b->x && x <= b->x + b->width &&
+		y >= b->y && y <= b->y + b->height;
 }
 
 void snis_button_draw(struct button *b)
@@ -130,9 +143,10 @@ void snis_button_draw(struct button *b)
 
 int snis_button_button_press(struct button *b, int x, int y)
 {
-	if (x < b->x || x > b->x + b->width || 
-		y < b->y || y > b->y + b->height)
+	if (!snis_button_inside(b, x, y))
 		return 0;
+	if (b->button_sound != -1)
+		wwviaudio_add_sound(b->button_sound);
 	if (b->bf)
 		b->bf(b->cookie);
 	if (b->checkbox_value)
@@ -144,6 +158,11 @@ int snis_button_button_press(struct button *b, int x, int y)
 void snis_button_set_color(struct button *b, int color)
 {
 	b->color = color;
+}
+
+int snis_button_get_color(struct button *b)
+{
+	return b->color;
 }
 
 void snis_button_checkbox(struct button *b, int *value)
@@ -161,4 +180,14 @@ int snis_button_get_x(struct button *b) { return b->x; }
 int snis_button_get_y(struct button *b) { return b->y; }
 int snis_button_get_width(struct button *b) { return b->width; }
 int snis_button_get_height(struct button *b) { return b->height; }
+
+void snis_button_set_sound(struct button *b, int sound)
+{
+	b->button_sound = sound;
+}
+
+void snis_button_set_default_sound(int sound)
+{
+	default_button_sound = sound;
+}
 

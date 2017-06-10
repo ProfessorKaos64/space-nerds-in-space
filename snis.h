@@ -25,7 +25,10 @@
 #include "material.h"
 #include "docking_port.h"
 #include "space-part.h"
+#include "oriented_bounding_box.h"
 
+#define MAXSTARMAPENTRIES 1000 /* max number of solar systems */
+#define MAX_STARMAP_ADJACENCIES 5 /* max warp lanes from one star to other stars */
 #define DEFAULT_SOLAR_SYSTEM "default"
 #define SNIS_PROTOCOL_VERSION "SNIS001"
 #define COMMON_MTWIST_SEED 97872
@@ -68,6 +71,11 @@
 #define MIN_NEBULA_RADIUS 200
 #define NDERELICTS 20
 #define NWARPGATES 10
+/* Maximum distance between solarsystems that can be warpgated
+ * Note, this is on a completely different dimension than all other
+ * positions in the game.
+ */
+#define SNIS_WARP_GATE_THRESHOLD 15.0
 
 #define NPLANETS 6
 #define NATMOSPHERE_TYPES 100
@@ -99,6 +107,8 @@
 #define OBJTYPE_SHIELD_EFFECT 19
 #define OBJTYPE_DOCKING_PORT 20
 #define OBJTYPE_WARPGATE 21
+#define OBJTYPE_BLOCK 22
+#define OBJTYPE_TURRET 23
 
 #define SHIELD_EFFECT_LIFETIME 30
 
@@ -126,6 +136,7 @@ struct power_model_data {
 	struct power_model_device phasers;
 	struct power_model_device shields;
 	struct power_model_device tractor;
+	struct power_model_device lifesupport;
 	uint8_t voltage;
 };
 
@@ -138,6 +149,7 @@ struct ship_damage_data {
 	uint8_t sensors_damage;
 	uint8_t comms_damage;
 	uint8_t tractor_damage;
+	uint8_t lifesupport_damage;
 };
 
 struct command_data {
@@ -218,6 +230,8 @@ struct ai_mining_bot_data {
 	uint8_t platinum;
 	uint8_t germanium;
 	uint8_t uranium;
+	uint8_t oxygen;
+	uint8_t fuel;
 };
 
 struct ai_tow_ship_data {
@@ -271,6 +285,9 @@ struct ship_data {
 #define LASER_VELOCITY (200.0)
 #define LASER_RANGE (LASER_VELOCITY * LASER_LIFETIME)
 #define LASER_DETONATE_DIST2 (100 * 100)
+#define TURRET_LASER_POWER 20
+#define TURRET_LASER_WAVELENGTH 128
+#define TURRET_FIRE_INTERVAL 150
 #define PATROL_ATTACK_DIST (LASER_RANGE)
 #define LASERBEAM_DURATION 5 
 #define MINING_LASER_DURATION 2 
@@ -355,6 +372,12 @@ struct ship_data {
 #define FUEL_UNITS (FUEL_DURATION * 60.0 * 30.0)
 #define FUEL_CONSUMPTION_UNIT ((uint32_t) (UINT_MAX / FUEL_UNITS))
 	uint32_t fuel;
+#define OXYGEN_DURATION (4.0) /* minutes */
+#define OXYGEN_UNITS (OXYGEN_DURATION * 60.0 * 30.0)
+#define OXYGEN_CONSUMPTION_UNIT ((uint32_t) (UINT_MAX / OXYGEN_UNITS))
+#define OXYGEN_PRODUCTION_UNIT (1.8 * OXYGEN_CONSUMPTION_UNIT)
+#define OXYGEN_REPLENISHMENT_UNIT OXYGEN_CONSUMPTION_UNIT
+	uint32_t oxygen;
 	uint8_t rpm;
 	uint8_t throttle;
 	uint8_t temp;
@@ -412,6 +435,9 @@ struct ship_data {
 	uint8_t in_secure_area;
 	uint8_t emf_detector;
 	uint8_t auto_respawn;
+#define NAV_MODE_NORMAL 0
+#define NAV_MODE_STARMAP 1
+	uint8_t nav_mode;
 	uint32_t home_planet;
 	int flames_timer;
 	uint8_t docking_magnets;
@@ -533,6 +559,8 @@ struct derelict_data {
 	uint8_t shiptype; /* same as snis_entity_science_data subclass */
 	union quat rotational_velocity;
 	uint8_t persistent;
+	uint8_t fuel;
+	uint8_t oxygen;
 };
 
 struct wormhole_data {
@@ -549,17 +577,13 @@ struct spacemonster_data {
 	struct entity **entity;
 };
 
-#define MAX_LASERBEAM_SEGMENTS 32
 struct laserbeam_data {
-	double *x;
-	double *y;
-	double *z;
 	uint32_t origin;
 	uint32_t target;
+	struct material *material;
+	struct entity *laserflash_entity;
 	uint8_t power;
 	uint8_t wavelength;
-	struct entity **entity;
-	struct material *material;
 	uint8_t mining_laser;
 };
 
@@ -595,6 +619,35 @@ struct warpgate_data {
 	uint32_t warpgate_number;
 };
 
+struct block_data {
+	uint32_t parent_id;
+	double sx, sy, sz; /* scale in x, y, z */
+	union quat relative_orientation;
+	double dx, dy, dz; /* offset position from parent, used only server side */
+	double radius;
+	struct oriented_bounding_box obb;
+	uint32_t naughty_list[8];
+	uint32_t root_id;
+	union quat rotational_velocity;
+	uint8_t block_material_index; /* For now, 0 for big blocks, 1 for small blocks */
+	uint8_t health;
+};
+
+struct turret_data {
+	uint32_t parent_id, root_id;
+	union quat relative_orientation;
+	double dx, dy, dz; /* offset position from parent, used only server side */
+	uint32_t current_target_id;
+	union quat rotational_velocity;
+	union quat base_orientation;
+	union quat base_orientation_history[SNIS_ENTITY_NUPDATE_HISTORY];
+	union vec3 up_direction;
+	uint8_t fire_countdown;
+	uint8_t fire_countdown_reset_value;
+	uint8_t health;
+	struct entity *turret_base_entity;
+};
+
 union type_specific_data {
 	struct ship_data ship;
 	struct laser_data laser;
@@ -613,6 +666,8 @@ union type_specific_data {
 	struct warp_effect_data warp_effect;
 	struct docking_port_data docking_port;
 	struct warpgate_data warpgate;
+	struct block_data block;
+	struct turret_data turret;
 };
 
 struct snis_entity;
@@ -644,8 +699,6 @@ struct snis_entity {
 	union type_specific_data tsd;
 	move_function move;
 	struct snis_entity_science_data sdata;
-	double sci_coordx; /* selected coords by science station for warp calculations */
-	double sci_coordz;
 	struct entity *entity;
 	struct space_partition_entry partition;
 	union quat o[SNIS_ENTITY_NUPDATE_HISTORY];
@@ -669,11 +722,12 @@ typedef void (*damcon_draw_function)(void *drawable, struct snis_damcon_entity *
 #define DAMCON_TYPE_SENSORARRAY 5
 #define DAMCON_TYPE_COMMUNICATIONS 6
 #define DAMCON_TYPE_TRACTORSYSTEM 7
-#define DAMCON_TYPE_REPAIR_STATION 8
-#define DAMCON_TYPE_SOCKET 9
-#define DAMCON_TYPE_PART 10 
-#define DAMCON_TYPE_ROBOT 11 
-#define DAMCON_TYPE_WAYPOINT 12
+#define DAMCON_TYPE_LIFESUPPORTSYSTEM 8
+#define DAMCON_TYPE_REPAIR_STATION 9
+#define DAMCON_TYPE_SOCKET 10
+#define DAMCON_TYPE_PART 11
+#define DAMCON_TYPE_ROBOT 12
+#define DAMCON_TYPE_WAYPOINT 13
 /* Threshold beyond which repair requires using the repair station */
 #define DAMCON_EASY_REPAIR_THRESHOLD 200
 
@@ -761,7 +815,7 @@ struct damcon_data {
 #define damcon_index(data, object) ((object) - &(data)->o[0])
 
 #define DAMCONXDIM 800.0
-#define DAMCONYDIM 2000.0
+#define DAMCONYDIM 2666.666
 
 /* Time after being killed to wait for respawn */
 #define RESPAWN_TIME_SECS 20
@@ -774,6 +828,13 @@ struct passenger_data {
 	char name[50];
 	uint32_t location, destination;
 	uint32_t fare;
+};
+
+/* For waypoints that players can set */
+#define MAXWAYPOINTS 10  /* must be small enough to fit on science screen */
+struct player_waypoint {
+	double x, y, z;
+	char name[15];
 };
 
 #endif

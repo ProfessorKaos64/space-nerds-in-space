@@ -23,6 +23,10 @@
 
 #define PLANET_TYPE_COUNT_SHALL_BE 6
 
+struct atmosphere_color_rgb {
+	unsigned char r, g, b;
+};
+
 struct solarsystem_asset_spec {
 	char *sun_texture;
 	char *skybox_prefix;
@@ -30,6 +34,8 @@ struct solarsystem_asset_spec {
 	char **planet_texture;
 	char **planet_normalmap;
 	char **planet_type;
+	struct atmosphere_color_rgb *atmosphere_color;
+	double x, y, z; /* Location of solarsystem (separate coord sys from rest of objects) */
 };
 
 struct solarsystem_asset_spec *solarsystem_asset_spec_read(char *filename);

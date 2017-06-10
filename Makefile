@@ -267,6 +267,7 @@ SCAD_PARAMS_FILES=${MODELSRCDIR}/disruptor.scad_params.h \
 	${MODELSRCDIR}/starbase5.scad_params.h \
 	${MODELSRCDIR}/research-vessel.scad_params.h \
 	${MODELSRCDIR}/conqueror.scad_params.h \
+	${MODELSRCDIR}/cruiser.scad_params.h \
 	${MODELSRCDIR}/asteroid-miner.scad_params.h \
 	${MODELSRCDIR}/battlestar.scad_params.h \
 	${MODELSRCDIR}/wombat.scad_params.h \
@@ -278,8 +279,10 @@ SCAD_PARAMS_FILES=${MODELSRCDIR}/disruptor.scad_params.h \
 	${MODELSRCDIR}/freighter.scad_params.h \
 	${MODELSRCDIR}/scrambler.scad_params.h \
 	${MODELSRCDIR}/spaceship2.scad_params.h \
+	${MODELSRCDIR}/spaceship3.scad_params.h \
 	${MODELSRCDIR}/skorpio.scad_params.h \
 	${MODELSRCDIR}/spaceship.scad_params.h \
+	${MODELSRCDIR}/transport.scad_params.h \
 	${MODELSRCDIR}/escapepod.scad_params.h \
 	${MODELSRCDIR}/mantis.scad_params.h
 
@@ -292,7 +295,8 @@ DOCKING_PORT_FILES=${MODELSRCDIR}/starbase2.docking_ports.h \
 
 MANSRCDIR=.
 MANPAGES=${MANSRCDIR}/snis_client.6.gz ${MANSRCDIR}/snis_server.6.gz \
-	${MANSRCDIR}/earthlike.1.gz ${MANSRCDIR}/gaseous-giganticus.1
+	${MANSRCDIR}/earthlike.1.gz ${MANSRCDIR}/gaseous-giganticus.1 \
+	${MANSRCDIR}/snis_text_to_speech.sh.6 ${MANSRCDIR}/snis_test_audio.1.gz
 MANDIR=${DESTDIR}/${PREFIX}/share/man/man6
 
 DESKTOPDIR=${DESTDIR}/${PREFIX}/share/applications
@@ -361,26 +365,33 @@ COMMONOBJS=mathutils.o snis_alloc.o snis_socket_io.o snis_marshal.o \
 		bline.o shield_strength.o stacktrace.o snis_ship_type.o \
 		snis_faction.o mtwist.o names.o infinite-taunt.o snis_damcon_systems.o \
 		string-utils.o c-is-the-locale.o starbase_metadata.o arbitrary_spin.o \
-		snis_hash.o planetary_atmosphere.o
+		snis_hash.o planetary_atmosphere.o mesh.o pthread_util.o snis_opcode_def.o
 SERVEROBJS=${COMMONOBJS} snis_server.o starbase-comms.o \
 		power-model.o quat.o vec4.o matrix.o snis_event_callback.o space-part.o fleet.o \
 		commodities.o docking_port.o elastic_collision.o snis_nl.o spelled_numbers.o \
 		snis_server_tracker.o snis_bridge_update_packet.o solarsystem_config.o a_star.o \
-		key_value_parser.o nonuniform_random_sampler.o
+		key_value_parser.o nonuniform_random_sampler.o oriented_bounding_box.o \
+		graph_dev_mesh_stub.o turret_aimer.o
 MULTIVERSEOBJS=snis_multiverse.o snis_marshal.o snis_socket_io.o mathutils.o mtwist.o stacktrace.o \
-		snis_hash.o quat.o string-utils.o key_value_parser.o snis_bridge_update_packet.o
+		snis_hash.o quat.o string-utils.o key_value_parser.o snis_bridge_update_packet.o \
+		pthread_util.o
 
 COMMONCLIENTOBJS=${COMMONOBJS} ${OGGOBJ} ${SNDOBJS} snis_ui_element.o snis_font.o snis_text_input.o \
 	snis_typeface.o snis_gauge.o snis_button.o snis_label.o snis_sliders.o snis_text_window.o \
-	snis_strip_chart.o mesh.o material.o stl_parser.o entity.o matrix.o my_point.o liang-barsky.o joystick.o \
+	snis_strip_chart.o material.o stl_parser.o entity.o matrix.o my_point.o liang-barsky.o joystick.o \
 	quat.o vec4.o thrust_attachment.o docking_port.o ui_colors.o snis_keyboard.o solarsystem_config.o \
-	pronunciation.o
+	pronunciation.o snis_preferences.o
 
 CLIENTOBJS=${COMMONCLIENTOBJS} shader.o graph_dev_opengl.o opengl_cap.o snis_graph.o snis_client.o
 
 LIMCLIENTOBJS=${COMMONCLIENTOBJS} graph_dev_gdk.o snis_limited_graph.o snis_limited_client.o
 
-SDLCLIENTOBJS=${COMMONCLIENTOBJS} shader.o graph_dev_opengl.o opengl_cap.o snis_graph.o mesh_viewer.o png_utils.o
+SDLCLIENTOBJS=shader.o graph_dev_opengl.o opengl_cap.o snis_graph.o mesh_viewer.o \
+				png_utils.o turret_aimer.o quat.o mathutils.o mesh.o mtwist.o \
+				material.o entity.o snis_alloc.o matrix.o stacktrace.o stl_parser.o \
+				snis_typeface.o snis_font.o string-utils.o ui_colors.o liang-barsky.o \
+				bline.o vec4.o
+
 
 SSGL=ssgl/libssglclient.a
 LIBS=-lGL -Lssgl -lssglclient -ldl -lm ${LUALIBS} ${PNGLIBS} ${GLEWLIBS} -lcrypto -lssl
@@ -407,16 +418,17 @@ MULTIVERSELIBS=-Lssgl -lssglclient ${LRTLIB} -ldl -lm -lcrypto -lssl
 
 
 PROGS=snis_server snis_client snis_limited_client snis_multiverse
-BINPROGS=bin/ssgl_server bin/snis_server bin/snis_client bin/snis_limited_client bin/text_to_speech.sh \
-		bin/snis_multiverse
-UTILPROGS=util/mask_clouds util/cloud-mask-normalmap mesh_viewer
+BINPROGS=bin/ssgl_server bin/snis_server bin/snis_client bin/snis_limited_client bin/snis_text_to_speech.sh \
+		bin/snis_multiverse bin/lsssgl
+UTILPROGS=util/mask_clouds util/cloud-mask-normalmap mesh_viewer util/sample_image_colors \
+		util/generate_solarsystem_positions
+ESSENTIAL_SCRIPTS=snis_text_to_speech.sh
 
 # model directory
 MD=${ASSETSSRCDIR}/models
 
 MODELS=${MD}/freighter.stl \
 	${MD}/laser.stl \
-	${MD}/planet.stl \
 	${MD}/spaceship.stl \
 	${MD}/torpedo.stl \
 	${MD}/tanker.stl \
@@ -440,9 +452,6 @@ MODELS=${MD}/freighter.stl \
 	${MD}/asteroid-miner.stl \
 	${MD}/spaceship2.stl \
 	${MD}/spaceship3.stl \
-	${MD}/planet1.stl \
-	${MD}/planet2.stl \
-	${MD}/planet3.stl \
 	${MD}/dragonhawk.stl \
 	${MD}/skorpio.stl \
 	${MD}/long-triangular-prism.stl \
@@ -459,7 +468,10 @@ MODELS=${MD}/freighter.stl \
 	${MD}/docking_port2.stl \
 	${MD}/warpgate.stl \
 	${MD}/escapepod.stl \
-	${MD}/mantis.stl
+	${MD}/mantis.stl \
+	${MD}/laser_turret.stl \
+	${MD}/laser_turret_base.stl \
+	${MD}/uv_sphere.stl
 
 
 MYCFLAGS=-DPREFIX=${PREFIX} ${DEBUGFLAG} ${PROFILEFLAG} ${OPTIMIZEFLAG}\
@@ -494,7 +506,7 @@ OPENSCAD=openscad -o $@ $< && $(ECHO) '  OPENSCAD' $<
 EXTRACTSCADPARAMS=$(AWK) -f extract_scad_params.awk $< > $@ && $(ECHO) '  EXTRACT THRUST ATTACHMENTS' $@
 EXTRACTDOCKINGPORTS=$(AWK) -f extract_docking_ports.awk $< > $@ && $(ECHO) '  EXTRACT DOCKING PORTS' $@
 
-ELOBJS=mtwist.o mathutils.o quat.o open-simplex-noise.o png_utils.o crater.o
+ELOBJS=mtwist.o mathutils.o quat.o open-simplex-noise.o png_utils.o crater.o pthread_util.o
 ELLIBS=-lm ${LRTLIB} -lpng
 ELLINK=$(CC) ${MYCFLAGS} -o $@ ${GTKCFLAGS} earthlike.o ${ELOBJS} ${ELLIBS} && $(ECHO) '  LINK' $@
 MCLIBS=-lm ${LRTLIB} -lpng
@@ -505,7 +517,7 @@ CMNMLIBS=-lm ${LRTLIB} -lpng
 CMNMOBJS=png_utils.o
 CMNMLINK=$(CC) ${MYCFLAGS} -o $@ ${GTKCFLAGS} util/cloud-mask-normalmap.o ${CMNMOBJS} ${CMNMLIBS} && $(ECHO) '  LINK' $@
 
-GGOBJS=mtwist.o mathutils.o open-simplex-noise.o quat.o png_utils.o
+GGOBJS=mtwist.o mathutils.o open-simplex-noise.o quat.o png_utils.o pthread_util.o
 GGLIBS=-lm ${LRTLIB} -lpng
 GGLINK=$(CC) ${MYCFLAGS} -o $@ ${GTKCFLAGS} gaseous-giganticus.o ${GGOBJS} ${GGLIBS} && $(ECHO) '  LINK' $@
 
@@ -523,6 +535,9 @@ opengl_cap.o : opengl_cap.c Makefile
 
 graph_dev_gdk.o : graph_dev_gdk.c Makefile
 	$(Q)$(GTKCOMPILE)
+
+graph_dev_mesh_stub.o:	graph_dev_mesh_stub.c graph_dev_mesh_stub.h
+	$(Q)$(COMPILE)
 
 material.o : material.c Makefile
 	$(Q)$(GTKCOMPILE)
@@ -551,13 +566,22 @@ ui_colors.o:	ui_colors.c ui_colors.h snis_graph.h Makefile
 snis_keyboard.o:	snis_keyboard.c snis_keyboard.h string-utils.o Makefile
 	$(Q)$(GTKCOMPILE)
 
+snis_preferences.o:	snis_preferences.c snis_preferences.h string-utils.h snis_packet.h
+	$(Q)$(COMPILE)
+
 solarsystem_config.o:	solarsystem_config.c solarsystem_config.h string-utils.h Makefile
 	$(Q)$(COMPILE)
+
+solarsystem_config_test: solarsystem_config.c string-utils.o
+	$(CC) ${MYCFLAGS} -DSOLARSYSTEM_CONFIG_TEST=1 -o $@ solarsystem_config.c string-utils.o
 
 my_point.o:   my_point.c Makefile
 	$(Q)$(COMPILE)
 
 mesh.o:   mesh.c Makefile
+	$(Q)$(COMPILE)
+
+pthread_util.o:	pthread_util.c pthread_util.h
 	$(Q)$(COMPILE)
 
 power-model.o:   power-model.c Makefile
@@ -597,7 +621,8 @@ snis_multiverse.o:	snis_multiverse.c snis_multiverse.h Makefile build_info.h \
 			snis_entity_key_value_specification.h
 	$(Q)$(COMPILE)
 
-snis_server_tracker.o:	snis_server_tracker.c snis_server_tracker.h ssgl/ssgl.h Makefile
+snis_server_tracker.o:	snis_server_tracker.c snis_server_tracker.h pthread_util.h \
+			ssgl/ssgl.h Makefile
 	$(Q)$(COMPILE)
 
 snis_client.o:	snis_client.c Makefile build_info.h ui_colors.h
@@ -630,10 +655,25 @@ util/mask_clouds.o:	util/mask_clouds.c
 util/cloud-mask-normalmap.o:	util/cloud-mask-normalmap.c
 	$(Q)$(COMPILE)
 
+util/sample_image_colors.o:	util/sample_image_colors.c png_utils.o
+	$(Q)$(COMPILE)
+
+util/sample_image_colors:	util/sample_image_colors.o png_utils.o
+	$(CC) ${MYCFLAGS} -o $@ util/sample_image_colors.o png_utils.o ${PNGLIBS}
+
+util/generate_solarsystem_positions.o:	util/generate_solarsystem_positions.c string-utils.o
+	$(Q)$(COMPILE)
+
+util/generate_solarsystem_positions:	util/generate_solarsystem_positions.o
+	$(CC) ${MYCFLAGS} -o $@ util/generate_solarsystem_positions.o string-utils.o -lm
+
 snis_socket_io.o:	snis_socket_io.c Makefile
 	$(Q)$(COMPILE)
 
 snis_marshal.o:	snis_marshal.c Makefile
+	$(Q)$(COMPILE)
+
+snis_opcode_def.o:	snis_opcode_def.c snis_opcode_def.h snis_packet.h Makefile
 	$(Q)$(COMPILE)
 
 snis_bridge_update_packet.o:	snis_bridge_update_packet.c snis_bridge_update_packet.h Makefile
@@ -669,6 +709,9 @@ snis_multiverse:	${MULTIVERSEOBJS} ${SSGL} Makefile
 snis_limited_client:	${LIMCLIENTOBJS} ${SSGL} Makefile
 	$(Q)$(LIMCLIENTLINK)
 
+ssgl/lsssgl:
+	(cd ssgl ; ${MAKE} )
+
 ssgl/ssgl_server:
 	(cd ssgl ; ${MAKE} )
 
@@ -692,9 +735,13 @@ bin/ssgl_server:	ssgl/ssgl_server
 	@mkdir -p bin
 	@cp ssgl/ssgl_server bin
 
-bin/text_to_speech.sh:	text_to_speech.sh
-	@cp text_to_speech.sh bin/text_to_speech.sh
-	@chmod +x bin/text_to_speech.sh
+bin/lsssgl:	ssgl/lsssgl
+	@mkdir -p bin
+	@cp ssgl/lsssgl bin
+
+bin/snis_text_to_speech.sh:	snis_text_to_speech.sh
+	@cp snis_text_to_speech.sh bin/snis_text_to_speech.sh
+	@chmod +x bin/snis_text_to_speech.sh
 
 mesh_viewer:	${SDLCLIENTOBJS} ${SSGL} Makefile
 	$(Q)$(SDLCLIENTLINK)
@@ -785,6 +832,12 @@ space-part.o:	space-part.c Makefile
 quat.o:	quat.c Makefile
 	$(Q)$(COMPILE)
 
+oriented_bounding_box.o:	oriented_bounding_box.c oriented_bounding_box.h
+	$(Q)$(COMPILE)
+
+turret_aimer.o:	turret_aimer.c turret_aimer.h quat.h mathutils.h
+	$(Q)$(COMPILE)
+
 vec4.o:	vec4.c Makefile
 	$(Q)$(COMPILE)
 
@@ -870,7 +923,7 @@ ${SSGL}:
 mostly-clean:
 	rm -f ${SERVEROBJS} ${CLIENTOBJS} ${LIMCLIENTOBJS} ${SDLCLIENTOBJS} ${PROGS} ${SSGL} \
 	${BINPROGS} ${UTILPROGS} stl_parser snis_limited_graph.c snis_limited_client.c \
-	test-space-partition
+	test-space-partition snis_test_audio.o snis_test_audio
 	( cd ssgl; ${MAKE} clean )
 
 test-marshal:	snis_marshal.c stacktrace.o Makefile
@@ -927,12 +980,21 @@ earthlike.1.gz:	earthlike.1
 gaseous-giganticus.1.gz:	gaseous-giganticus.1
 	gzip -9 - < gaseous-giganticus.6 > gaseous-giganticus.6.gz
 
+snis_test_audio.1.gz:	snis_test_audio.1
+	gzip -9 - < snis_test_audio.1 > snis_test_audio.1.gz
+
 print_ship_attributes:	snis_entity_key_value_specification.h key_value_parser.o
 	gcc -o print_ship_attributes print_ship_attributes.c key_value_parser.o
 
+snis_test_audio.o:	snis_test_audio.c Makefile ${SNDOBJS} ${OGGOBJ}
+	$(Q)$(VORBISCOMPILE)
+
+snis_test_audio:	snis_test_audio.o ${SNDLIBS} Makefile
+	gcc -o snis_test_audio snis_test_audio.o ${SNDOBJS} ${OGGOBJ} ${SNDLIBS}
+
 install:	${PROGS} ${MODELS} ${AUDIOFILES} ${TEXTURES} \
 		${MATERIALS} ${CONFIGFILES} ${SHADERS} ${LUASCRIPTS} ${MANPAGES} ${SSGL} \
-		${SOLARSYSTEMFILES}
+		${SOLARSYSTEMFILES} ${ESSENTIAL_SCRIPTS}
 	@# First check that PREFIX is sane, and esp. that it's not pointed at source
 	@mkdir -p ${DESTDIR}/${PREFIX}
 	@touch ${DESTDIR}/${PREFIX}/.canary-in-the-coal-mine.canary
@@ -947,7 +1009,7 @@ install:	${PROGS} ${MODELS} ${AUDIOFILES} ${TEXTURES} \
 	@ rm -f ${DESTDIR}/${PREFIX}/.canary-in-the-coal-mine.canary
 	mkdir -p ${DESTDIR}/${PREFIX}/bin
 	${INSTALL} -m 755 ssgl/ssgl_server ${DESTDIR}/${PREFIX}/bin
-	for x in ${PROGS} ; do \
+	for x in ${PROGS} ${ESSENTIAL_SCRIPTS} ; do \
 		${INSTALL} -m 755 bin/$$x \
 				${DESTDIR}/${PREFIX}/bin; \
 	done

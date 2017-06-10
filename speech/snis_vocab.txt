@@ -5,7 +5,9 @@ activate warp drive
 actuate
 actuate docking system
 actuate warp drive
+african
 after
+airspeed velocity
 alert
 all
 alongside
@@ -18,6 +20,7 @@ asteroid
 at
 atop
 base
+be
 beam
 before
 behind
@@ -32,6 +35,8 @@ by
 calculate
 calculate the distance to
 calculate the distance to the nearest planet
+calculate the distance to the selected target
+calculate the distance to the selected planet
 cancel red alert
 charge
 clockwise
@@ -61,6 +66,7 @@ course
 cut
 cut power to impulse
 cut power to impulse drive
+cut power to life support
 cut power to maneuvering
 cut power to phasers
 cut power to sensors
@@ -93,6 +99,7 @@ disable
 disengage
 disengage docking system
 distance
+do
 docking
 down
 drive
@@ -115,9 +122,12 @@ engage warp drive
 engineering
 engineering on screen
 engineering screen
+enough
 enter standard orbit
+european
 everything
 except
+far
 factor
 fifteen
 fifteen percent
@@ -141,6 +151,7 @@ full impulse drive
 full power
 full power to impulse
 full power to impulse drive
+full power to life support
 full power to maneuvering
 full power to phasers
 full power to sensors
@@ -154,6 +165,9 @@ full velocity
 full stop
 full throttle
 gate
+have
+how
+how far
 hull
 hundred
 impulse
@@ -179,6 +193,7 @@ leave standard orbit
 leave orbit
 left
 level
+life support
 long
 long range
 long range scan
@@ -344,6 +359,8 @@ set communications power to
 set impulse drive coolant to
 set impulse drive power to
 set impulse drive to
+set life support coolant to
+set life support power to
 set maneuvering coolant to
 set maneuvering power to
 set phaser coolant to
@@ -391,6 +408,7 @@ status
 status report
 stop
 stop red alert
+sufficient
 swiftly
 system
 target
@@ -436,6 +454,7 @@ twenty percent
 two
 two thirds
 under
+unladen swallow
 until
 up
 view
@@ -444,6 +463,11 @@ wavelength
 weapons
 weapon screen
 weapons on screen
+what
+what is
+what is the distance
+what is the airspeed velocity of an unladen swallow
+will
 with
 yaw
 zero
@@ -454,3 +478,18 @@ zoom one hundred
 zoom thirty
 zoom twenty
 zoom zero
+navigate to the selected target
+set a course for the selected target
+selected planet
+selected asteroid
+selected ship
+selected gate
+selected target
+head for the selected target
+head for the nearest planet
+head for the nearest ship
+head for the selection
+head for the target
+how much fuel do we have
+do we have enough fuel
+do we have sufficient fuel

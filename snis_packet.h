@@ -46,24 +46,53 @@
 #define OPCODE_SHIP_SDATA	120
 #define OPCODE_LOAD_TORPEDO	121
 #define OPCODE_REQUEST_PHASER	122
-#define OPCODE_REQUEST_THROTTLE	123
-#define OPCODE_REQUEST_MANEUVERING_PWR	124
-#define OPCODE_REQUEST_WARP_PWR	125
-#define OPCODE_REQUEST_IMPULSE_PWR	126
-#define OPCODE_REQUEST_SHIELDS_PWR	127
-#define OPCODE_REQUEST_COMMS_PWR	128
-#define OPCODE_REQUEST_SENSORS_PWR	129
-#define OPCODE_REQUEST_PHASERBANKS_PWR	130
-#define OPCODE_REQUEST_SCIZOOM	131
-#define OPCODE_REQUEST_WARPDRIVE 132
+/* UNUSED OPCODE 123 */
+/* UNUSED OPCODE 124 */
+/* UNUSED OPCODE 125 */
+/* UNUSED OPCODE 126 */
+/* UNUSED OPCODE 127 */
+/* UNUSED OPCODE 128 */
+/* UNUSED OPCODE 129 */
+/* UNUSED OPCODE 130 */
+/* UNUSED OPCODE 131 */
+/* UNUSED OPCODE 132 */
 #define OPCODE_ENGAGE_WARP 133
 #define OPCODE_ROLE_ONSCREEN 134
 #define OPCODE_SCI_SELECT_TARGET 135
+#define   OPCODE_SCI_SELECT_TARGET_TYPE_OBJECT 1
+#define   OPCODE_SCI_SELECT_TARGET_TYPE_WAYPOINT 2
 #define OPCODE_UPDATE_DAMAGE 136
 #define OPCODE_REQUEST_LASER 137
-#define OPCODE_REQUEST_LASER_WAVELENGTH 138
-#define OPCODE_SCI_SELECT_COORDS 139
-#define OPCODE_REQUEST_SHIELD 140
+/* UNUSED OPCODE 138 */
+
+#define OPCODE_ADJUST_CONTROL_INPUT 139
+#define   OPCODE_ADJUST_CONTROL_LASER_WAVELENGTH 0
+#define   OPCODE_ADJUST_CONTROL_NAVZOOM 1
+#define   OPCODE_ADJUST_CONTROL_MAINZOOM 2
+#define   OPCODE_ADJUST_CONTROL_THROTTLE 3
+#define   OPCODE_ADJUST_CONTROL_SCIZOOM 4
+#define   OPCODE_ADJUST_CONTROL_WARPDRIVE 5
+#define   OPCODE_ADJUST_CONTROL_SHIELD 6
+#define   OPCODE_ADJUST_CONTROL_MANEUVERING_PWR 7
+#define   OPCODE_ADJUST_CONTROL_TRACTOR_PWR 8
+#define   OPCODE_ADJUST_CONTROL_LIFESUPPORT_PWR 9
+#define   OPCODE_ADJUST_CONTROL_SHIELDS_PWR 10
+#define   OPCODE_ADJUST_CONTROL_IMPULSE_PWR 11
+#define   OPCODE_ADJUST_CONTROL_WARP_PWR 12
+#define   OPCODE_ADJUST_CONTROL_SENSORS_PWR 13
+#define   OPCODE_ADJUST_CONTROL_PHASERBANKS_PWR 14
+#define   OPCODE_ADJUST_CONTROL_COMMS_PWR 15
+#define   OPCODE_ADJUST_CONTROL_MANEUVERING_COOLANT 16
+#define   OPCODE_ADJUST_CONTROL_TRACTOR_COOLANT 17
+#define   OPCODE_ADJUST_CONTROL_LIFESUPPORT_COOLANT 18
+#define   OPCODE_ADJUST_CONTROL_SHIELDS_COOLANT 19
+#define   OPCODE_ADJUST_CONTROL_IMPULSE_COOLANT 20
+#define   OPCODE_ADJUST_CONTROL_WARP_COOLANT 21
+#define   OPCODE_ADJUST_CONTROL_SENSORS_COOLANT 22
+#define   OPCODE_ADJUST_CONTROL_PHASERBANKS_COOLANT 23
+#define   OPCODE_ADJUST_CONTROL_COMMS_COOLANT 24
+
+/* UNUSED OPCODE 140 */
 #define OPCODE_UPDATE_RESPAWN_TIME 141
 #define OPCODE_UPDATE_NETSTATS 142
 #define OPCODE_COMMS_TRANSMISSION 143
@@ -81,7 +110,7 @@
 #define OPCODE_WORMHOLE_LIMBO		155
 #define OPCODE_UPDATE_SPACEMONSTER	156
 #define OPCODE_REQUEST_WEAPZOOM		157
-#define OPCODE_REQUEST_NAVZOOM		158
+/* UNUSED OPCODE 158 */
 #define OPCODE_REQUEST_REDALERT		159
 #define OPCODE_UPDATE_POWER_DATA	160
 #define OPCODE_UPDATE_PLANET		161
@@ -109,13 +138,13 @@
 #define OPCODE_EXEC_LUA_SCRIPT		180
 #define OPCODE_REQUEST_TRACTORBEAM	181
 #define OPCODE_UPDATE_TRACTORBEAM	182
-#define OPCODE_REQUEST_TRACTOR_PWR	183
+/* UNUSED OPCODE 183 */
 #define OPCODE_COMMS_MAINSCREEN	184
 #define COMMS_CHANNEL_CHANGE_MSG "TX/RX INITIATED ON CHANNEL "
 #define OPCODE_LOAD_SKYBOX 185
 #define OPCODE_ROBOT_AUTO_MANUAL 	186
 #define OPCODE_ADD_WARP_EFFECT		187
-#define OPCODE_REQUEST_MAINZOOM		188
+/* UNUSED OPCODE 188 */
 #define OPCODE_REQUEST_PITCH		189
 #define OPCODE_REQUEST_ROLL		190
 #define OPCODE_REQUEST_SCIBALL_YAW	191
@@ -126,14 +155,14 @@
 #define OPCODE_REQUEST_MANUAL_LASER	197
 #define OPCODE_REQUEST_WEAPONS_YAW_PITCH 198
 #define OPCODE_UPDATE_COOLANT_DATA	199
-#define OPCODE_REQUEST_MANEUVERING_COOLANT	200
-#define OPCODE_REQUEST_WARP_COOLANT	201	
-#define OPCODE_REQUEST_IMPULSE_COOLANT	202
-#define OPCODE_REQUEST_SHIELDS_COOLANT	203
-#define OPCODE_REQUEST_COMMS_COOLANT	204
-#define OPCODE_REQUEST_SENSORS_COOLANT	205
-#define OPCODE_REQUEST_PHASERBANKS_COOLANT	206
-#define OPCODE_REQUEST_TRACTOR_COOLANT	207
+/* UNUSED OPCODE 200 */
+/* UNUSED OPCODE 201 */
+/* UNUSED OPCODE 202 */
+/* UNUSED OPCODE 203 */
+/* UNUSED OPCODE 204 */
+/* UNUSED OPCODE 205 */
+/* UNUSED OPCODE 206 */
+/* UNUSED OPCODE 207 */
 #define OPCODE_SILENT_UPDATE_DAMAGE		208
 #define OPCODE_ECON_UPDATE_SHIP_DEBUG_AI 209
 #define OPCODE_TOGGLE_DEMON_AI_DEBUG_MODE 210
@@ -161,6 +190,7 @@
 #define   OPCODE_NL_SUBCOMMAND_TEXT_TO_SPEECH	2
 #define OPCODE_SET_SOLARSYSTEM			231
 #define OPCODE_REQUEST_ROBOT_CMD		232
+/* TODO: delete these unused ROBOT_SUBCDM_?TG opcodes */
 #define   OPCODE_ROBOT_SUBCMD_STG		1	/* set short term goal */
 #define   OPCODE_ROBOT_SUBCMD_LTG		2	/* set long term goal */
 #define OPCODE_TEXTSCREEN_OP			233
@@ -168,6 +198,34 @@
 #define   OPCODE_TEXTSCREEN_TIMEDTEXT		1
 #define   OPCODE_TEXTSCREEN_MENU		2
 #define   OPCODE_TEXTSCREEN_MENU_CHOICE		3
+#define OPCODE_UPDATE_BLOCK			234
+#define OPCODE_UPDATE_TURRET			235
+#define OPCODE_LATENCY_CHECK			236
+
+/* Opcode to make sure client and server are running compatible protocols.
+ * Client can send FORMAT+VERIFY with format of opcode
+ * Server will respond with UNKNOWN, MATCH, or MISMATCH
+ * Server can send FORMAT+QUERY to client (no format included)
+ * Client will respond with VERIFY + format, or UNKNOWN
+ */
+#define OPCODE_CHECK_OPCODE_FORMAT		237
+#define   OPCODE_CHECK_OPCODE_UNKNOWN		1
+#define   OPCODE_CHECK_OPCODE_MATCH		2
+#define   OPCODE_CHECK_OPCODE_QUERY		3
+#define   OPCODE_CHECK_OPCODE_VERIFY		4
+#define   OPCODE_CHECK_OPCODE_MISMATCH		5
+#define OPCODE_REQUEST_STARMAP			238
+#define OPCODE_UPDATE_SOLARSYSTEM_LOCATION	239
+
+#define OPCODE_SET_WAYPOINT			240
+#define OPCODE_SET_WAYPOINT_CLEAR               1
+#define OPCODE_SET_WAYPOINT_COUNT		2
+#define OPCODE_SET_WAYPOINT_ROW			3
+#define OPCODE_SET_WAYPOINT_ADD_ROW		4
+#define OPCODE_SET_WAYPOINT_UPDATE_SELECTION	5
+
+/* UNUSED OPCODE 241 */
+/* UNUSED OPCODE 242 */
 
 #define OPCODE_NOOP		0xff
 
@@ -180,6 +238,8 @@
 #define UPDATE_UNIVERSE_TIMESTAMP_START_SAMPLE 1
 #define UPDATE_UNIVERSE_TIMESTAMP_SAMPLE 0
 #define UPDATE_UNIVERSE_TIMESTAMP_END_SAMPLE 2
+
+#define OPCODE_NO_SUBCODE 0
 
 #define NAMESIZE 20
 
@@ -199,6 +259,7 @@ struct update_ship_packet {
 	uint8_t throttle;
 	uint8_t rpm;
 	uint32_t fuel;
+	uint32_t oxygen;
 	uint8_t temp;
 	uint8_t scizoom;
 	uint8_t weapzoom;
@@ -213,12 +274,13 @@ struct update_ship_packet {
 	uint8_t reverse;
 	uint8_t trident;
 	uint32_t victim_id;
-	int32_t orientation[4]; /* int32_t encoded orientation quaternion */
-	int32_t sciball_orientation[4]; /* int32_t encoded orientation quaternion */
-	int32_t weap_orientation[4];
+	int16_t orientation[4]; /* int16_t encoded orientation quaternion */
+	int16_t sciball_orientation[4]; /* int16_t encoded orientation quaternion */
+	int16_t weap_orientation[4];
 	uint8_t in_secure_area;
 	uint8_t docking_magnets;
 	uint8_t emf_detector;
+	uint8_t nav_mode;
 };
 
 struct ship_sdata_packet {
@@ -329,7 +391,7 @@ struct update_laser_packet {
 	uint32_t timestamp;
 	uint32_t ship_oid; /* ship laser came from */
 	uint32_t x, y, z;
-	uint32_t orientation[4]; /* encoded orientation quaternion */	
+	uint16_t orientation[4]; /* encoded orientation quaternion */
 }; 
 
 struct update_spacemonster_packet {
@@ -377,18 +439,16 @@ struct request_thrust_packet {
 #define DISPLAYMODE_NAVIGATION 1
 #define DISPLAYMODE_WEAPONS 2
 #define DISPLAYMODE_ENGINEERING 3
-#define DISPLAYMODE_SCIENCE 4 
-#define DISPLAYMODE_COMMS 5 
-#define DISPLAYMODE_DEMON 6 
+#define DISPLAYMODE_SCIENCE 4
+#define DISPLAYMODE_COMMS 5
+#define DISPLAYMODE_DEMON 6
 #define DISPLAYMODE_DAMCON 7
-#define DISPLAYMODE_GLMAIN 8
-#define DISPLAYMODE_FONTTEST 9 
-#define DISPLAYMODE_INTROSCREEN 10 
-#define DISPLAYMODE_LOBBYSCREEN 11 
-#define DISPLAYMODE_CONNECTING 12 
-#define DISPLAYMODE_CONNECTED 13 
-#define DISPLAYMODE_FINDSERVER 14 
-#define DISPLAYMODE_NETWORK_SETUP 15
+#define DISPLAYMODE_FONTTEST 8
+#define DISPLAYMODE_INTROSCREEN 9
+#define DISPLAYMODE_LOBBYSCREEN 10
+#define DISPLAYMODE_CONNECTING 11
+#define DISPLAYMODE_CONNECTED 12
+#define DISPLAYMODE_NETWORK_SETUP 13
 
 #define ROLE_MAIN		(1 << DISPLAYMODE_MAINSCREEN)
 #define ROLE_NAVIGATION		(1 << DISPLAYMODE_NAVIGATION)
@@ -405,14 +465,17 @@ struct request_thrust_packet {
 #define SCI_DETAILS_MODE_THREED 1
 #define SCI_DETAILS_MODE_DETAILS 2
 #define SCI_DETAILS_MODE_SCIPLANE 3
+#define SCI_DETAILS_MODE_WAYPOINTS 4
 
 struct add_player_packet {
 	uint8_t opcode;
 	uint8_t new_ship;
 	uint8_t warpgate_number;
 	uint32_t role;
-	unsigned char shipname[20];
-	unsigned char password[20];
+#define SHIPNAME_LEN 20
+	unsigned char shipname[SHIPNAME_LEN];
+#define PASSWORD_LEN 20
+	unsigned char password[PASSWORD_LEN];
 };
 
 struct ack_player_packet {
@@ -481,6 +544,7 @@ struct ship_damage_packet {
 	uint8_t sensors;
 	uint8_t comms;
 	uint8_t tractor;
+	uint8_t lifesupport;
 };
 
 struct respawn_time_packet {
@@ -492,8 +556,10 @@ struct netstats_packet {
 	uint8_t opcode;
 	uint64_t bytes_sent;
 	uint64_t bytes_recd;
-	uint32_t nships, nobjects;
+	uint32_t nobjects;
+	uint32_t nships;
 	uint32_t elapsed_seconds;
+	uint32_t latency_in_usec;
 	uint32_t faction_population[5];
 };
 
@@ -578,6 +644,12 @@ struct request_mainscreen_view_change {
 	uint8_t view_mode;
 #define MAINSCREEN_VIEW_MODE_NORMAL 0
 #define MAINSCREEN_VIEW_MODE_WEAPONS 1
+};
+
+struct opcode_format_descriptor {
+	int32_t size;
+	uint8_t subcode;
+	char format[256];
 };
 
 #pragma pack()

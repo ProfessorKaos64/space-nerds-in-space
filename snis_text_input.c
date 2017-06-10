@@ -240,3 +240,14 @@ void snis_text_input_box_set_dynamic_width(struct snis_text_input_box *t,
 	t->maxwidth = maxwidth;
 	t->desiredwidth = t->width;
 }
+
+void snis_text_input_box_set_contents(struct snis_text_input_box *t, char *contents)
+{
+	memset(t->buffer, 0, t->buflen + 1);
+	strncpy(t->buffer, contents, t->buflen);
+	t->cursor_pos = strlen(t->buffer);
+}
+
+int snis_text_input_box_get_x(struct snis_text_input_box *t) { return t->x; }
+int snis_text_input_box_get_y(struct snis_text_input_box *t) { return t->y; }
+

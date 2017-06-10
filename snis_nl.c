@@ -44,6 +44,7 @@ static const char * const part_of_speech[] = {
 	"name",
 	"pronoun",
 	"externalnoun",
+	"auxverb",
 };
 
 #define MAX_SYNONYMS 100
@@ -77,7 +78,7 @@ static snis_nl_external_noun_lookup external_lookup = NULL;
 static snis_nl_error_function error_function = NULL;
 static snis_nl_multiword_preprocessor_fn multiword_preprocessor_fn = NULL;
 
-#define MAX_MEANINGS 10
+#define MAX_MEANINGS 11
 struct nl_token {
 	char *word;
 	int pos[MAX_MEANINGS];
@@ -85,6 +86,17 @@ struct nl_token {
 	int npos; /* number of possible parts of speech */
 	struct snis_nl_number_data number;
 	struct snis_nl_external_noun_data external_noun;
+};
+
+static struct snis_nl_topic {
+	int part_of_speech;
+	int meaning;
+	char *word;
+	union snis_nl_extra_data extra_data;
+} snis_nl_current_topic = {
+	.part_of_speech = -1,
+	.word = NULL,
+	.extra_data = { { 0 } },
 };
 
 static char *fixup_punctuation(char *s)
@@ -206,6 +218,23 @@ static void free_tokens(struct nl_token *word[], int nwords)
 		free(word[i]);
 }
 
+static void maybe_do_pronoun_substitution(void *context, struct nl_token *t)
+{
+	if (t->pos[t->npos] != POS_PRONOUN)
+		return;
+	if (strcasecmp(t->word, "it") != 0) /* only try to substitute for "it" */
+		return;
+	if (snis_nl_current_topic.part_of_speech == -1) /* No antecedent ready */
+		return;
+	/* Substitute the antecedent */
+	t->pos[t->npos] = snis_nl_current_topic.part_of_speech;
+	t->meaning[t->npos] = snis_nl_current_topic.meaning;
+	if (snis_nl_current_topic.part_of_speech == POS_EXTERNAL_NOUN)
+		t->external_noun.handle = snis_nl_current_topic.extra_data.external_noun.handle;
+	else
+		t->external_noun.handle = -1;
+}
+
 static void classify_token(void *context, struct nl_token *t)
 {
 	int i, j;
@@ -222,6 +251,7 @@ static void classify_token(void *context, struct nl_token *t)
 			continue;
 		t->pos[t->npos] = dictionary[i].p_o_s;
 		t->meaning[t->npos] = i;
+		maybe_do_pronoun_substitution(context, t);
 		t->npos++;
 		if (t->npos >= MAX_MEANINGS)
 			break;
@@ -332,7 +362,7 @@ static void __attribute__((unused)) print_tokens(struct nl_token *t[], int ntoke
 		print_token(t[i]);
 }
 
-#define MAX_MEANINGS 10
+#define MAX_MEANINGS 11
 #define MAX_WORDS 100
 
 static char *starting_syntax = "v";
@@ -477,10 +507,14 @@ static void nl_parse_machine_process_token(struct nl_parse_machine **list, struc
 	struct nl_parse_machine *new_parse_machine;
 	int i, found = 0;
 	int p_o_s;
+	int topic_pos = snis_nl_current_topic.part_of_speech;
 
 	for (i = 0; i < token[p->current_token]->npos; i++) {
 		p_o_s = token[p->current_token]->pos[i]; /* part of speech */
-		if (p_o_s == looking_for_pos || (p_o_s == POS_EXTERNAL_NOUN && looking_for_pos == POS_NOUN)) {
+		if (p_o_s == looking_for_pos ||
+			(p_o_s == POS_EXTERNAL_NOUN && looking_for_pos == POS_NOUN) ||
+			(p_o_s == POS_PRONOUN && looking_for_pos == POS_NOUN &&
+				(topic_pos == POS_NOUN || topic_pos == POS_EXTERNAL_NOUN))) {
 			p->meaning[p->current_token] = i;
 			if (found == 0) {
 				p->syntax_pos++;
@@ -519,6 +553,10 @@ static void nl_parse_machine_process_token(struct nl_parse_machine **list, struc
 	}
 	if (!found) {
 		/* didn't find a required meaning for this token, we're done */
+		if (debuglevel > 0) {
+			printf("   Failed to parse '%s'\n", token[p->current_token]->word);
+			printf("   Looking for %s\n", part_of_speech[looking_for_pos]);
+		}
 		p->state = NL_STATE_FAILED;
 	}
 }
@@ -604,6 +642,12 @@ static void nl_parse_machine_step(struct nl_parse_machine **list,
 	case 'a':
 		nl_parse_machine_process_token(list, p, token, ntokens, POS_ADJECTIVE);
 		break;
+	case 'P':
+		nl_parse_machine_process_token(list, p, token, ntokens, POS_PRONOUN);
+		break;
+	case 'x':
+		nl_parse_machine_process_token(list, p, token, ntokens, POS_AUXVERB);
+		break;
 	case 's':
 		nl_parse_machine_process_token(list, p, token, ntokens, POS_SEPARATOR);
 		break;
@@ -631,12 +675,56 @@ static int nl_parse_machines_still_running(struct nl_parse_machine **list)
 	return 0;
 }
 
+void snis_nl_clear_current_topic(void)
+{
+	snis_nl_current_topic.part_of_speech = -1;
+	snis_nl_current_topic.meaning = -1;
+	if (snis_nl_current_topic.word) {
+		free(snis_nl_current_topic.word);
+		snis_nl_current_topic.word = NULL;
+	}
+	memset(&snis_nl_current_topic.extra_data, 0, sizeof(snis_nl_current_topic.extra_data));
+	snis_nl_current_topic.extra_data.external_noun.handle = -1;
+}
+
+void snis_nl_set_current_topic(int part_of_speech, char *word, union snis_nl_extra_data extra_data)
+{
+	int i;
+
+	snis_nl_clear_current_topic();
+	if (part_of_speech != POS_EXTERNAL_NOUN) {
+		for (i = 0; dictionary[i].word != NULL; i++) {
+			if (strcmp(dictionary[i].word, word) != 0)
+				continue;
+			if (part_of_speech != dictionary[i].p_o_s)
+				continue;
+			break;
+		}
+		if (!dictionary[i].word) {
+			snis_nl_clear_current_topic();
+			return;
+		}
+	}
+	/* TODO make synonyms work here? */
+	snis_nl_current_topic.part_of_speech = part_of_speech;
+	snis_nl_current_topic.word = strdup(word);
+	if (part_of_speech == POS_EXTERNAL_NOUN)
+		snis_nl_current_topic.meaning = -1;
+	else
+		snis_nl_current_topic.meaning = i;
+	snis_nl_current_topic.extra_data = extra_data;
+}
+
 static void do_action(void *context, struct nl_parse_machine *p, struct nl_token **token, int ntokens)
 {
 	int argc;
 	char *argv[MAX_WORDS];
 	int pos[MAX_WORDS];
 	union snis_nl_extra_data extra_data[MAX_WORDS] = { { { 0 } } };
+	union snis_nl_extra_data antecedent_extra_data = { { 0 } };
+	int antecedent_word = -1;
+	int antecedent_noun_meaning = -1;
+	int antecedent_pos = -1;
 	int i, w = 0, de;
 	snis_nl_verb_function vf = NULL;
 	int limit = ntokens;
@@ -672,6 +760,16 @@ static void do_action(void *context, struct nl_parse_machine *p, struct nl_token
 					extra_data[w].number.value = t->number.value;
 				} else if (pos[w] == POS_EXTERNAL_NOUN) {
 					extra_data[w].external_noun.handle = t->external_noun.handle;
+					antecedent_extra_data = extra_data[w];
+					antecedent_noun_meaning = -1;
+					antecedent_pos = POS_EXTERNAL_NOUN;
+					antecedent_word = w;
+				} else if (pos[w] == POS_NOUN) {
+					memset(&antecedent_extra_data, 0, sizeof(antecedent_extra_data));
+					antecedent_noun_meaning = de;
+					antecedent_word = w;
+					antecedent_pos = POS_NOUN;
+				de = t->meaning[p->meaning[i]];
 				} else {
 					extra_data[w].number.value = 0.0;
 				}
@@ -680,7 +778,12 @@ static void do_action(void *context, struct nl_parse_machine *p, struct nl_token
 			}
 		}
 	}
+
 	if (vf != NULL) {
+		if (antecedent_word != -1) {
+			snis_nl_set_current_topic(antecedent_pos, argv[antecedent_word], antecedent_extra_data);
+			snis_nl_current_topic.meaning = antecedent_noun_meaning;
+		}
 		vf(context, argc, argv, pos, extra_data);
 		vf = NULL;
 	}
@@ -734,7 +837,7 @@ static void nl_parse_machines_run(struct nl_parse_machine **list, struct nl_toke
 
 	do {
 		if (debuglevel > 0) {
-			printf("--- iteration %d ---\n", iteration);
+			printf("\n--- iteration %d ---\n", iteration);
 			nl_parse_machines_print(list, tokens, ntokens);
 		}
 		for (i = *list; i != NULL; i = i->next)
@@ -993,6 +1096,9 @@ static void init_dictionary(void)
 	snis_nl_add_dictionary_verb("describe",		"navigate",	"n", generic_verb_action);
 	snis_nl_add_dictionary_verb("describe",		"navigate",	"an", generic_verb_action);
 	snis_nl_add_dictionary_verb("navigate",		"navigate",	"pn", generic_verb_action);
+	snis_nl_add_dictionary_verb("navigate",		"navigate",	"pnq", generic_verb_action);
+	snis_nl_add_dictionary_verb("head",		"navigate",	"pn", generic_verb_action);
+	snis_nl_add_dictionary_verb("head",		"navigate",	"pnq", generic_verb_action);
 	snis_nl_add_dictionary_verb("set",		"set",		"npq", generic_verb_action);
 	snis_nl_add_dictionary_verb("set",		"set",		"npa", generic_verb_action);
 	snis_nl_add_dictionary_verb("set",		"set",		"npn", generic_verb_action);
@@ -1020,6 +1126,7 @@ static void init_dictionary(void)
 	snis_nl_add_dictionary_verb("launch",		"launch",	"n", generic_verb_action);
 	snis_nl_add_dictionary_verb("eject",		"eject",	"n", generic_verb_action);
 	snis_nl_add_dictionary_verb("full",		"full",		"n", generic_verb_action);
+	snis_nl_add_dictionary_verb("how",		"how",		"anxPx", generic_verb_action);
 
 	snis_nl_add_dictionary_word("drive",		"drive",	POS_NOUN);
 	snis_nl_add_dictionary_word("system",		"system",	POS_NOUN);
@@ -1074,6 +1181,7 @@ static void init_dictionary(void)
 	snis_nl_add_dictionary_word("damage",		"damage",	POS_NOUN);
 	snis_nl_add_dictionary_word("course",		"course",	POS_NOUN);
 	snis_nl_add_dictionary_word("earth",		"earth",	POS_NOUN);
+	snis_nl_add_dictionary_word("fuel",		"fuel",		POS_NOUN);
 
 
 	snis_nl_add_dictionary_word("a",		"a",		POS_ARTICLE);
@@ -1166,6 +1274,8 @@ static void init_dictionary(void)
 	snis_nl_add_dictionary_word("maximum",		"maximum",	POS_ADJECTIVE);
 	snis_nl_add_dictionary_word("planet",		"planet",	POS_ADJECTIVE);
 	snis_nl_add_dictionary_word("degrees",		"degrees",	POS_ADJECTIVE);
+	snis_nl_add_dictionary_word("much",		"much",		POS_ADJECTIVE);
+	snis_nl_add_dictionary_word("far",		"far",		POS_ADJECTIVE);
 
 	snis_nl_add_dictionary_word("percent",		"percent",	POS_ADVERB);
 	snis_nl_add_dictionary_word("quickly",		"quickly",	POS_ADVERB);
@@ -1175,9 +1285,23 @@ static void init_dictionary(void)
 
 	snis_nl_add_dictionary_word("it",		"it",		POS_PRONOUN);
 	snis_nl_add_dictionary_word("me",		"me",		POS_PRONOUN);
+	snis_nl_add_dictionary_word("we",		"we",		POS_PRONOUN);
 	snis_nl_add_dictionary_word("them",		"them",		POS_PRONOUN);
 	snis_nl_add_dictionary_word("all",		"all",		POS_PRONOUN);
 	snis_nl_add_dictionary_word("everything",	"everything",	POS_PRONOUN);
+
+	snis_nl_add_dictionary_word("do",		"do",		POS_AUXVERB);
+	snis_nl_add_dictionary_word("be",		"be",		POS_AUXVERB);
+	snis_nl_add_dictionary_word("have",		"have",		POS_AUXVERB);
+	snis_nl_add_dictionary_word("will",		"will",		POS_AUXVERB);
+	snis_nl_add_dictionary_word("shall",		"shall",	POS_AUXVERB);
+	snis_nl_add_dictionary_word("would",		"would",	POS_AUXVERB);
+	snis_nl_add_dictionary_word("could",		"could",	POS_AUXVERB);
+	snis_nl_add_dictionary_word("should",		"should",	POS_AUXVERB);
+	snis_nl_add_dictionary_word("can",		"can",		POS_AUXVERB);
+	snis_nl_add_dictionary_word("may",		"may",		POS_AUXVERB);
+	snis_nl_add_dictionary_word("must",		"must",		POS_AUXVERB);
+	snis_nl_add_dictionary_word("ought",		"ought",	POS_AUXVERB);
 
 }
 

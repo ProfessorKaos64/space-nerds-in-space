@@ -39,6 +39,7 @@ struct loaded_texture {
 	time_t mtime;
 	double last_mtime_change;
 	int expired;
+	int use_mipmaps;
 };
 static int nloaded_textures = 0;
 static struct loaded_texture loaded_textures[MAX_LOADED_TEXTURES];
@@ -723,6 +724,8 @@ struct graph_dev_gl_textured_shader {
 	GLint texture_cubemap_id;
 	GLint normalmap_cubemap_id;
 	GLint light_pos_id;
+	GLint specular_power_id;
+	GLint specular_intensity_id;
 
 	GLint shadow_sphere_id;
 
@@ -1253,7 +1256,8 @@ static void graph_dev_raster_texture(struct graph_dev_gl_textured_shader *shader
 	struct sng_color *triangle_color, float alpha, union vec3 *eye_light_pos, GLuint texture_number,
 	GLuint emit_texture_number, GLuint normalmap_texture_number, struct shadow_sphere_data *shadow_sphere,
 	struct shadow_annulus_data *shadow_annulus, int do_cullface, int do_blend,
-	float ring_texture_v, float ring_inner_radius, float ring_outer_radius)
+	float ring_texture_v, float ring_inner_radius, float ring_outer_radius,
+	float specular_power, float specular_intensity)
 {
 	enable_3d_viewport();
 
@@ -1299,6 +1303,10 @@ static void graph_dev_raster_texture(struct graph_dev_gl_textured_shader *shader
 		glUniformMatrix4fv(shader->mv_matrix_id, 1, GL_FALSE, &mat_mv->m[0][0]);
 	if (shader->normal_matrix_id >= 0)
 		glUniformMatrix3fv(shader->normal_matrix_id, 1, GL_FALSE, &mat_normal->m[0][0]);
+	if (shader->specular_power_id >= 0)
+		glUniform1f(shader->specular_power_id, specular_power);
+	if (shader->specular_intensity_id >= 0)
+		glUniform1f(shader->specular_intensity_id, specular_intensity);
 
 	glUniform4f(shader->tint_color_id, triangle_color->red,
 		triangle_color->green, triangle_color->blue, alpha);
@@ -1952,7 +1960,7 @@ static void graph_dev_draw_nebula(const struct mat44 *mat_mvp, const struct mat4
 
 		graph_dev_raster_texture(&textured_shader, &mat_mvp_local_r, &mat_mv_local_r, &mat_normal_local_r,
 			e->m, &mt->tint, alpha, eye_light_pos, mt->texture_id[i], 0, -1, 0, 0, 0, 1, 0.0f,
-				2.0f, 4.0f);
+				2.0f, 4.0f, 512.0, 0.2);
 
 		if (draw_billboard_wireframe) {
 			struct sng_color line_color = sng_get_color(WHITE);
@@ -2165,6 +2173,8 @@ void graph_dev_draw_entity(struct entity_context *cx, struct entity *e, union ve
 	float ring_inner_radius = 1.0f;
 	float ring_outer_radius = 4.0f;
 	struct sng_color atmosphere_color = { 0 };
+	float specular_power = 512.0;
+	float specular_intensity = 0.2;
 
 	draw_vertex_buffer_2d();
 
@@ -2226,6 +2236,8 @@ void graph_dev_draw_entity(struct entity_context *cx, struct entity *e, union ve
 				struct material_texture_mapped *mt = &e->material_ptr->texture_mapped;
 				texture_id = mt->texture_id;
 				emit_texture_id = mt->emit_texture_id;
+				specular_power = mt->specular_power;
+				specular_intensity = mt->specular_intensity;
 
 				if (emit_texture_id > 0)
 					tex_shader = &textured_lit_emit_shader;
@@ -2343,8 +2355,9 @@ void graph_dev_draw_entity(struct entity_context *cx, struct entity *e, union ve
 				struct material_wireframe_sphere_clip *mt =
 					&e->material_ptr->wireframe_sphere_clip;
 
-				union vec4 clip_sphere_pos;
-				vec4_init_vec3(&clip_sphere_pos, &mt->center->e_pos, 1);
+				union vec4 clip_sphere_pos = VEC4_INITIALIZER;
+				if (mt->center)
+					vec4_init_vec3(&clip_sphere_pos, &mt->center->e_pos, 1);
 				mat44_x_vec4_into_vec3_dff(transform->v, &clip_sphere_pos, &clip_sphere.eye_pos);
 
 				clip_sphere.r = e->material_ptr->wireframe_sphere_clip.radius;
@@ -2370,7 +2383,8 @@ void graph_dev_draw_entity(struct entity_context *cx, struct entity *e, union ve
 						&texture_tint, texture_alpha, eye_light_pos, texture_id,
 						emit_texture_id, normalmap_id, &shadow_sphere, &shadow_annulus,
 						do_cullface, do_blend, ring_texture_v,
-						ring_inner_radius, ring_outer_radius);
+						ring_inner_radius, ring_outer_radius,
+						specular_power, specular_intensity);
 				else if (atmosphere)
 					graph_dev_raster_atmosphere(mat_mvp, mat_mv, mat_normal,
 						e->m, &atmosphere_color, eye_light_pos);
@@ -2552,6 +2566,8 @@ void graph_dev_start_frame()
 		glClear(GL_COLOR_BUFFER_BIT);
 	} else
 		sgc.fbo_2d = 0;
+
+	glEnable(GL_TEXTURE_CUBE_MAP_SEAMLESS);
 
 	if (draw_msaa_samples > 0 && msaa.fbo > 0) {
 
@@ -2863,6 +2879,12 @@ static void setup_textured_shader(const char *basename, const char *defines,
 	shader->ring_outer_radius_id = glGetUniformLocation(shader->program_id, "u_ring_outer_radius");
 	if (shader->ring_outer_radius_id >= 0)
 		glUniform1f(shader->ring_outer_radius_id, 2.0);
+	shader->specular_power_id = glGetUniformLocation(shader->program_id, "u_SpecularPower");
+	if (shader->specular_power_id >= 0)
+		glUniform1f(shader->specular_power_id, 512.0);
+	shader->specular_intensity_id = glGetUniformLocation(shader->program_id, "u_SpecularIntensity");
+	if (shader->specular_power_id >= 0)
+		glUniform1f(shader->specular_intensity_id, 0.2);
 
 	shader->vertex_position_id = glGetAttribLocation(shader->program_id, "a_Position");
 	shader->vertex_normal_id = glGetAttribLocation(shader->program_id, "a_Normal");
@@ -3531,7 +3553,7 @@ static int load_cubemap_texture_id(
 
 	glBindTexture(GL_TEXTURE_CUBE_MAP, cube_texture_id);
 	glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-	glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
 	glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 	glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 	glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
@@ -3554,6 +3576,7 @@ static int load_cubemap_texture_id(
 			return -1;
 		}
 	}
+	glGenerateMipmap(GL_TEXTURE_CUBE_MAP);
 	return 0;
 }
 
@@ -3718,7 +3741,7 @@ int graph_dev_reload_cubemap_textures()
 	return failed;
 }
 
-static int load_texture_id(GLuint texture_number, const char *filename)
+static int load_texture_id(GLuint texture_number, const char *filename, int use_mipmaps)
 {
 	char whynotz[100];
 	int whynotlen = 100;
@@ -3729,7 +3752,11 @@ static int load_texture_id(GLuint texture_number, const char *filename)
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	if (use_mipmaps)
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+	else
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
 
 	char *image_data = sng_load_png_texture(filename, 1, 0, 1, &tw, &th, &hasAlpha,
 						whynotz, whynotlen);
@@ -3737,6 +3764,8 @@ static int load_texture_id(GLuint texture_number, const char *filename)
 		glTexImage2D(GL_TEXTURE_2D, 0, (hasAlpha ? GL_RGBA8 : GL_RGB8), tw, th, 0,
 				(hasAlpha ? GL_RGBA : GL_RGB), GL_UNSIGNED_BYTE, image_data);
 		free(image_data);
+		if (use_mipmaps)
+			glGenerateMipmap(GL_TEXTURE_2D);
 		return 0;
 	}
 	fprintf(stderr, "Unable to load texture '%s': %s\n", filename, whynotz);
@@ -3747,7 +3776,7 @@ static int load_texture_id(GLuint texture_number, const char *filename)
 /* returning unsigned int instead of GLuint so as not to leak opengl types out
  * Kind of ugly, but should not be dangerous.
  */
-unsigned int graph_dev_load_texture(const char *filename)
+static unsigned int graph_dev_load_texture_and_mipmap(const char *filename, int use_mipmaps)
 {
 	int i;
 
@@ -3765,7 +3794,7 @@ unsigned int graph_dev_load_texture(const char *filename)
 			glBindTexture(GL_TEXTURE_2D, 0);
 			glDeleteTextures(1, &loaded_textures[i].texture_id);
 			fprintf(stderr, "Replacing %s with %s\n", loaded_textures[i].filename, filename);
-			if (load_texture_id(loaded_textures[i].texture_id, filename)) {
+			if (load_texture_id(loaded_textures[i].texture_id, filename, use_mipmaps)) {
 				fprintf(stderr, "Failed to load texture from '%s'\n", filename);
 				return 0;
 			}
@@ -3775,6 +3804,7 @@ unsigned int graph_dev_load_texture(const char *filename)
 			loaded_textures[i].mtime = get_file_modify_time(filename);
 			loaded_textures[i].last_mtime_change = 0;
 			loaded_textures[i].expired = 0;
+			loaded_textures[i].use_mipmaps = use_mipmaps;
 			return loaded_textures[i].texture_id;
 		}
 	}
@@ -3788,7 +3818,7 @@ unsigned int graph_dev_load_texture(const char *filename)
 	GLuint texture_number;
 	glGenTextures(1, &texture_number);
 
-	if (load_texture_id(texture_number, filename)) {
+	if (load_texture_id(texture_number, filename, use_mipmaps)) {
 		glDeleteTextures(1, &texture_number);
 		fprintf(stderr, "Failed to load texture from '%s'\n", filename);
 		return 0;
@@ -3799,10 +3829,21 @@ unsigned int graph_dev_load_texture(const char *filename)
 	loaded_textures[nloaded_textures].mtime = get_file_modify_time(filename);
 	loaded_textures[nloaded_textures].last_mtime_change = 0;
 	loaded_textures[nloaded_textures].expired = 0;
+	loaded_textures[nloaded_textures].use_mipmaps = use_mipmaps;
 
 	nloaded_textures++;
 
 	return (unsigned int) texture_number;
+}
+
+unsigned int graph_dev_load_texture(const char *filename)
+{
+	return graph_dev_load_texture_and_mipmap(filename, 1);
+}
+
+unsigned int graph_dev_load_texture_no_mipmaps(const char *filename)
+{
+	return graph_dev_load_texture_and_mipmap(filename, 0);
 }
 
 const char *graph_dev_get_texture_filename(unsigned int texture_id)
@@ -3820,7 +3861,8 @@ int graph_dev_reload_textures()
 {
 	int i;
 	for (i = 0; i < nloaded_textures; i++) {
-		load_texture_id(loaded_textures[i].texture_id, loaded_textures[i].filename);
+		load_texture_id(loaded_textures[i].texture_id, loaded_textures[i].filename,
+				loaded_textures[i].use_mipmaps);
 	}
 	return 0;
 }
@@ -3836,7 +3878,8 @@ int graph_dev_reload_changed_textures()
 		} else if (loaded_textures[i].last_mtime_change > 0 &&
 			time_now_double() - loaded_textures[i].last_mtime_change >= TEX_RELOAD_DELAY) {
 			printf("reloading texture '%s'\n", loaded_textures[i].filename);
-			load_texture_id(loaded_textures[i].texture_id, loaded_textures[i].filename);
+			load_texture_id(loaded_textures[i].texture_id, loaded_textures[i].filename,
+					loaded_textures[i].use_mipmaps);
 			loaded_textures[i].last_mtime_change = 0;
 		}
 	}
@@ -4020,9 +4063,9 @@ int graph_dev_graph_dev_debug_menu_click(int x, int y)
 
 void graph_dev_grab_framebuffer(unsigned char **buffer, int *width, int *height)
 {
-	*buffer = malloc(3 * sgc.screen_x * sgc.screen_y);
+	*buffer = malloc(4 * sgc.screen_x * sgc.screen_y);
 	*width = sgc.screen_x;
 	*height = sgc.screen_y;
-	glReadPixels(0, 0, sgc.screen_x - 1, sgc.screen_y - 1,
-			GL_RGB, GL_UNSIGNED_BYTE, *buffer);
+	glReadPixels(0, 0, sgc.screen_x, sgc.screen_y,
+			GL_RGBA, GL_UNSIGNED_BYTE, *buffer);
 }
